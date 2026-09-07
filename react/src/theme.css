@@ -1,0 +1,70 @@
+:root {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background: #0b1020;
+  color: #e5e7eb;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.ant-typography,
+.ant-typography h1,
+.ant-typography h2,
+.ant-typography h3,
+.ant-typography h4,
+.ant-typography h5,
+.ant-card,
+.ant-card-head,
+.ant-card-head-title,
+.ant-card-extra,
+.ant-statistic-title,
+.ant-form-item-label > label,
+.ant-tabs-tab,
+.ant-table,
+.ant-table-thead > tr > th,
+.ant-table-tbody > tr > td {
+  color: #e5e7eb !important;
+}
+
+.ant-typography.ant-typography-secondary,
+.ant-card-extra .ant-typography,
+.ant-statistic-title,
+.ant-form-item-label > label {
+  color: #aebbd0 !important;
+}
+
+.ant-card,
+.ant-table,
+.ant-table-container,
+.ant-table-thead > tr > th,
+.ant-table-tbody > tr > td {
+  background: #111827 !important;
+}
+
+.ant-table-tbody > tr.ant-table-row:hover > td {
+  background: #1b2638 !important;
+}
+
+.ant-input,
+.ant-input-affix-wrapper,
+.ant-select-selector,
+.ant-input-textarea textarea {
+  color: #f3f6ff !important;
+  background: #0f1728 !important;
+  border-color: #3d4a60 !important;
+}
+
+.ant-input::placeholder,
+.ant-input-textarea textarea::placeholder {
+  color: #7f8da4 !important;
+}
+
+.ant-tabs-tab-btn {
+  color: #cbd5e1 !important;
+}
+
+.ant-tabs-tab-active .ant-tabs-tab-btn {
+  color: #7aa2ff !important;
+}
