@@ -1,20 +1,4 @@
-# WorkBuddy2API
 
-> WorkBuddy CN（CodeBuddy / copilot.tencent.com）的 OpenAI 兼容反向代理，支持 OAuth 登录、多账号轮转、工具调用与流式响应。
-
-## 功能特性
-
-- 🔐 **OAuth 登录** — 通过 `/v2/plugin/auth/state` 设备授权流程获取凭证，支持 token 自动刷新
-- 🔄 **多账号轮转** — 三因子加权随机选号（credits ×闲置×成功率），防热点 + 防惊群（100ms 窗口）
-- 🛠 **工具调用** — 完整支持 OpenAI tools/tool_choice，流式 `tool_calls` 按 index 合并
-- 📡 **流式 + 非流式** — 上游 SSE 透传；非流式本地聚合（上游拒绝非流式请求）
-- ⏰ **定时签到** — 每日 09:00 / 21:00 自动签到 + 积分查询，积分耗尽账号次日 04:00 自动恢复
-- 📊 **积分监控** — `credit.sh` 一键查询全部账号剩余/总量/百分比
-- 🔑 **登录工具** — `login.sh` 交互式登录，落盘即生效
-- 🏗 **Docker 部署** — 一键 `docker compose up`，healthcheck 常驻
-- 📈 **请求级日志** — 每个 `/v1/chat/completions` 请求打表格日志（seq/TTFB/uid/tokens/latency）
-- 🏥 **健康检查** — `/healthz` 无健康账号时返回 503，可接负载均衡器
-- 📉 **状态汇总** — `/status` 返回 total/healthy/cooling/disabled 计数 + 每账号完整画像
 
 ## 快速开始
 
