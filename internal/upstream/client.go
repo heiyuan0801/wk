@@ -4,6 +4,7 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -206,7 +207,8 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 func (c *Client) RefreshToken(a *auth.Auth) error {
 	a.Lock()
 	defer a.Unlock()
-	if strings.TrimSpace(a.RefreshToken) == "" {
+	credentials := a.Snapshot()
+	if strings.TrimSpace(credentials.RefreshToken) == "" {
 		return fmt.Errorf("no refreshToken")
 	}
 	url := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
@@ -228,17 +230,12 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
 		return fmt.Errorf("refresh_failed: no accessToken in response — re-login required")
 	}
-	a.AccessToken = tok.AccessToken
-	if tok.RefreshToken != "" {
-		a.RefreshToken = tok.RefreshToken
-	}
-	if tok.Domain != "" {
-		a.Domain = tok.Domain
-	}
 	// preserveExpiry：响应缺 expiresIn 时保留旧过期时间，避免刷新风暴。
+	expiresAt := int64(0)
 	if tok.ExpiresIn > 0 {
-		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
+		expiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
+	a.ApplyRefresh(tok.AccessToken, tok.RefreshToken, tok.Domain, expiresAt)
 	return nil
 }
 
@@ -246,8 +243,14 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify(status, string(body))）、err 为 nil；
 // 只有传输层失败才返回 err。
 func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	return c.ChatStreamContext(context.Background(), a, body)
+}
+
+// ChatStreamContext attaches the caller context so a disconnected client can
+// cancel the upstream request and release the account lease promptly.
+func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(body)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(c.prepareBody(body)))
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -285,7 +288,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.Snapshot().AccessToken)
 	req.Header.Set("Accept", "application/json")
 	origin := originRefererFor(a)
 	req.Header.Set("Origin", origin)

@@ -12,6 +12,7 @@ import (
 	"context"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -36,9 +37,10 @@ type Store interface {
 }
 
 const (
-	bindPrefix  = "wb2api:bind:"
-	stateKey    = "wb2api:state"
-	readTimeout = 3 * time.Second
+	bindPrefix     = "wb2api:bind:"
+	responsePrefix = "wb2api:response:"
+	stateKey       = "wb2api:state"
+	readTimeout    = 3 * time.Second
 )
 
 // New 根据 url+token 构建 Store。
@@ -69,7 +71,7 @@ func New(url, token string) Store {
 		return Noop{}
 	}
 	log.Printf("[redisstore] upstash 已连接 (addr=%s)", opt.Addr)
-	return &Upstash{client: client}
+	return &Upstash{client: client, versions: make(map[string]uint64)}
 }
 
 // normalizeURL 把 url+token 归一化为可直接 ParseURL 的完整 rediss:// URL。
@@ -90,7 +92,10 @@ func normalizeURL(url, token string) string {
 
 // Upstash 真实现：redis.Client 封装。
 type Upstash struct {
-	client *redis.Client
+	client    *redis.Client
+	writeMu   sync.Mutex
+	versionMu sync.Mutex
+	versions  map[string]uint64
 }
 
 func bindKey(key string) string { return bindPrefix + key }
@@ -100,33 +105,77 @@ func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
 	if ttl <= 0 {
 		ttl = keyTTL
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := u.client.Set(ctx, bindKey(key), uid, ttl).Err(); err != nil {
-			log.Printf("[redisstore] debug: SetBind %s: %v", key, err)
-		}
-	}()
+	u.scheduleWrite(bindKey(key), "SetBind "+key, func(ctx context.Context) error {
+		return u.client.Set(ctx, bindKey(key), uid, ttl).Err()
+	})
 }
 
 // DelBind 异步删除粘性会话绑定。
 func (u *Upstash) DelBind(key string) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := u.client.Del(ctx, bindKey(key)).Err(); err != nil {
-			log.Printf("[redisstore] debug: DelBind %s: %v", key, err)
-		}
-	}()
+	u.scheduleWrite(bindKey(key), "DelBind "+key, func(ctx context.Context) error {
+		return u.client.Del(ctx, bindKey(key)).Err()
+	})
 }
 
 // SaveState 异步写池状态 JSON 快照。
 func (u *Upstash) SaveState(data []byte) {
+	snapshot := append([]byte(nil), data...)
+	u.scheduleWrite(stateKey, "SaveState", func(ctx context.Context) error {
+		return u.client.Set(ctx, stateKey, snapshot, keyTTL).Err()
+	})
+}
+
+// SaveResponse persists one Responses API turn for previous_response_id
+// continuation across process restarts and multiple replicas.
+func (u *Upstash) SaveResponse(id string, data []byte, ttl time.Duration) {
+	if ttl <= 0 {
+		ttl = keyTTL
+	}
+	snapshot := append([]byte(nil), data...)
+	key := responsePrefix + id
+	u.scheduleWrite(key, "SaveResponse "+id, func(ctx context.Context) error {
+		return u.client.Set(ctx, key, snapshot, ttl).Err()
+	})
+}
+
+// LoadResponse reads one persisted Responses API turn.
+func (u *Upstash) LoadResponse(id string) ([]byte, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+	defer cancel()
+	value, err := u.client.Get(ctx, responsePrefix+id).Bytes()
+	return value, err == nil
+}
+
+// scheduleWrite serializes remote writes and drops an operation when a newer
+// write for the same Redis key was queued before it started. This preserves
+// call order without adding network latency to request handlers.
+func (u *Upstash) scheduleWrite(key, label string, write func(context.Context) error) {
+	u.versionMu.Lock()
+	if u.versions == nil {
+		u.versions = make(map[string]uint64)
+	}
+	u.versions[key]++
+	version := u.versions[key]
+	u.versionMu.Unlock()
 	go func() {
+		u.writeMu.Lock()
+		defer u.writeMu.Unlock()
+		u.versionMu.Lock()
+		latest := u.versions[key]
+		u.versionMu.Unlock()
+		if version != latest {
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := u.client.Set(ctx, stateKey, data, keyTTL).Err(); err != nil {
-			log.Printf("[redisstore] debug: SaveState: %v", err)
+		err := write(ctx)
+		u.versionMu.Lock()
+		if u.versions[key] == version {
+			delete(u.versions, key)
+		}
+		u.versionMu.Unlock()
+		if err != nil {
+			log.Printf("[redisstore] debug: %s: %v", label, err)
 		}
 	}()
 }
@@ -162,8 +211,10 @@ func (u *Upstash) LoadBinds() map[string]string {
 // Noop 纯内存降级：所有方法空实现。
 type Noop struct{}
 
-func (Noop) SetBind(string, string, time.Duration) {}
-func (Noop) DelBind(string)                        {}
-func (Noop) LoadBinds() map[string]string          { return nil }
-func (Noop) SaveState([]byte)                      {}
-func (Noop) LoadState() ([]byte, bool)             { return nil, false }
+func (Noop) SetBind(string, string, time.Duration)      {}
+func (Noop) DelBind(string)                             {}
+func (Noop) LoadBinds() map[string]string               { return nil }
+func (Noop) SaveState([]byte)                           {}
+func (Noop) LoadState() ([]byte, bool)                  { return nil, false }
+func (Noop) SaveResponse(string, []byte, time.Duration) {}
+func (Noop) LoadResponse(string) ([]byte, bool)         { return nil, false }

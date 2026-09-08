@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"sync"
 	"time"
 
 	"workbuddy2api/internal/pool"
@@ -22,7 +23,9 @@ type Config struct {
 
 // Scheduler 调度器。
 type Scheduler struct {
-	cfg Config
+	mu   sync.RWMutex
+	cfg  Config
+	wake chan struct{}
 }
 
 // New 构建。
@@ -33,7 +36,32 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.KeepaliveHours) == 0 {
 		cfg.KeepaliveHours = []int{22}
 	}
-	return &Scheduler{cfg: cfg}
+	return &Scheduler{cfg: cfg, wake: make(chan struct{}, 1)}
+}
+
+// UpdateSchedule applies management-console changes without restarting the
+// process and wakes Run so it can recalculate its next timer immediately.
+func (s *Scheduler) UpdateSchedule(checkinHours, keepaliveHours []int) {
+	if len(checkinHours) == 0 {
+		checkinHours = []int{9, 21}
+	}
+	if len(keepaliveHours) == 0 {
+		keepaliveHours = []int{22}
+	}
+	s.mu.Lock()
+	s.cfg.CheckinHours = append([]int(nil), checkinHours...)
+	s.cfg.KeepaliveHours = append([]int(nil), keepaliveHours...)
+	s.mu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Scheduler) schedule() (checkinHours, keepaliveHours []int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]int(nil), s.cfg.CheckinHours...), append([]int(nil), s.cfg.KeepaliveHours...)
 }
 
 // nextFire 返回 now 之后最近的一个整点触发时间；hours 为本地小时（0-23）。
@@ -53,20 +81,25 @@ func nextFire(now time.Time, hours []int) time.Time {
 
 // Run 主循环，阻塞直到 ctx 取消。
 func (s *Scheduler) Run(ctx context.Context) {
-	all := append(append([]int{}, s.cfg.CheckinHours...), s.cfg.KeepaliveHours...)
 	for {
+		checkinHours, keepaliveHours := s.schedule()
+		all := append(append([]int{}, checkinHours...), keepaliveHours...)
 		next := nextFire(time.Now(), all)
 		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return
+		case <-s.wake:
+			timer.Stop()
+			continue
 		case <-timer.C:
 			h := time.Now().Hour()
-			if contains(s.cfg.CheckinHours, h) {
+			checkinHours, keepaliveHours = s.schedule()
+			if contains(checkinHours, h) {
 				s.RunCheckinNow()
 			}
-			if contains(s.cfg.KeepaliveHours, h) {
+			if contains(keepaliveHours, h) {
 				s.RunKeepaliveNow()
 			}
 		}
@@ -90,7 +123,7 @@ func (s *Scheduler) RunCheckinNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.Snapshot().RefreshToken == "" {
 			continue
 		}
 		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
@@ -113,7 +146,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.Snapshot().RefreshToken == "" {
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {

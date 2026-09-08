@@ -63,21 +63,22 @@ func (r *Router) StartGC() {
 		r.mu.Unlock()
 		return
 	}
-	r.stop = make(chan struct{})
+	stop := make(chan struct{})
+	r.stop = stop
 	r.mu.Unlock()
 
-	go func() {
+	go func(stop <-chan struct{}) {
 		t := time.NewTicker(r.cfg.GCInterval)
 		defer t.Stop()
 		for {
 			select {
-			case <-r.stop:
+			case <-stop:
 				return
 			case <-t.C:
 				r.gcOnce(time.Now())
 			}
 		}
-	}()
+	}(stop)
 }
 
 // StopGC 停止后台 GC（幂等）。
@@ -269,10 +270,12 @@ func hashIndex(key string, n int) int {
 	return int(h % uint32(n))
 }
 
-// ExtractKey 从请求体提取会话键；按任务书给定顺序依次尝试，找不到返回空串（绝不失败）。
+// ExtractKey 从请求体提取会话键；按优先级依次尝试，找不到返回空串（绝不失败）。
 //  1. metadata.conversation_id
 //  2. conversation_id
-//  3. metadata.user_id
+//  3. conversation（Responses API 的会话键）
+//  4. prompt_cache_key（Responses API 的显式缓存分区键）
+//  5. metadata.user_id
 func ExtractKey(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -285,11 +288,20 @@ func ExtractKey(body []byte) string {
 		if v := strOrEmpty(meta["conversation_id"]); v != "" {
 			return v
 		}
-		if v := strOrEmpty(meta["user_id"]); v != "" {
-			return v
-		}
 	}
-	return strOrEmpty(obj["conversation_id"])
+	if v := strOrEmpty(obj["conversation_id"]); v != "" {
+		return v
+	}
+	if v := strOrEmpty(obj["conversation"]); v != "" {
+		return v
+	}
+	if v := strOrEmpty(obj["prompt_cache_key"]); v != "" {
+		return v
+	}
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		return strOrEmpty(meta["user_id"])
+	}
+	return ""
 }
 
 // strOrEmpty 把 JSON 字符串字段安全转 string（非字符串类型返回空）。

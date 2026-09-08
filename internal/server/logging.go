@@ -19,6 +19,7 @@ var requestMetrics struct {
 	requests, successes, failures          atomic.Int64
 	inputTokens, outputTokens, totalTokens atomic.Int64
 	cacheRead, cacheWrite, toolCalls       atomic.Int64
+	ttfbMillis, ttfbSamples, latencyMillis atomic.Int64
 	lastRequestUnix                        atomic.Int64
 }
 
@@ -28,29 +29,40 @@ var chatLogEnabled = true
 
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
-	start       time.Time
-	model       string
-	mode        string // "stream" | "sync"
-	uid         string // 完整 uid，展示时只取前 8 位
-	ttfb        time.Duration
-	toks        int // <0 表示 usage 缺失 → 显示 "-"
-	inputTokens int
-	totalTokens int
-	cacheRead   int
-	cacheWrite  int
-	toolCalls   int
-	status      int
+	start        time.Time
+	model        string
+	mode         string // "stream" | "sync"
+	uid          string // 完整 uid，展示时只取前 8 位
+	ttfb         time.Duration
+	toks         int // <0 表示 usage 缺失 → 显示 "-"
+	inputTokens  int
+	totalTokens  int
+	cacheRead    int
+	cacheWrite   int
+	toolCalls    int
+	status       int
+	metricsStore MetricsStore
 
 	logged bool
 }
 
+// MetricsStore receives one aggregate delta when a request finishes.
+type MetricsStore interface {
+	AddMetrics(requests, successes, failures, inputTokens, outputTokens, totalTokens, cacheRead, cacheWrite, toolCalls, ttfbMillis, ttfbSamples, latencyMillis, lastRequestUnix int64) error
+	SnapshotMetrics() map[string]any
+}
+
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
 func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
+	return newChatStatWithStore(now, body, stream, nil)
+}
+
+func newChatStatWithStore(now time.Time, body []byte, stream bool, store MetricsStore) *chatStat {
 	mode := "sync"
 	if stream {
 		mode = "stream"
 	}
-	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
+	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1, metricsStore: store}
 }
 
 // done 幂等落一行表格日志。
@@ -59,6 +71,7 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
+	elapsed := time.Since(s.start)
 	requestMetrics.requests.Add(1)
 	if s.status >= 200 && s.status < 300 {
 		requestMetrics.successes.Add(1)
@@ -71,8 +84,23 @@ func (s *chatStat) done() {
 	requestMetrics.cacheRead.Add(int64(s.cacheRead))
 	requestMetrics.cacheWrite.Add(int64(s.cacheWrite))
 	requestMetrics.toolCalls.Add(int64(s.toolCalls))
+	requestMetrics.latencyMillis.Add(elapsed.Milliseconds())
+	if s.ttfb > 0 {
+		requestMetrics.ttfbMillis.Add(s.ttfb.Milliseconds())
+		requestMetrics.ttfbSamples.Add(1)
+	}
 	requestMetrics.lastRequestUnix.Store(time.Now().Unix())
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
+	if s.metricsStore != nil {
+		_ = s.metricsStore.AddMetrics(1, boolInt(s.status >= 200 && s.status < 300), boolInt(s.status < 200 || s.status >= 300), int64(s.inputTokens), int64(maxInt(s.toks, 0)), int64(s.totalTokens), int64(s.cacheRead), int64(s.cacheWrite), int64(s.toolCalls), s.ttfb.Milliseconds(), boolInt(s.ttfb > 0), elapsed.Milliseconds(), time.Now().Unix())
+	}
+	logChatRow(s.ttfb, elapsed, s.model, s.mode, s.uid, s.status, s.toks)
+}
+
+func boolInt(value bool) int64 {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func maxInt(v, floor int) int {
@@ -81,8 +109,33 @@ func maxInt(v, floor int) int {
 	}
 	return v
 }
+
+func maxInts(values ...int) int {
+	max := 0
+	for _, value := range values {
+		if value > max {
+			max = value
+		}
+	}
+	return max
+}
 func metricsSnapshot() map[string]any {
-	return map[string]any{"requests": requestMetrics.requests.Load(), "successes": requestMetrics.successes.Load(), "failures": requestMetrics.failures.Load(), "input_tokens": requestMetrics.inputTokens.Load(), "output_tokens": requestMetrics.outputTokens.Load(), "total_tokens": requestMetrics.totalTokens.Load(), "cache_read_tokens": requestMetrics.cacheRead.Load(), "cache_write_tokens": requestMetrics.cacheWrite.Load(), "tool_calls": requestMetrics.toolCalls.Load(), "last_request_at": requestMetrics.lastRequestUnix.Load()}
+	requests := requestMetrics.requests.Load()
+	ttfbSamples := requestMetrics.ttfbSamples.Load()
+	avgLatencyMS := int64(0)
+	if requests > 0 {
+		avgLatencyMS = requestMetrics.latencyMillis.Load() / requests
+	}
+	avgTTFBMS := int64(0)
+	if ttfbSamples > 0 {
+		avgTTFBMS = requestMetrics.ttfbMillis.Load() / ttfbSamples
+	}
+	return map[string]any{
+		"requests": requests, "successes": requestMetrics.successes.Load(), "failures": requestMetrics.failures.Load(),
+		"input_tokens": requestMetrics.inputTokens.Load(), "output_tokens": requestMetrics.outputTokens.Load(), "total_tokens": requestMetrics.totalTokens.Load(),
+		"cache_read_tokens": requestMetrics.cacheRead.Load(), "cache_write_tokens": requestMetrics.cacheWrite.Load(), "tool_calls": requestMetrics.toolCalls.Load(),
+		"avg_ttfb_ms": avgTTFBMS, "avg_latency_ms": avgLatencyMS, "last_request_at": requestMetrics.lastRequestUnix.Load(),
+	}
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -148,10 +201,9 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		}
 		for _, c := range toolChunk.Choices {
 			for _, call := range c.Delta.ToolCalls {
-				key := call.ID
-				if key == "" {
-					key = fmt.Sprintf("index:%d", call.Index)
-				}
+				// IDs are commonly present only in the first delta; index remains
+				// stable across every fragment of the same tool call.
+				key := fmt.Sprintf("index:%d", call.Index)
 				if _, seen := s.toolCallIDs[key]; !seen {
 					s.toolCallIDs[key] = struct{}{}
 					s.toolCalls++
@@ -185,8 +237,8 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	s.tokens = chunk.Usage.CompletionTokens
 	s.inputTokens = chunk.Usage.PromptTokens
 	s.totalTokens = chunk.Usage.TotalTokens
-	s.cacheRead = chunk.Usage.PromptCacheHitTokens + chunk.Usage.CacheReadInputTokens + chunk.Usage.PromptTokensDetails.CachedTokens + chunk.Usage.InputTokensDetails.CachedTokens
-	s.cacheWrite = chunk.Usage.PromptCacheMissTokens + chunk.Usage.CacheCreationInputTokens + chunk.Usage.InputTokensDetails.CacheCreationInputTokens + chunk.Usage.InputTokensDetails.CacheWriteTokens
+	s.cacheRead = maxInts(chunk.Usage.PromptCacheHitTokens, chunk.Usage.CacheReadInputTokens, chunk.Usage.PromptTokensDetails.CachedTokens, chunk.Usage.InputTokensDetails.CachedTokens)
+	s.cacheWrite = maxInts(chunk.Usage.PromptCacheMissTokens, chunk.Usage.CacheCreationInputTokens, chunk.Usage.InputTokensDetails.CacheCreationInputTokens, chunk.Usage.InputTokensDetails.CacheWriteTokens)
 	s.totalTokens = chunk.Usage.TotalTokens
 }
 
@@ -242,14 +294,16 @@ func usageStats(resp map[string]any, s *chatStat) {
 			*dst = v
 		}
 	}
+	cacheRead := 0
 	for _, key := range []string{"prompt_cache_hit_tokens", "cache_read_input_tokens"} {
 		if v, ok := usageInt(u[key]); ok {
-			s.cacheRead += v
+			cacheRead = maxInts(cacheRead, v)
 		}
 	}
+	cacheWrite := 0
 	for _, key := range []string{"prompt_cache_miss_tokens", "cache_creation_input_tokens"} {
 		if v, ok := usageInt(u[key]); ok {
-			s.cacheWrite += v
+			cacheWrite = maxInts(cacheWrite, v)
 		}
 	}
 	// Responses API and several OpenAI-compatible providers expose cache usage
@@ -257,17 +311,19 @@ func usageStats(resp map[string]any, s *chatStat) {
 	for _, key := range []string{"prompt_tokens_details", "input_tokens_details"} {
 		if details, ok := u[key].(map[string]any); ok {
 			if v, ok := usageInt(details["cached_tokens"]); ok {
-				s.cacheRead += v
+				cacheRead = maxInts(cacheRead, v)
 			}
 		}
 	}
 	if details, ok := u["input_tokens_details"].(map[string]any); ok {
 		for _, key := range []string{"cache_creation_input_tokens", "cache_write_tokens"} {
 			if v, ok := usageInt(details[key]); ok {
-				s.cacheWrite += v
+				cacheWrite = maxInts(cacheWrite, v)
 			}
 		}
 	}
+	s.cacheRead = cacheRead
+	s.cacheWrite = cacheWrite
 	if choices, ok := resp["choices"].([]any); ok && len(choices) > 0 {
 		if c, ok := choices[0].(map[string]any); ok {
 			if m, ok := c["message"].(map[string]any); ok {

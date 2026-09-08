@@ -1,7 +1,14 @@
 # syntax=docker/dockerfile:1
+FROM node:22-alpine AS frontend-build
+WORKDIR /src/react
+COPY react/package.json react/package-lock.json ./
+RUN npm ci
+COPY react/ ./
+RUN npm run build
+
 FROM golang:1.23-alpine AS build
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server \
@@ -16,8 +23,8 @@ USER app
 WORKDIR /app
 COPY --from=build /out/wb2api /app/wb2api
 COPY --from=build /out/login /app/login
-COPY frontend /app/frontend
-COPY config.json /app/config.json
+COPY --from=frontend-build /src/react/dist /app/frontend
+COPY config.example.json /app/config.json
 EXPOSE 7863
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
   CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1

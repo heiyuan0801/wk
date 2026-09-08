@@ -184,9 +184,12 @@ Disabled ←────┘ (session 死亡，永久)
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer | OpenAI 兼容聊天补全（流式/非流式） |
+| `POST /v1/responses` | Bearer | Responses API 适配（流式/非流式、工具调用、`previous_response_id`） |
 | `GET /v1/models` | Bearer | 模型列表（动态拉取 + 静态兜底） |
 | `GET /status` | Bearer | 账号状态汇总（total/healthy/cooling/disabled + 每账号详情） |
 | `GET /healthz` | 无 | 健康检查（无健康账号时 503） |
+
+重复调用 `/v1/responses` 时应复用稳定的 `prompt_cache_key` 或 `conversation`；使用上一轮返回的 `previous_response_id` 时，服务会恢复该轮上下文并继续使用同一账号。响应历史默认保留 1 小时；配置 Upstash 后会同步到 Redis，可跨进程重启和多实例继续会话，未配置时使用进程内存。
 
 ## 稳定性设计
 

@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
+	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2 WorkBuddy"
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 )
@@ -36,24 +36,25 @@ func CommonHeaders(req *http.Request, a *auth.Auth) {
 // 缺省字段用 X-No-* 约定（与 CodeBuddy 官方 CLI 一致）。
 func ChatHeaders(req *http.Request, a *auth.Auth) {
 	CommonHeaders(req, a)
-	if a.AccessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	credentials := a.Snapshot()
+	if credentials.AccessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+credentials.AccessToken)
 	} else {
 		req.Header.Set("X-No-Authorization", "1")
 	}
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+	if credentials.UID != "" {
+		req.Header.Set("X-User-Id", credentials.UID)
 	} else {
 		req.Header.Set("X-No-User-Id", "1")
 	}
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+	if credentials.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", credentials.EnterpriseID)
 	} else {
 		req.Header.Set("X-No-Enterprise-Id", "1")
 	}
 	// 安全红线：绝不在 chat 请求里携带 X-Refresh-Token。
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	if credentials.Domain != "" {
+		req.Header.Set("X-Domain", credentials.Domain)
 	} else {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
@@ -62,27 +63,30 @@ func ChatHeaders(req *http.Request, a *auth.Auth) {
 
 // BillingHeaders billing 接口请求头。
 func BillingHeaders(req *http.Request, a *auth.Auth) {
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("User-Agent", clientUA)
+	credentials := a.Snapshot()
+	req.Header.Set("Authorization", "Bearer "+credentials.AccessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+	if credentials.UID != "" {
+		req.Header.Set("X-User-Id", credentials.UID)
 	}
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
-		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
+	if credentials.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", credentials.EnterpriseID)
+		req.Header.Set("X-Tenant-Id", credentials.EnterpriseID)
 	}
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	if credentials.Domain != "" {
+		req.Header.Set("X-Domain", credentials.Domain)
 	}
 }
 
 // RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。
 func RefreshHeaders(req *http.Request, a *auth.Auth) {
 	CommonHeaders(req, a)
-	req.Header.Set("X-Refresh-Token", a.RefreshToken)
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+	credentials := a.Snapshot()
+	req.Header.Set("X-Refresh-Token", credentials.RefreshToken)
+	if credentials.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", credentials.EnterpriseID)
 	}
 	req.Header.Set("X-Auth-Refresh-Source", "workbuddy")
 }

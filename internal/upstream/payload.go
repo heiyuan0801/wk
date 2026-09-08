@@ -119,6 +119,12 @@ func normalizeToolChoice(obj map[string]any) {
 	}
 	tc, present := obj["tool_choice"]
 	if !present {
+		// Some compatible upstreams otherwise treat a request that contains
+		// tools as plain chat and never emit tool_calls. Explicitly selecting
+		// auto keeps normal text responses possible while enabling tool use.
+		if tools, ok := obj["tools"].([]any); ok && len(tools) > 0 {
+			obj["tool_choice"] = "auto"
+		}
 		return
 	}
 	switch v := tc.(type) {

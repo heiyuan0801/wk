@@ -14,8 +14,9 @@ import (
 
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或 CPA 面板扁平形）。
 type Auth struct {
-	// mu 串行化 RefreshToken 写与 SaveAtomic 读，防止并发写回半更新 token。
-	mu sync.Mutex
+	mu        sync.RWMutex
+	refreshMu sync.Mutex
+	saveMu    sync.Mutex
 
 	AccessToken  string
 	RefreshToken string
@@ -27,18 +28,60 @@ type Auth struct {
 	FilePath     string // 来源文件；refresh 后原子写回此处
 }
 
-// Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
-func (a *Auth) Lock() { a.mu.Lock() }
+// Credentials is an immutable point-in-time copy of an account credential.
+type Credentials struct {
+	AccessToken  string
+	RefreshToken string
+	ExpiresAt    int64
+	Domain       string
+	UID          string
+	EnterpriseID string
+	Nickname     string
+	FilePath     string
+}
+
+// Lock serializes refresh operations for one account. Credential field access
+// still goes through Snapshot and ApplyRefresh so HTTP calls never observe a
+// partially updated token bundle.
+func (a *Auth) Lock() { a.refreshMu.Lock() }
 
 // Unlock 释放 a.Lock 获取的锁。
-func (a *Auth) Unlock() { a.mu.Unlock() }
+func (a *Auth) Unlock() { a.refreshMu.Unlock() }
+
+// Snapshot returns a consistent copy safe for concurrent request building.
+func (a *Auth) Snapshot() Credentials {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return Credentials{
+		AccessToken: a.AccessToken, RefreshToken: a.RefreshToken, ExpiresAt: a.ExpiresAt,
+		Domain: a.Domain, UID: a.UID, EnterpriseID: a.EnterpriseID,
+		Nickname: a.Nickname, FilePath: a.FilePath,
+	}
+}
+
+// ApplyRefresh atomically updates the fields returned by a token refresh.
+// Empty optional values preserve their current value.
+func (a *Auth) ApplyRefresh(accessToken, refreshToken, domain string, expiresAt int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.AccessToken = accessToken
+	if refreshToken != "" {
+		a.RefreshToken = refreshToken
+	}
+	if domain != "" {
+		a.Domain = domain
+	}
+	if expiresAt > 0 {
+		a.ExpiresAt = expiresAt
+	}
+}
 
 // globalSuffix 判定全球区（global）账号的域名后缀；子域（如 www./api.）也属于全球区。
 const globalSuffix = ".workbuddy.ai"
 
 // Region 返回 "cn" 或 "global"。domain 为空视为 CN（向后兼容）。
 func (a *Auth) Region() string {
-	d := strings.ToLower(strings.TrimSpace(a.Domain))
+	d := strings.ToLower(strings.TrimSpace(a.Snapshot().Domain))
 	if d == strings.TrimPrefix(globalSuffix, ".") || strings.HasSuffix(d, globalSuffix) {
 		return "global"
 	}
@@ -47,10 +90,11 @@ func (a *Auth) Region() string {
 
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
-	if a.ExpiresAt <= 0 {
+	expiresAt := a.Snapshot().ExpiresAt
+	if expiresAt <= 0 {
 		return true
 	}
-	return time.Now().Add(within).Unix() >= a.ExpiresAt
+	return time.Now().Add(within).Unix() >= expiresAt
 }
 
 // Parse 兼容两种磁盘形态：
@@ -122,39 +166,40 @@ func Parse(raw []byte) (*Auth, error) {
 }
 
 // SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename），保持 CPA 插件可读格式。
-// 全程持 a.mu：防止与 RefreshToken 修改 token 字段并发，杜绝写回半更新。
+// 使用一致快照写回，防止与 RefreshToken 并发时落盘半更新 token。
 // 防御：accessToken 为空时拒绝写回，避免误用空凭证覆盖有效文件。
 func (a *Auth) SaveAtomic() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if strings.TrimSpace(a.AccessToken) == "" {
-		return fmt.Errorf("save refused: empty accessToken (uid=%s)", a.UID)
+	a.saveMu.Lock()
+	defer a.saveMu.Unlock()
+	snapshot := a.Snapshot()
+	if strings.TrimSpace(snapshot.AccessToken) == "" {
+		return fmt.Errorf("save refused: empty accessToken (uid=%s)", snapshot.UID)
 	}
-	if a.FilePath == "" {
+	if snapshot.FilePath == "" {
 		return fmt.Errorf("no FilePath set")
 	}
 	doc := map[string]any{
 		"auth": map[string]any{
-			"accessToken":  a.AccessToken,
-			"refreshToken": a.RefreshToken,
-			"expiresAt":    a.ExpiresAt,
-			"domain":       a.Domain,
+			"accessToken":  snapshot.AccessToken,
+			"refreshToken": snapshot.RefreshToken,
+			"expiresAt":    snapshot.ExpiresAt,
+			"domain":       snapshot.Domain,
 		},
 		"account": map[string]any{
-			"uid":          a.UID,
-			"enterpriseId": a.EnterpriseID,
-			"nickname":     a.Nickname,
+			"uid":          snapshot.UID,
+			"enterpriseId": snapshot.EnterpriseID,
+			"nickname":     snapshot.Nickname,
 		},
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := a.FilePath + ".tmp"
+	tmp := snapshot.FilePath + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, a.FilePath)
+	return os.Rename(tmp, snapshot.FilePath)
 }
 
 // LoadDir 扫描 dir 下 workbuddy*.json，只收 wantRegion（"cn"/"global"）。

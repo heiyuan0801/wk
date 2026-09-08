@@ -3,6 +3,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -36,24 +38,57 @@ type Config struct {
 	Region           string
 	LoginBin         string // OAuth 登录辅助程序路径
 	CheckinNow       func()
+	UpdateSchedule   func(checkinHours, keepaliveHours []int)
 	MaxRotate        int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
 	StickyCount func() int
 	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
-	RedisMode    string
-	SoftCooldown time.Duration // 429 冷却，默认 60s
-	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+	RedisMode     string
+	SoftCooldown  time.Duration // 429 冷却，默认 60s
+	RefreshSkew   time.Duration // token 提前刷新窗口，默认 10m
+	ResponseStore ResponseStore
+	MetricsStore  MetricsStore
+}
+
+// ResponseStore is the optional Redis-backed persistence used by
+// previous_response_id across restarts and replicas.
+type ResponseStore interface {
+	SaveResponse(id string, data []byte, ttl time.Duration)
+	LoadResponse(id string) ([]byte, bool)
 }
 
 // Handler 主路由。
 type Handler struct {
-	cfg        Config
-	mux        *http.ServeMux
-	sessionsMu sync.Mutex
-	sessions   map[string]time.Time
+	cfg             Config
+	mux             *http.ServeMux
+	sessionsMu      sync.Mutex
+	sessions        map[string]time.Time
+	responsesMu     sync.Mutex
+	responseHistory map[string]storedResponse
+	responseBytes   int
 }
+
+type storedResponse struct {
+	messages  []map[string]any
+	parentID  string
+	routeKey  string
+	expiresAt time.Time
+	size      int
+}
+
+type storedResponseWire struct {
+	Messages []map[string]any `json:"messages"`
+	ParentID string           `json:"parent_id,omitempty"`
+	RouteKey string           `json:"route_key"`
+}
+
+const (
+	responseHistoryTTL      = time.Hour
+	maxResponseHistory      = 1024
+	maxResponseHistoryBytes = 64 << 20
+)
 
 // NewHandler 构建 handler。
 func NewHandler(cfg Config) *Handler {
@@ -66,7 +101,7 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sessions: make(map[string]time.Time)}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sessions: make(map[string]time.Time), responseHistory: make(map[string]storedResponse)}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
@@ -90,16 +125,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if h.cfg.APIKey != "" {
-			authz := r.Header.Get("Authorization")
-			validAPIKey := strings.HasPrefix(authz, "Bearer ") && strings.TrimPrefix(authz, "Bearer ") == h.cfg.APIKey
-			if !validAPIKey && !h.frontendSession(r) {
-				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
-				return
-			}
+		if h.cfg.APIKey != "" && !h.validAPIKey(r) && !h.frontendSession(r) {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return
 		}
 		next(w, r)
 	}
+}
+
+func (h *Handler) validAPIKey(r *http.Request) bool {
+	if h.cfg.APIKey == "" {
+		return false
+	}
+	authz := r.Header.Get("Authorization")
+	return strings.HasPrefix(authz, "Bearer ") && strings.TrimPrefix(authz, "Bearer ") == h.cfg.APIKey
 }
 
 func (h *Handler) frontendSession(r *http.Request) bool {
@@ -122,8 +161,11 @@ func (h *Handler) frontendSession(r *http.Request) bool {
 
 func (h *Handler) withFrontend(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if h.cfg.FrontendPassword != "" && !h.frontendSession(r) {
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"code": "frontend_locked", "message": "frontend password required"}})
+		// Admin endpoints accept either the configured API key or the frontend
+		// unlock cookie. If either credential is configured, require one of them.
+		if (h.cfg.APIKey != "" || h.cfg.FrontendPassword != "") &&
+			!h.validAPIKey(r) && !h.frontendSession(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"code": "frontend_locked", "message": "frontend password or API key required"}})
 			return
 		}
 		next(w, r)
@@ -184,16 +226,10 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
 		return
 	}
-	validHours := func(xs []int) bool {
-		for _, x := range xs {
-			if x < 0 || x > 23 {
-				return false
-			}
-		}
-		return true
-	}
-	if !validHours(req.CheckinHours) || !validHours(req.KeepaliveHours) {
-		writeJSON(w, 400, map[string]string{"error": "小时必须在 0-23 之间"})
+	checkinHours, checkinOK := normalizeScheduleHours(req.CheckinHours)
+	keepaliveHours, keepaliveOK := normalizeScheduleHours(req.KeepaliveHours)
+	if !checkinOK || !keepaliveOK {
+		writeJSON(w, 400, map[string]string{"error": "每项至少填写一个 0-23 的整数小时"})
 		return
 	}
 	raw, err := os.ReadFile(h.cfg.ConfigPath)
@@ -206,13 +242,64 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": "invalid config"})
 		return
 	}
-	doc["schedule"] = map[string]any{"checkin_hours": req.CheckinHours, "keepalive_hours": req.KeepaliveHours}
+	schedule := map[string]any{"checkin_hours": checkinHours, "keepalive_hours": keepaliveHours}
+	doc["schedule"] = schedule
 	out, _ := json.MarshalIndent(doc, "", "  ")
-	if err := os.WriteFile(h.cfg.ConfigPath, append(out, '\n'), 0644); err != nil {
+	if err := writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600); err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "restart_required": true})
+	restartRequired := h.cfg.UpdateSchedule == nil
+	if h.cfg.UpdateSchedule != nil {
+		h.cfg.UpdateSchedule(checkinHours, keepaliveHours)
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "restart_required": restartRequired, "schedule": schedule})
+}
+
+func normalizeScheduleHours(hours []int) ([]int, bool) {
+	if len(hours) == 0 {
+		return nil, false
+	}
+	seen := make(map[int]struct{}, len(hours))
+	out := make([]int, 0, len(hours))
+	for _, hour := range hours {
+		if hour < 0 || hour > 23 {
+			return nil, false
+		}
+		if _, exists := seen[hour]; exists {
+			continue
+		}
+		seen[hour] = struct{}{}
+		out = append(out, hour)
+	}
+	sort.Ints(out)
+	return out, true
+}
+
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".wb2api-config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func (h *Handler) runCheckin(w http.ResponseWriter, r *http.Request) {
@@ -224,18 +311,18 @@ func (h *Handler) runCheckin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 202, map[string]any{"ok": true, "message": "签到任务已启动"})
 }
 
-func (h *Handler) loginCommand(arg string) ([]byte, error) {
+func (h *Handler) loginCommand(ctx context.Context, arg string) ([]byte, error) {
 	bin := h.cfg.LoginBin
 	if bin == "" {
 		bin = "./login"
 	}
-	cmd := exec.Command(bin, arg)
+	cmd := exec.CommandContext(ctx, bin, arg)
 	cmd.Dir = filepath.Dir(h.cfg.ConfigPath)
 	return cmd.Output()
 }
 
 func (h *Handler) accountURL(w http.ResponseWriter, r *http.Request) {
-	out, err := h.loginCommand("url")
+	out, err := h.loginCommand(r.Context(), "url")
 	if err != nil {
 		writeJSON(w, 502, map[string]string{"error": fmt.Sprintf("登录初始化失败: %v", err)})
 		return
@@ -244,7 +331,7 @@ func (h *Handler) accountURL(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
-	out, err := h.loginCommand("poll")
+	out, err := h.loginCommand(r.Context(), "poll")
 	if err != nil {
 		writeJSON(w, 409, map[string]string{"error": "登录尚未完成，请先在浏览器完成授权"})
 		return
@@ -263,7 +350,8 @@ func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	doc := map[string]any{"auth": map[string]any{"accessToken": result.AccessToken, "refreshToken": result.RefreshToken, "expiresAt": time.Now().Unix() + result.ExpiresIn, "domain": result.Domain}, "account": map[string]any{"uid": result.UID, "enterpriseId": result.EnterpriseID, "nickname": result.Nickname}}
+	expiresAt := time.Now().Unix() + result.ExpiresIn
+	doc := map[string]any{"auth": map[string]any{"accessToken": result.AccessToken, "refreshToken": result.RefreshToken, "expiresAt": expiresAt, "domain": result.Domain}, "account": map[string]any{"uid": result.UID, "enterpriseId": result.EnterpriseID, "nickname": result.Nickname}}
 	raw, _ := json.MarshalIndent(doc, "", "  ")
 	path := filepath.Join(h.cfg.AuthDir, "workbuddy-"+result.UID+".json")
 	if err := os.WriteFile(path, append(raw, '\n'), 0600); err != nil {
@@ -272,6 +360,13 @@ func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	if loaded, err := auth.LoadDir(h.cfg.AuthDir, h.cfg.Region); err == nil {
 		h.cfg.Pool.SyncToDir(loaded)
+	}
+	if h.cfg.Pool != nil {
+		h.cfg.Pool.Add(&auth.Auth{
+			AccessToken: result.AccessToken, RefreshToken: result.RefreshToken, ExpiresAt: expiresAt,
+			Domain: result.Domain, UID: result.UID, EnterpriseID: result.EnterpriseID,
+			Nickname: result.Nickname, FilePath: path,
+		})
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "uid": result.UID, "nickname": result.Nickname})
 }
@@ -306,12 +401,19 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		"in_flight_full":  inFlightFull,
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
-		"metrics":         metricsSnapshot(),
+		"metrics":         h.metricsSnapshot(),
 	})
 }
 
 func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, metricsSnapshot())
+	writeJSON(w, http.StatusOK, h.metricsSnapshot())
+}
+
+func (h *Handler) metricsSnapshot() map[string]any {
+	if h.cfg.MetricsStore != nil {
+		return h.cfg.MetricsStore.SnapshotMetrics()
+	}
+	return metricsSnapshot()
 }
 
 // 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
@@ -423,6 +525,42 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	var requestDoc map[string]any
+	var chatDoc map[string]any
+	if json.Unmarshal(body, &requestDoc) != nil || json.Unmarshal(chatBody, &chatDoc) != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid request body")
+		return
+	}
+	currentMessages, _ := chatDoc["messages"].([]any)
+	turnMessages := responseMessages(currentMessages)
+	messages := turnMessages
+	routeKey := session.ExtractKey(body)
+	previousID, _ := requestDoc["previous_response_id"].(string)
+	if previousID != "" {
+		previousMessages, previousRouteKey, ok := h.loadResponseHistory(previousID)
+		if !ok {
+			writeOpenAIError(w, http.StatusBadRequest, "previous_response_not_found", "previous_response_id is unknown or expired")
+			return
+		}
+		messages = append(previousMessages, messages...)
+		routeKey = previousRouteKey
+	}
+	responseID := newResponseID()
+	if routeKey == "" {
+		routeKey = "responses:" + responseID
+	}
+	chatDoc["messages"] = messages
+	meta, _ := chatDoc["metadata"].(map[string]any)
+	if meta == nil {
+		meta = make(map[string]any)
+		chatDoc["metadata"] = meta
+	}
+	meta["conversation_id"] = routeKey
+	chatBody, err = json.Marshal(chatDoc)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
 	chatReq := r.Clone(r.Context())
 	chatReq.Body = io.NopCloser(bytes.NewReader(chatBody))
 	if !stream {
@@ -437,11 +575,149 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 			copyResponse(w, rec)
 			return
 		}
-		writeJSON(w, http.StatusOK, chatToResponse(chat))
+		response := chatToResponse(chat, responseID)
+		if assistant := chatAssistantMessage(chat); assistant != nil {
+			h.storeResponse(responseID, append(append([]map[string]any{}, turnMessages...), assistant), routeKey, previousID)
+		}
+		writeJSON(w, http.StatusOK, response)
 		return
 	}
-	sw := &responsesStreamWriter{header: make(http.Header), dst: w}
+	sw := &responsesStreamWriter{
+		header: make(http.Header), dst: w, id: responseID,
+		onComplete: func(assistant map[string]any) {
+			h.storeResponse(responseID, append(append([]map[string]any{}, turnMessages...), assistant), routeKey, previousID)
+		},
+	}
 	h.chatCompletions(sw, chatReq)
+}
+
+func responseMessages(raw []any) []map[string]any {
+	out := make([]map[string]any, 0, len(raw))
+	for _, item := range raw {
+		if message, ok := item.(map[string]any); ok {
+			out = append(out, message)
+		}
+	}
+	return out
+}
+
+func newResponseID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err == nil {
+		return "resp_" + hex.EncodeToString(b)
+	}
+	return fmt.Sprintf("resp_%d", time.Now().UnixNano())
+}
+
+func (h *Handler) loadResponseHistory(id string) ([]map[string]any, string, bool) {
+	seen := make(map[string]struct{})
+	var routeKey string
+	var turns [][]map[string]any
+	for id != "" {
+		if _, duplicate := seen[id]; duplicate {
+			return nil, "", false
+		}
+		seen[id] = struct{}{}
+		record, ok := h.loadResponseRecord(id)
+		if !ok {
+			return nil, "", false
+		}
+		if routeKey == "" {
+			routeKey = record.routeKey
+		}
+		turns = append(turns, record.messages)
+		id = record.parentID
+	}
+	history := make([]map[string]any, 0)
+	for i := len(turns) - 1; i >= 0; i-- {
+		history = append(history, turns[i]...)
+	}
+	return history, routeKey, true
+}
+
+func (h *Handler) loadResponseRecord(id string) (storedResponse, bool) {
+	now := time.Now()
+	h.responsesMu.Lock()
+	record, ok := h.responseHistory[id]
+	if ok && now.After(record.expiresAt) {
+		h.deleteResponseLocked(id)
+		ok = false
+	}
+	h.responsesMu.Unlock()
+	if ok {
+		return record, true
+	}
+	if h.cfg.ResponseStore == nil {
+		return storedResponse{}, false
+	}
+	raw, ok := h.cfg.ResponseStore.LoadResponse(id)
+	if !ok {
+		return storedResponse{}, false
+	}
+	var persisted storedResponseWire
+	if json.Unmarshal(raw, &persisted) != nil || len(persisted.Messages) == 0 || persisted.RouteKey == "" {
+		return storedResponse{}, false
+	}
+	record = storedResponse{
+		messages: persisted.Messages, parentID: persisted.ParentID, routeKey: persisted.RouteKey,
+		expiresAt: now.Add(responseHistoryTTL), size: len(raw),
+	}
+	h.cacheResponse(id, record)
+	return record, true
+}
+
+func (h *Handler) storeResponse(id string, messages []map[string]any, routeKey, parentID string) {
+	now := time.Now()
+	raw, _ := json.Marshal(messages)
+	h.cacheResponse(id, storedResponse{
+		messages: append([]map[string]any{}, messages...), parentID: parentID, routeKey: routeKey,
+		expiresAt: now.Add(responseHistoryTTL), size: len(raw),
+	})
+	if h.cfg.ResponseStore != nil {
+		persisted, err := json.Marshal(storedResponseWire{Messages: messages, ParentID: parentID, RouteKey: routeKey})
+		if err == nil {
+			h.cfg.ResponseStore.SaveResponse(id, persisted, responseHistoryTTL)
+		}
+	}
+}
+
+func (h *Handler) cacheResponse(id string, record storedResponse) {
+	now := time.Now()
+	h.responsesMu.Lock()
+	defer h.responsesMu.Unlock()
+	if _, exists := h.responseHistory[id]; exists {
+		h.deleteResponseLocked(id)
+	}
+	for key, record := range h.responseHistory {
+		if now.After(record.expiresAt) {
+			h.deleteResponseLocked(key)
+		}
+	}
+	for len(h.responseHistory) >= maxResponseHistory || h.responseBytes+record.size > maxResponseHistoryBytes {
+		var oldestID string
+		var oldest time.Time
+		for key, record := range h.responseHistory {
+			if oldestID == "" || record.expiresAt.Before(oldest) {
+				oldestID, oldest = key, record.expiresAt
+			}
+		}
+		if oldestID == "" {
+			break
+		}
+		h.deleteResponseLocked(oldestID)
+	}
+	if record.size > maxResponseHistoryBytes {
+		return
+	}
+	h.responseHistory[id] = record
+	h.responseBytes += record.size
+}
+
+func (h *Handler) deleteResponseLocked(id string) {
+	if record, ok := h.responseHistory[id]; ok {
+		h.responseBytes -= record.size
+		delete(h.responseHistory, id)
+	}
 }
 
 func responsesToChat(raw []byte) ([]byte, bool, error) {
@@ -452,10 +728,34 @@ func responsesToChat(raw []byte) ([]byte, bool, error) {
 	chat := make(map[string]any, len(in))
 	for k, v := range in {
 		switch k {
-		case "input", "instructions", "stream", "max_output_tokens":
+		case "input", "instructions", "stream", "max_output_tokens", "conversation", "previous_response_id":
 			continue
 		}
 		chat[k] = v
+	}
+	// Responses tools are flat ({type,name,parameters}); Chat Completions
+	// expects function metadata nested under `function`.
+	if rawTools, ok := in["tools"].([]any); ok {
+		tools := make([]any, 0, len(rawTools))
+		for _, raw := range rawTools {
+			tool, ok := raw.(map[string]any)
+			if !ok || tool["type"] != "function" {
+				tools = append(tools, raw)
+				continue
+			}
+			if _, nested := tool["function"].(map[string]any); nested {
+				tools = append(tools, tool)
+				continue
+			}
+			fn := make(map[string]any, len(tool))
+			for k, v := range tool {
+				if k != "type" {
+					fn[k] = v
+				}
+			}
+			tools = append(tools, map[string]any{"type": "function", "function": fn})
+		}
+		chat["tools"] = tools
 	}
 	if model, ok := in["model"].(string); !ok || strings.TrimSpace(model) == "" {
 		return nil, false, fmt.Errorf("model is required")
@@ -471,6 +771,18 @@ func responsesToChat(raw []byte) ([]byte, bool, error) {
 		return nil, false, fmt.Errorf("input is required")
 	}
 	chat["messages"] = msgs
+	// Carry a stable Responses conversation/cache key into the existing chat
+	// routing path without sending Responses-only conversation fields upstream.
+	if key := session.ExtractKey(raw); key != "" {
+		meta, _ := chat["metadata"].(map[string]any)
+		if meta == nil {
+			meta = make(map[string]any)
+			chat["metadata"] = meta
+		}
+		if _, exists := meta["conversation_id"]; !exists {
+			meta["conversation_id"] = key
+		}
+	}
 	stream, _ := in["stream"].(bool)
 	chat["stream"] = stream
 	if n, ok := in["max_output_tokens"]; ok {
@@ -481,9 +793,9 @@ func responsesToChat(raw []byte) ([]byte, bool, error) {
 }
 
 func appendResponseInput(msgs *[]map[string]any, input any) {
-	appendOne := func(role, text string) {
-		if text != "" {
-			*msgs = append(*msgs, map[string]any{"role": role, "content": text})
+	appendOne := func(role string, content any) {
+		if content != nil && content != "" {
+			*msgs = append(*msgs, map[string]any{"role": role, "content": content})
 		}
 	}
 	switch v := input.(type) {
@@ -498,6 +810,37 @@ func appendResponseInput(msgs *[]map[string]any, input any) {
 				}
 				continue
 			}
+			typ, _ := m["type"].(string)
+			switch typ {
+			case "function_call":
+				callID, _ := m["call_id"].(string)
+				name, _ := m["name"].(string)
+				args, _ := m["arguments"].(string)
+				if callID != "" && name != "" {
+					call := map[string]any{"id": callID, "type": "function", "function": map[string]any{"name": name, "arguments": args}}
+					if n := len(*msgs); n > 0 && (*msgs)[n-1]["role"] == "assistant" {
+						last := (*msgs)[n-1]
+						calls, _ := last["tool_calls"].([]any)
+						last["tool_calls"] = append(calls, call)
+					} else {
+						*msgs = append(*msgs, map[string]any{"role": "assistant", "content": "", "tool_calls": []any{call}})
+					}
+				}
+				continue
+			case "function_call_output":
+				callID, _ := m["call_id"].(string)
+				var output any = m["output"]
+				if parts, ok := output.([]any); ok {
+					output = responseContentToChat(parts)
+				}
+				if output == nil {
+					output = ""
+				}
+				if callID != "" {
+					*msgs = append(*msgs, map[string]any{"role": "tool", "tool_call_id": callID, "content": output})
+				}
+				continue
+			}
 			role, _ := m["role"].(string)
 			if role == "" {
 				role = "user"
@@ -507,15 +850,7 @@ func appendResponseInput(msgs *[]map[string]any, input any) {
 				continue
 			}
 			if content, ok := m["content"].([]any); ok {
-				var b strings.Builder
-				for _, part := range content {
-					if p, ok := part.(map[string]any); ok {
-						if text, ok := p["text"].(string); ok {
-							b.WriteString(text)
-						}
-					}
-				}
-				appendOne(role, b.String())
+				appendOne(role, responseContentToChat(content))
 				continue
 			}
 			if text, ok := m["text"].(string); ok {
@@ -532,48 +867,150 @@ func appendResponseInput(msgs *[]map[string]any, input any) {
 	}
 }
 
-func chatToResponse(chat map[string]any) map[string]any {
-	id := fmt.Sprintf("resp-%d", time.Now().UnixNano())
-	if s, ok := chat["id"].(string); ok && s != "" {
-		id = "resp-" + s
+func responseContentToChat(content []any) []any {
+	out := make([]any, 0, len(content))
+	for _, raw := range content {
+		part, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		typ, _ := part["type"].(string)
+		switch typ {
+		case "input_text", "output_text", "text":
+			if text, _ := part["text"].(string); text != "" {
+				out = append(out, map[string]any{"type": "text", "text": text})
+			}
+		case "input_image", "image_url":
+			if imageURL, ok := part["image_url"].(string); ok && imageURL != "" {
+				image := map[string]any{"url": imageURL}
+				if detail, _ := part["detail"].(string); detail != "" {
+					image["detail"] = detail
+				}
+				out = append(out, map[string]any{"type": "image_url", "image_url": image})
+			} else if imageURL, ok := part["image_url"].(map[string]any); ok {
+				out = append(out, map[string]any{"type": "image_url", "image_url": imageURL})
+			} else if fileID, _ := part["file_id"].(string); fileID != "" {
+				// Some compatible providers accept uploaded image IDs in the
+				// image_url object even though the field name is historical.
+				out = append(out, map[string]any{"type": "image_url", "image_url": map[string]any{"file_id": fileID}})
+			}
+		case "input_audio", "audio":
+			audio, _ := part["input_audio"].(map[string]any)
+			if audio == nil {
+				audio, _ = part["audio"].(map[string]any)
+			}
+			if audio == nil {
+				audio = selectFields(part, "data", "format")
+			}
+			if len(audio) > 0 {
+				out = append(out, map[string]any{"type": "input_audio", "input_audio": audio})
+			}
+		case "input_file", "file":
+			file, _ := part["file"].(map[string]any)
+			if file == nil {
+				file = selectFields(part, "file_id", "file_data", "filename")
+			}
+			if len(file) > 0 {
+				out = append(out, map[string]any{"type": "file", "file": file})
+			}
+		}
+	}
+	return out
+}
+
+func selectFields(source map[string]any, keys ...string) map[string]any {
+	out := make(map[string]any, len(keys))
+	for _, key := range keys {
+		if value, ok := source[key]; ok && value != nil && value != "" {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func chatToResponse(chat map[string]any, id string) map[string]any {
+	if id == "" {
+		id = newResponseID()
 	}
 	model, _ := chat["model"].(string)
 	text := ""
-	finish := "completed"
+	finishReason := ""
+	var message map[string]any
 	if choices, ok := chat["choices"].([]any); ok && len(choices) > 0 {
-		if c, ok := choices[0].(map[string]any); ok {
-			if m, ok := c["message"].(map[string]any); ok {
-				text, _ = m["content"].(string)
-			}
-			if fr, ok := c["finish_reason"].(string); ok && fr != "stop" {
-				finish = fr
-			}
+		if choice, ok := choices[0].(map[string]any); ok {
+			message, _ = choice["message"].(map[string]any)
+			text, _ = message["content"].(string)
+			finishReason, _ = choice["finish_reason"].(string)
 		}
 	}
-	item := map[string]any{"id": id + "-item", "type": "message", "status": finish, "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}}
-	output := []any{item}
-	if choices, ok := chat["choices"].([]any); ok && len(choices) > 0 {
-		if c, ok := choices[0].(map[string]any); ok {
-			if m, ok := c["message"].(map[string]any); ok {
-				if calls, ok := m["tool_calls"].([]any); ok {
-					for i, raw := range calls {
-						if call, ok := raw.(map[string]any); ok {
-							fn, _ := call["function"].(map[string]any)
-							name, _ := fn["name"].(string)
-							args, _ := fn["arguments"].(string)
-							callID, _ := call["id"].(string)
-							output = append(output, map[string]any{"id": callID, "type": "function_call", "status": "completed", "call_id": callID, "name": name, "arguments": args, "index": i})
-						}
-					}
-				}
-			}
-		}
+
+	calls, _ := message["tool_calls"].([]any)
+	output := make([]any, 0, len(calls)+1)
+	if text != "" || len(calls) == 0 {
+		output = append(output, map[string]any{
+			"id": id + "-item", "type": "message", "status": "completed", "role": "assistant",
+			"content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}},
+		})
 	}
-	out := map[string]any{"id": id, "object": "response", "created_at": time.Now().Unix(), "status": finish, "model": model, "output": output, "output_text": text}
-	if u, ok := chat["usage"]; ok {
-		out["usage"] = responseUsage(u)
+	for i, raw := range calls {
+		call, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, _ := call["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		args, _ := fn["arguments"].(string)
+		callID, _ := call["id"].(string)
+		if callID == "" {
+			callID = fmt.Sprintf("call-%s-%d", id, i)
+		}
+		output = append(output, map[string]any{
+			"id": callID, "type": "function_call", "status": "completed", "call_id": callID,
+			"name": name, "arguments": args,
+		})
+	}
+
+	status := "completed"
+	out := map[string]any{
+		"id": id, "object": "response", "created_at": time.Now().Unix(), "status": status,
+		"model": model, "output": output, "output_text": text,
+	}
+	if finishReason == "length" {
+		out["status"] = "incomplete"
+		out["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+	}
+	if usage, ok := chat["usage"]; ok {
+		out["usage"] = responseUsage(usage)
 	}
 	return out
+}
+
+func chatAssistantMessage(chat map[string]any) map[string]any {
+	choices, ok := chat["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		return nil
+	}
+	choice, ok := choices[0].(map[string]any)
+	if !ok {
+		return nil
+	}
+	message, ok := choice["message"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	assistant := map[string]any{"role": "assistant"}
+	if content, exists := message["content"]; exists {
+		assistant["content"] = content
+	}
+	if calls, exists := message["tool_calls"]; exists {
+		assistant["tool_calls"] = calls
+	}
+	if _, hasContent := assistant["content"]; !hasContent {
+		if _, hasCalls := assistant["tool_calls"]; !hasCalls {
+			return nil
+		}
+	}
+	return assistant
 }
 
 // responseUsage normalizes the upstream Chat Completions usage shape into the
@@ -604,7 +1041,12 @@ func responseUsage(raw any) any {
 		cached := 0
 		for _, key := range []string{"prompt_cache_hit_tokens", "cache_read_input_tokens"} {
 			if n, ok := numberInt(u[key]); ok {
-				cached += n
+				cached = maxInts(cached, n)
+			}
+		}
+		if details, ok := u["prompt_tokens_details"].(map[string]any); ok {
+			if n, ok := numberInt(details["cached_tokens"]); ok {
+				cached = maxInts(cached, n)
 			}
 		}
 		if cached > 0 {
@@ -649,21 +1091,51 @@ func copyResponse(dst http.ResponseWriter, src *httptest.ResponseRecorder) {
 }
 
 type responsesStreamWriter struct {
-	header  http.Header
-	dst     http.ResponseWriter
-	buf     bytes.Buffer
-	started bool
-	id      string
-	model   string
+	header      http.Header
+	dst         http.ResponseWriter
+	buf         bytes.Buffer
+	started     bool
+	passthrough bool
+	completed   bool
+	id          string
+	model       string
+	finish      string
+	outputText  strings.Builder
+	textStarted bool
+	textIndex   int
+	nextIndex   int
+	usage       map[string]any
+	calls       map[int]*responseStreamCall
+	onComplete  func(map[string]any)
+}
+
+type responseStreamCall struct {
+	index int
+	id    string
+	name  string
+	args  strings.Builder
+	added bool
 }
 
 func (w *responsesStreamWriter) Header() http.Header { return w.header }
 func (w *responsesStreamWriter) WriteHeader(code int) {
 	if code >= 400 {
+		for k, values := range w.header {
+			for _, value := range values {
+				w.dst.Header().Add(k, value)
+			}
+		}
+		w.passthrough = true
 		w.dst.WriteHeader(code)
 	}
 }
 func (w *responsesStreamWriter) Write(p []byte) (int, error) {
+	if w.passthrough {
+		return w.dst.Write(p)
+	}
+	if w.completed {
+		return len(p), nil
+	}
 	w.buf.Write(p)
 	for {
 		data := w.buf.Bytes()
@@ -679,36 +1151,89 @@ func (w *responsesStreamWriter) Write(p []byte) (int, error) {
 			}
 			payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
 			if payload == "[DONE]" {
-				w.emit("response.completed", map[string]any{"type": "response.completed", "response": map[string]any{"id": w.id, "object": "response", "status": "completed", "output_text": ""}})
+				if err := w.complete(); err != nil {
+					return 0, err
+				}
 				continue
 			}
 			var chunk map[string]any
 			if json.Unmarshal([]byte(payload), &chunk) != nil {
 				continue
 			}
-			if w.id == "" {
-				w.id = "resp-" + fmt.Sprintf("%d", time.Now().UnixNano())
-				w.model, _ = chunk["model"].(string)
-				w.emit("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": w.id, "object": "response", "status": "in_progress", "model": w.model}})
+			if rawErr, ok := chunk["error"]; ok {
+				w.ensureID(chunk)
+				w.completed = true
+				if err := w.emit("response.failed", map[string]any{"type": "response.failed", "response": map[string]any{"id": w.id, "object": "response", "status": "failed", "error": rawErr}}); err != nil {
+					return 0, err
+				}
+				if _, err := io.WriteString(w.dst, "data: [DONE]\n\n"); err != nil {
+					return 0, err
+				}
+				if f, ok := w.dst.(http.Flusher); ok {
+					f.Flush()
+				}
+				return len(p), nil
+			}
+			if err := w.ensureCreated(chunk); err != nil {
+				return 0, err
+			}
+			if usage, ok := chunk["usage"].(map[string]any); ok {
+				w.usage = usage
 			}
 			if choices, ok := chunk["choices"].([]any); ok && len(choices) > 0 {
 				if c, ok := choices[0].(map[string]any); ok {
+					if finish, ok := c["finish_reason"].(string); ok && finish != "" {
+						w.finish = finish
+					}
 					if d, ok := c["delta"].(map[string]any); ok {
 						if text, ok := d["content"].(string); ok && text != "" {
-							w.emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "response_id": w.id, "delta": text})
+							if err := w.startTextOutput(); err != nil {
+								return 0, err
+							}
+							w.outputText.WriteString(text)
+							if err := w.emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "response_id": w.id, "item_id": w.id + "-item", "output_index": w.textIndex, "content_index": 0, "delta": text}); err != nil {
+								return 0, err
+							}
 						}
 						if calls, ok := d["tool_calls"].([]any); ok {
 							for _, raw := range calls {
 								if call, ok := raw.(map[string]any); ok {
+									idx := 0
+									if n, ok := numberInt(call["index"]); ok {
+										idx = n
+									}
+									if w.calls == nil {
+										w.calls = make(map[int]*responseStreamCall)
+									}
+									state := w.calls[idx]
+									if state == nil {
+										state = &responseStreamCall{index: w.nextIndex}
+										w.nextIndex++
+										w.calls[idx] = state
+									}
 									fn, _ := call["function"].(map[string]any)
-									callID, _ := call["id"].(string)
+									if callID, _ := call["id"].(string); callID != "" {
+										state.id = callID
+									}
 									name, _ := fn["name"].(string)
-									args, _ := fn["arguments"].(string)
 									if name != "" {
-										w.emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "response_id": w.id, "item": map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": ""}})
+										state.name = name
+									}
+									args, _ := fn["arguments"].(string)
+									if state.id == "" {
+										state.id = fmt.Sprintf("call-%s-%d", w.id, idx)
+									}
+									if state.name != "" && !state.added {
+										state.added = true
+										if err := w.emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "response_id": w.id, "output_index": state.index, "item": map[string]any{"id": state.id, "type": "function_call", "status": "in_progress", "call_id": state.id, "name": state.name, "arguments": ""}}); err != nil {
+											return 0, err
+										}
 									}
 									if args != "" {
-										w.emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "response_id": w.id, "call_id": callID, "delta": args})
+										state.args.WriteString(args)
+										if err := w.emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "response_id": w.id, "output_index": state.index, "item_id": state.id, "call_id": state.id, "delta": args}); err != nil {
+											return 0, err
+										}
 									}
 								}
 							}
@@ -720,18 +1245,143 @@ func (w *responsesStreamWriter) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
-func (w *responsesStreamWriter) emit(event string, v map[string]any) {
+
+func (w *responsesStreamWriter) ensureID(chunk map[string]any) {
+	if w.id == "" {
+		w.id = "resp-" + fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	if w.model == "" {
+		w.model, _ = chunk["model"].(string)
+	}
+}
+
+func (w *responsesStreamWriter) ensureCreated(chunk map[string]any) error {
+	w.ensureID(chunk)
+	if w.started {
+		return nil
+	}
+	return w.emit("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": w.id, "object": "response", "status": "in_progress", "model": w.model}})
+}
+
+func (w *responsesStreamWriter) complete() error {
+	if w.completed {
+		return nil
+	}
+	w.completed = true
+	w.ensureID(nil)
+	text := w.outputText.String()
+	output := make([]any, w.nextIndex)
+	if w.textStarted {
+		output[w.textIndex] = map[string]any{"id": w.id + "-item", "type": "message", "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}}
+	}
+	indexes := make([]int, 0, len(w.calls))
+	for index := range w.calls {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	for _, index := range indexes {
+		call := w.calls[index]
+		item := map[string]any{"id": call.id, "type": "function_call", "status": "completed", "call_id": call.id, "name": call.name, "arguments": call.args.String()}
+		output[call.index] = item
+		if err := w.emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "response_id": w.id, "item_id": call.id, "output_index": call.index, "arguments": call.args.String()}); err != nil {
+			return err
+		}
+		if err := w.emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "response_id": w.id, "output_index": call.index, "item": item}); err != nil {
+			return err
+		}
+	}
+	status := "completed"
+	response := map[string]any{"id": w.id, "object": "response", "status": status, "model": w.model, "output": output, "output_text": text}
+	if w.finish == "length" {
+		status = "incomplete"
+		response["status"] = status
+		response["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+	}
+	if w.usage != nil {
+		response["usage"] = responseUsage(w.usage)
+	}
+	if w.textStarted {
+		if err := w.emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "response_id": w.id, "item_id": w.id + "-item", "output_index": w.textIndex, "content_index": 0, "text": text}); err != nil {
+			return err
+		}
+		if err := w.emit("response.content_part.done", map[string]any{"type": "response.content_part.done", "response_id": w.id, "item_id": w.id + "-item", "output_index": w.textIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}); err != nil {
+			return err
+		}
+		if err := w.emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "response_id": w.id, "output_index": w.textIndex, "item": map[string]any{"id": w.id + "-item", "type": "message", "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}}}); err != nil {
+			return err
+		}
+	}
+	event := "response.completed"
+	if status == "incomplete" {
+		event = "response.incomplete"
+	}
+	if err := w.emit(event, map[string]any{"type": event, "response": response}); err != nil {
+		return err
+	}
+	// A number of OpenAI-compatible clients, including DSH, require the
+	// terminal Chat Completions sentinel even when the payload uses Responses
+	// lifecycle events. Keep both protocols well formed.
+	if _, err := io.WriteString(w.dst, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	if f, ok := w.dst.(http.Flusher); ok {
+		f.Flush()
+	}
+	if w.onComplete != nil {
+		assistant := map[string]any{"role": "assistant", "content": text}
+		if len(indexes) > 0 {
+			toolCalls := make([]any, 0, len(indexes))
+			for _, index := range indexes {
+				call := w.calls[index]
+				toolCalls = append(toolCalls, map[string]any{
+					"id": call.id, "type": "function",
+					"function": map[string]any{"name": call.name, "arguments": call.args.String()},
+				})
+			}
+			assistant["tool_calls"] = toolCalls
+		}
+		w.onComplete(assistant)
+	}
+	return nil
+}
+
+func (w *responsesStreamWriter) startTextOutput() error {
+	if w.textStarted {
+		return nil
+	}
+	w.textStarted = true
+	w.textIndex = w.nextIndex
+	w.nextIndex++
+	itemID := w.id + "-item"
+	if err := w.emit("response.output_item.added", map[string]any{
+		"type": "response.output_item.added", "response_id": w.id, "output_index": w.textIndex,
+		"item": map[string]any{"id": itemID, "type": "message", "status": "in_progress", "role": "assistant", "content": []any{}},
+	}); err != nil {
+		return err
+	}
+	return w.emit("response.content_part.added", map[string]any{
+		"type": "response.content_part.added", "response_id": w.id, "item_id": itemID,
+		"output_index": w.textIndex, "content_index": 0,
+		"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+	})
+}
+
+func (w *responsesStreamWriter) emit(event string, v map[string]any) error {
 	raw, _ := json.Marshal(v)
 	if !w.started {
 		w.dst.Header().Set("Content-Type", "text/event-stream")
 		w.dst.Header().Set("Cache-Control", "no-cache")
+		w.dst.Header().Set("X-Accel-Buffering", "no")
 		w.dst.WriteHeader(http.StatusOK)
 		w.started = true
 	}
-	_, _ = fmt.Fprintf(w.dst, "event: %s\ndata: %s\n\n", event, raw)
+	if _, err := fmt.Fprintf(w.dst, "event: %s\ndata: %s\n\n", event, raw); err != nil {
+		return err
+	}
 	if f, ok := w.dst.(http.Flusher); ok {
 		f.Flush()
 	}
+	return nil
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -746,7 +1396,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(body, &peek)
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
-	st := newChatStat(time.Now(), body, peek.Stream)
+	st := newChatStatWithStore(time.Now(), body, peek.Stream, h.cfg.MetricsStore)
 	defer st.done()
 
 	tried := map[string]bool{}
@@ -838,7 +1488,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body)
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body)
 		if terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
@@ -855,21 +1505,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			fail(acct.UID)
 			continue
 		}
-		h.cfg.Pool.NoteSuccess(acct.UID)
-		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
-		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
-		}
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
-			_ = upstream.Stream(w, stats)
+			streamErr := upstream.Stream(w, stats)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
 			st.inputTokens, st.toks, st.totalTokens, st.cacheRead, st.cacheWrite, st.toolCalls = stats.UsageStats()
 			rc.Close()
+			if streamErr != nil {
+				st.status = http.StatusBadGateway
+				return
+			}
+			h.cfg.Pool.NoteSuccess(acct.UID)
+			if sessKey != "" && h.cfg.Session != nil {
+				h.cfg.Session.Bind(sessKey, acct.UID)
+			}
+			st.status = http.StatusOK
 			return
 		}
 		resp, err := upstream.Aggregate(rc)
@@ -882,6 +1535,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		usageStats(resp, st)
 		writeJSON(w, http.StatusOK, resp)
+		h.cfg.Pool.NoteSuccess(acct.UID)
+		if sessKey != "" && h.cfg.Session != nil {
+			h.cfg.Session.Bind(sessKey, acct.UID)
+		}
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
 		return

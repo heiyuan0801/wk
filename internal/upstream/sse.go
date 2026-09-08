@@ -21,6 +21,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		created       float64
 		content       strings.Builder
 		reasoning     strings.Builder
+		refusal       strings.Builder
 		role          = "assistant"
 		finishReason  = "stop"
 		usage         map[string]any
@@ -45,6 +46,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 				if json.Unmarshal([]byte(payload), &chunk) == nil {
 					// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
 					validEvents++
+					chunk = normalizeFrame(chunk)
 					if v, ok := chunk["id"].(string); ok && id == "" {
 						id = v
 					}
@@ -70,12 +72,15 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 								if r2, ok := delta["role"].(string); ok && r2 != "" {
 									role = r2
 								}
-								if txt, ok := delta["content"].(string); ok {
+								if txt := contentText(delta["content"]); txt != "" {
 									content.WriteString(txt)
 									gotAnyContent = true
 								}
-								if rc, ok := delta["reasoning_content"].(string); ok {
+								if rc := contentText(delta["reasoning_content"]); rc != "" {
 									reasoning.WriteString(rc)
+								}
+								if text := contentText(delta["refusal"]); text != "" {
+									refusal.WriteString(text)
 								}
 								if tcs, ok := delta["tool_calls"].([]any); ok {
 									for _, tc := range tcs {
@@ -99,8 +104,15 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 							}
 							// 有的上游把完整消息放在 message 里（非 delta）
 							if msg, ok := c["message"].(map[string]any); ok && !gotAnyContent {
-								if txt, ok := msg["content"].(string); ok {
+								if txt := contentText(msg["content"]); txt != "" {
 									content.WriteString(txt)
+									gotAnyContent = true
+								}
+								if rc := contentText(msg["reasoning_content"]); rc != "" {
+									reasoning.WriteString(rc)
+								}
+								if text := contentText(msg["refusal"]); text != "" {
+									refusal.WriteString(text)
 								}
 							}
 						}
@@ -116,6 +128,19 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		// 上游返回 200 但没有任何有效数据事件（空流/只有 [DONE]/只有注释行）：
 		// 不再合成空 content 的假成功响应，直接报错，由 handler 映射为 502 upstream_parse。
 		return nil, fmt.Errorf("upstream stream contained no valid data events")
+	}
+	// Some reasoning models occasionally finish without a normal content
+	// delta, while returning useful text only in refusal or reasoning_content.
+	// Surface that text instead of producing a successful empty completion.
+	if content.Len() == 0 && len(toolOrder) == 0 {
+		fallback := strings.TrimSpace(refusal.String())
+		if fallback == "" {
+			fallback = strings.TrimSpace(reasoning.String())
+		}
+		if fallback == "" {
+			return nil, fmt.Errorf("upstream completed response contained no content")
+		}
+		content.WriteString(fallback)
 	}
 	if id == "" {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -155,6 +180,29 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		resp["usage"] = usage
 	}
 	return resp, nil
+}
+
+// contentText accepts both the traditional string content and newer content
+// part arrays used by some OpenAI-compatible upstreams.
+func contentText(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []any:
+		var out strings.Builder
+		for _, part := range v {
+			out.WriteString(contentText(part))
+		}
+		return out.String()
+	case map[string]any:
+		if text, _ := v["text"].(string); text != "" {
+			return text
+		}
+		if text, _ := v["content"].(string); text != "" {
+			return text
+		}
+	}
+	return ""
 }
 
 // mergeToolCallDelta 把流式 tool_call 片段合并到累计对象：
@@ -231,13 +279,13 @@ func normalizeFrame(obj map[string]any) map[string]any {
 				if v, ok := d["role"].(string); ok && v != "" {
 					delta["role"] = v
 				}
-				if v, ok := d["content"].(string); ok && v != "" {
+				if v := contentText(d["content"]); v != "" {
 					delta["content"] = v
 				}
-				if v, ok := d["reasoning_content"].(string); ok && v != "" {
+				if v := contentText(d["reasoning_content"]); v != "" {
 					delta["reasoning_content"] = v
 				}
-				if v, ok := d["refusal"].(string); ok && v != "" {
+				if v := contentText(d["refusal"]); v != "" {
 					delta["refusal"] = v
 				}
 				if tcs, ok := d["tool_calls"].([]any); ok && len(tcs) > 0 {
@@ -258,6 +306,31 @@ func normalizeFrame(obj map[string]any) map[string]any {
 					}
 				}
 			}
+			// A few compatible upstreams send the completed assistant message
+			// in a stream frame instead of delta. Convert it to delta so the
+			// downstream Responses adapter does not lose the only text.
+			if msg, ok := c["message"].(map[string]any); ok {
+				if text := contentText(msg["content"]); text != "" {
+					delta["content"] = text
+				}
+				if text := contentText(msg["reasoning_content"]); text != "" {
+					delta["reasoning_content"] = text
+				}
+				if text := contentText(msg["refusal"]); text != "" {
+					delta["refusal"] = text
+				}
+			}
+			if msg, ok := c["message"].(map[string]any); ok {
+				if calls := normalizedToolCalls(msg); len(calls) > 0 {
+					delta["tool_calls"] = calls
+				}
+			}
+			if _, exists := delta["tool_calls"]; !exists {
+				if calls := normalizedToolCalls(delta); len(calls) > 0 {
+					delta["tool_calls"] = calls
+				}
+			}
+			delete(delta, "function_call")
 			nc["delta"] = delta
 			if fr, ok := c["finish_reason"].(string); ok && fr != "" {
 				nc["finish_reason"] = fr
@@ -286,6 +359,45 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
+	var streamedContent, reasoning, refusal strings.Builder
+	var streamID, streamModel string
+	toolCallSeen := false
+	fallbackEmitted := false
+	emptyCompletion := false
+
+	writePayload := func(payload string) error {
+		if _, err := io.WriteString(w, "data: "+payload+"\n\n"); err != nil {
+			return err
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		return nil
+	}
+	emitFallback := func() error {
+		if fallbackEmitted || streamedContent.Len() > 0 || toolCallSeen {
+			return nil
+		}
+		text := strings.TrimSpace(refusal.String())
+		if text == "" {
+			text = strings.TrimSpace(reasoning.String())
+		}
+		if text == "" {
+			return nil
+		}
+		chunk := map[string]any{
+			"id": streamID, "object": "chat.completion.chunk", "model": streamModel,
+			"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": text}, "finish_reason": nil}},
+			"usage":   nil,
+		}
+		raw, err := json.Marshal(chunk)
+		if err != nil {
+			return err
+		}
+		fallbackEmitted = true
+		streamedContent.WriteString(text)
+		return writePayload(string(raw))
+	}
 
 	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 	// 仅 JSON 解析成功时计数记为一次有效转发（JSON 解析失败照常降级原样写出，但不计数）。
@@ -293,16 +405,50 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 		var obj map[string]any
 		valid := 0
 		if json.Unmarshal([]byte(payload), &obj) == nil {
-			if raw, err := json.Marshal(normalizeFrame(obj)); err == nil {
+			normalized := normalizeFrame(obj)
+			if id, _ := normalized["id"].(string); id != "" {
+				streamID = id
+			}
+			if model, _ := normalized["model"].(string); model != "" {
+				streamModel = model
+			}
+			hasFinish := false
+			if choices, ok := normalized["choices"].([]any); ok {
+				for _, rawChoice := range choices {
+					choice, _ := rawChoice.(map[string]any)
+					if choice == nil {
+						continue
+					}
+					if finish, _ := choice["finish_reason"].(string); finish != "" {
+						hasFinish = true
+					}
+					delta, _ := choice["delta"].(map[string]any)
+					if text := contentText(delta["content"]); text != "" {
+						streamedContent.WriteString(text)
+					}
+					if text := contentText(delta["reasoning_content"]); text != "" {
+						reasoning.WriteString(text)
+					}
+					if text := contentText(delta["refusal"]); text != "" {
+						refusal.WriteString(text)
+					}
+					if calls, ok := delta["tool_calls"].([]any); ok && len(calls) > 0 {
+						toolCallSeen = true
+					}
+				}
+			}
+			if hasFinish {
+				if err := emitFallback(); err != nil {
+					return 0, err
+				}
+			}
+			if raw, err := json.Marshal(normalized); err == nil {
 				payload = string(raw)
 			}
 			valid = 1
 		}
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
-			return 0, werr
-		}
-		if fl != nil {
-			fl.Flush()
+		if err := writePayload(payload); err != nil {
+			return 0, err
 		}
 		return valid, nil
 	}
@@ -357,6 +503,11 @@ readLoop:
 	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
 	if validFrames == 0 {
 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error"}}`)
+	} else if err := emitFallback(); err != nil {
+		return err
+	} else if streamedContent.Len() == 0 && !toolCallSeen {
+		_ = writeRaw(`{"error":{"message":"upstream completed response contained no content","type":"upstream_error"}}`)
+		emptyCompletion = true
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
@@ -367,6 +518,39 @@ readLoop:
 	}
 	if validFrames == 0 {
 		return fmt.Errorf("upstream stream contained no valid data events")
+	}
+	if emptyCompletion {
+		return fmt.Errorf("upstream completed response contained no content")
+	}
+	return nil
+}
+
+// normalizedToolCalls accepts modern calls and the legacy single-function shape.
+func normalizedToolCalls(message map[string]any) []any {
+	if calls, ok := message["tool_calls"].([]any); ok && len(calls) > 0 {
+		out := make([]any, 0, len(calls))
+		for i, raw := range calls {
+			call, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			copy := make(map[string]any, len(call)+1)
+			for k, v := range call {
+				copy[k] = v
+			}
+			if _, ok := copy["index"]; !ok {
+				copy["index"] = float64(i)
+			}
+			out = append(out, copy)
+		}
+		return out
+	}
+	if fn, ok := message["function_call"].(map[string]any); ok {
+		name, _ := fn["name"].(string)
+		args, _ := fn["arguments"].(string)
+		if name != "" || args != "" {
+			return []any{map[string]any{"index": float64(0), "type": "function", "function": fn}}
+		}
 	}
 	return nil
 }
