@@ -26,6 +26,9 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 		return src
 	}
 	obj["stream"] = true
+	if model, ok := obj["model"].(string); ok {
+		obj["model"] = NormalizeModelID(model)
+	}
 	normalizeToolChoice(obj)
 	normalizeReasoningEffort(obj, efforts)
 	if sanitize {
@@ -38,6 +41,20 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 		return src
 	}
 	return out
+}
+
+// NormalizeModelID maps provider aliases to the stable public model IDs used
+// by the OpenAI-compatible API. It is intentionally exact so unrelated model
+// names are passed through unchanged.
+func NormalizeModelID(id string) string {
+	switch strings.TrimSpace(id) {
+	case "kimi-k3-1":
+		return "kimi-k3"
+	case "kimi-k2.7":
+		return "kimi-k2.7-code"
+	default:
+		return id
+	}
 }
 
 // effortRank 档位从低到高。

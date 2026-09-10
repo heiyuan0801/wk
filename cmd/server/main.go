@@ -28,6 +28,70 @@ func (m metricsAdapter) AddMetrics(requests, successes, failures, inputTokens, o
 	return m.store.Add(metricsstore.Snapshot{Requests: requests, Successes: successes, Failures: failures, InputTokens: inputTokens, OutputTokens: outputTokens, TotalTokens: totalTokens, CacheRead: cacheRead, CacheWrite: cacheWrite, ToolCalls: toolCalls, TTFBMillis: ttfbMillis, TTFBSamples: ttfbSamples, LatencyMillis: latencyMillis, LastRequestUnix: lastRequestUnix})
 }
 
+func (m metricsAdapter) AddCredit(consumed float64, source string) error {
+	return m.store.AddCredit(consumed, source)
+}
+
+func (m metricsAdapter) RecordRequest(record server.RequestLog) error {
+	return m.store.RecordRequest(metricsstore.RequestRecord{
+		ID:                    record.ID,
+		CreatedAt:             record.CreatedAt,
+		Route:                 record.Route,
+		Model:                 record.Model,
+		Mode:                  record.Mode,
+		Status:                record.Status,
+		AccountUID:            record.AccountUID,
+		RequestedOutputTokens: record.RequestedOutputTokens,
+		InputTokens:           record.InputTokens,
+		OutputTokens:          record.OutputTokens,
+		TotalTokens:           record.TotalTokens,
+		CacheReadTokens:       record.CacheReadTokens,
+		CacheWriteTokens:      record.CacheWriteTokens,
+		ToolCalls:             record.ToolCalls,
+		TTFBMillis:            record.TTFBMillis,
+		LatencyMillis:         record.LatencyMillis,
+		CreditsConsumed:       record.CreditsConsumed,
+		CreditSource:          record.CreditSource,
+		Passthrough:           record.Passthrough,
+		ErrorCode:             record.ErrorCode,
+		ErrorMessage:          record.ErrorMessage,
+	})
+}
+
+func (m metricsAdapter) RecentRequests(limit int) ([]server.RequestLog, error) {
+	records, err := m.store.RecentRequests(limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]server.RequestLog, 0, len(records))
+	for _, record := range records {
+		out = append(out, server.RequestLog{
+			ID:                    record.ID,
+			CreatedAt:             record.CreatedAt,
+			Route:                 record.Route,
+			Model:                 record.Model,
+			Mode:                  record.Mode,
+			Status:                record.Status,
+			AccountUID:            record.AccountUID,
+			RequestedOutputTokens: record.RequestedOutputTokens,
+			InputTokens:           record.InputTokens,
+			OutputTokens:          record.OutputTokens,
+			TotalTokens:           record.TotalTokens,
+			CacheReadTokens:       record.CacheReadTokens,
+			CacheWriteTokens:      record.CacheWriteTokens,
+			ToolCalls:             record.ToolCalls,
+			TTFBMillis:            record.TTFBMillis,
+			LatencyMillis:         record.LatencyMillis,
+			CreditsConsumed:       record.CreditsConsumed,
+			CreditSource:          record.CreditSource,
+			Passthrough:           record.Passthrough,
+			ErrorCode:             record.ErrorCode,
+			ErrorMessage:          record.ErrorMessage,
+		})
+	}
+	return out, nil
+}
+
 func (m metricsAdapter) SnapshotMetrics() map[string]any {
 	snapshot, err := m.store.Snapshot()
 	if err != nil {
@@ -43,7 +107,7 @@ func (m metricsAdapter) SnapshotMetrics() map[string]any {
 	if ttfbSamples > 0 {
 		avgTTFB = snapshot.TTFBMillis / ttfbSamples
 	}
-	return map[string]any{"requests": requests, "successes": snapshot.Successes, "failures": snapshot.Failures, "input_tokens": snapshot.InputTokens, "output_tokens": snapshot.OutputTokens, "total_tokens": snapshot.TotalTokens, "cache_read_tokens": snapshot.CacheRead, "cache_write_tokens": snapshot.CacheWrite, "tool_calls": snapshot.ToolCalls, "avg_ttfb_ms": avgTTFB, "avg_latency_ms": avgLatency, "last_request_at": snapshot.LastRequestUnix}
+	return map[string]any{"requests": requests, "successes": snapshot.Successes, "failures": snapshot.Failures, "input_tokens": snapshot.InputTokens, "output_tokens": snapshot.OutputTokens, "total_tokens": snapshot.TotalTokens, "cache_read_tokens": snapshot.CacheRead, "cache_write_tokens": snapshot.CacheWrite, "tool_calls": snapshot.ToolCalls, "credits_consumed": snapshot.CreditsConsumed, "credits_upstream": snapshot.CreditsUpstream, "credits_estimated": snapshot.CreditsEstimated, "credit_requests": snapshot.CreditRequests, "avg_ttfb_ms": avgTTFB, "avg_latency_ms": avgLatency, "last_request_at": snapshot.LastRequestUnix}
 }
 
 func main() {
@@ -78,8 +142,11 @@ func main() {
 		defer metricsDB.Close()
 	}
 	var persistentMetrics server.MetricsStore
+	var requestLogs server.RequestLogStore
 	if metricsDB != nil {
-		persistentMetrics = metricsAdapter{store: metricsDB}
+		adapter := metricsAdapter{store: metricsDB}
+		persistentMetrics = adapter
+		requestLogs = adapter
 	}
 	var responseStore server.ResponseStore
 	if persistedResponses, ok := store.(server.ResponseStore); ok {
@@ -142,17 +209,26 @@ func main() {
 		Region:           cfg.Region,
 		LoginBin:         "/app/login",
 		CheckinNow:       sch.RunCheckinNow,
+		CreditRefreshNow: sch.RunCreditRefreshNow,
 		UpdateSchedule:   sch.UpdateSchedule,
 		Session:          sessRouter,
 		StickyCount:      sessCount,
 		RedisMode:        redisMode,
 		ResponseStore:    responseStore,
 		MetricsStore:     persistentMetrics,
-		SoftCooldown:     cfg.SoftRateDur,
+		RequestLogStore:  requestLogs,
+		CreditPolicy: server.CreditPolicy{
+			InputPer1K:       cfg.Billing.InputCreditsPer1KTokens,
+			OutputPer1K:      cfg.Billing.OutputCreditsPer1KTokens,
+			CachedInputPer1K: cfg.Billing.CachedInputCreditsPer1KTokens,
+		},
+		Passthrough:  cfg.Features.Passthrough,
+		SoftCooldown: cfg.SoftRateDur,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go sch.RunCreditRefreshNow()
 	go sch.Run(ctx)
 
 	srv := &http.Server{

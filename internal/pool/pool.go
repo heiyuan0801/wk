@@ -45,19 +45,26 @@ func (k CoolKind) String() string {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID             string    `json:"uid"`
-	Nickname        string    `json:"nickname,omitempty"`
-	Credits         int64     `json:"credits"`
-	Cooling         bool      `json:"cooling"`
-	CoolKind        string    `json:"cool_kind,omitempty"`
-	CoolRemaining   int64     `json:"cool_remaining_sec,omitempty"`
-	Until           time.Time `json:"until,omitempty"`
-	Reason          string    `json:"reason,omitempty"`
-	Disabled        bool      `json:"disabled"`
-	SuccessCount    int64     `json:"success_count,omitempty"`
-	ErrTotal        int64     `json:"err_total,omitempty"`
-	LastSuccessTime time.Time `json:"last_success,omitempty"`
-	LastErrTime     time.Time `json:"last_err,omitempty"`
+	UID                 string    `json:"uid"`
+	Nickname            string    `json:"nickname,omitempty"`
+	Credits             int64     `json:"credits"`
+	CapacitySize        int64     `json:"capacity_size,omitempty"`
+	CapacityRemain      int64     `json:"capacity_remain,omitempty"`
+	CapacityUsed        int64     `json:"capacity_used,omitempty"`
+	CycleCapacitySize   int64     `json:"cycle_capacity_size,omitempty"`
+	CycleCapacityRemain int64     `json:"cycle_capacity_remain,omitempty"`
+	CycleCapacityUsed   int64     `json:"cycle_capacity_used,omitempty"`
+	CreditUpdatedAt     int64     `json:"credit_updated_at,omitempty"`
+	Cooling             bool      `json:"cooling"`
+	CoolKind            string    `json:"cool_kind,omitempty"`
+	CoolRemaining       int64     `json:"cool_remaining_sec,omitempty"`
+	Until               time.Time `json:"until,omitempty"`
+	Reason              string    `json:"reason,omitempty"`
+	Disabled            bool      `json:"disabled"`
+	SuccessCount        int64     `json:"success_count,omitempty"`
+	ErrTotal            int64     `json:"err_total,omitempty"`
+	LastSuccessTime     time.Time `json:"last_success,omitempty"`
+	LastErrTime         time.Time `json:"last_err,omitempty"`
 
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
@@ -65,18 +72,37 @@ type Status struct {
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
 }
 
+// CreditDetail is the aggregate credit snapshot returned by the upstream
+// billing meter. Credits remains the cycle-aware balance used for routing.
+type CreditDetail struct {
+	Remaining           int64
+	CapacitySize        int64
+	CapacityRemain      int64
+	CapacityUsed        int64
+	CycleCapacitySize   int64
+	CycleCapacityRemain int64
+	CycleCapacityUsed   int64
+}
+
 type entry struct {
-	a            *auth.Auth
-	credits      int64
-	successCount int64     // 累计成功
-	errTotal     int64     // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
-	lastErr      time.Time // 最近一次错误时间
-	lastSuccess  time.Time // 最近一次成功时间
-	coolKind     CoolKind
-	until        time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
-	disabled     bool
-	reason       string
-	lastUsed     time.Time // 最近被选中时刻（防并发撞号）
+	a                   *auth.Auth
+	credits             int64
+	capacitySize        int64
+	capacityRemain      int64
+	capacityUsed        int64
+	cycleCapacitySize   int64
+	cycleCapacityRemain int64
+	cycleCapacityUsed   int64
+	creditUpdatedAt     time.Time
+	successCount        int64     // 累计成功
+	errTotal            int64     // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
+	lastErr             time.Time // 最近一次错误时间
+	lastSuccess         time.Time // 最近一次成功时间
+	coolKind            CoolKind
+	until               time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+	disabled            bool
+	reason              string
+	lastUsed            time.Time // 最近被选中时刻（防并发撞号）
 
 	// breakerUntil / fails / retryCount 为熔断器运行态（不持久化）。
 	// fails 是唯一的"连续失败"计数器：任何错误喂入，达到 breakerThreshold 触发熔断（指数退避），
@@ -132,12 +158,19 @@ func (e *entry) fallbackKind(now time.Time) string {
 
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
-	Credits      int64     `json:"credits"`
-	Disabled     bool      `json:"disabled"`
-	Reason       string    `json:"reason,omitempty"`
-	Until        time.Time `json:"until,omitempty"`
-	CoolKind     CoolKind  `json:"cool_kind"`
-	SuccessCount int64     `json:"success_count,omitempty"`
+	Credits             int64     `json:"credits"`
+	CapacitySize        int64     `json:"capacity_size,omitempty"`
+	CapacityRemain      int64     `json:"capacity_remain,omitempty"`
+	CapacityUsed        int64     `json:"capacity_used,omitempty"`
+	CycleCapacitySize   int64     `json:"cycle_capacity_size,omitempty"`
+	CycleCapacityRemain int64     `json:"cycle_capacity_remain,omitempty"`
+	CycleCapacityUsed   int64     `json:"cycle_capacity_used,omitempty"`
+	CreditUpdatedAt     time.Time `json:"credit_updated_at,omitempty"`
+	Disabled            bool      `json:"disabled"`
+	Reason              string    `json:"reason,omitempty"`
+	Until               time.Time `json:"until,omitempty"`
+	CoolKind            CoolKind  `json:"cool_kind"`
+	SuccessCount        int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
 	ErrTotal    int64     `json:"err_total,omitempty"`
@@ -167,10 +200,11 @@ type snapshot struct {
 
 // Pool 账号池。
 type Pool struct {
-	mu      sync.RWMutex
-	byUID   map[string]*entry
-	stateFp string
-	dirty   atomic.Bool // 内存有变更待落盘
+	mu         sync.RWMutex
+	byUID      map[string]*entry
+	stateFp    string
+	lastPickAt time.Time   // monotonic tie-breaker for coarse system clocks
+	dirty      atomic.Bool // 内存有变更待落盘
 
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
 	// SaveState/LoadState 经它接线，与本地 state.json 并存作启动恢复备份。
@@ -445,8 +479,8 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 // pick 在 healthy 候选集中按三因子权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
 // 候选集是 top5 近似：先按三因子权重（weightOf）降序取前 5（credits 只是权重的一个因子，
 // 闲置补偿与成功率同样决定谁进短名单），再在 top5 内做防撞号过滤。
-// 并发防雪崩：跳过 lastUsed 距今 < minPickGap 的账号（除非 top5 全部刚被用过，
-// 此时退回最近最少使用 LRU 账号），迫使高并发请求发散，而不是全部撞同一高分账号。
+// 并发防雪崩：跳过 lastUsed 距今 < minPickGap 的账号；Top5 全部刚被用过时扩展到
+// 完整健康候选集，仍无可选账号才退回全局 LRU，迫使高并发请求发散。
 // minPickGap=0（测试用）时过滤恒通过，退化为纯加权随机。
 func (p *Pool) pick(tried map[string]bool) *auth.Auth {
 	p.mu.Lock()
@@ -495,8 +529,10 @@ func (p *Pool) pick(tried map[string]bool) *auth.Auth {
 		}
 		return ws[i].e.a.UID < ws[j].e.a.UID
 	})
+	allCands := make([]*entry, 0, len(ws))
 	cands = cands[:0]
 	for _, c := range ws {
+		allCands = append(allCands, c.e)
 		cands = append(cands, c.e)
 	}
 	if len(cands) > 5 {
@@ -511,18 +547,43 @@ func (p *Pool) pick(tried map[string]bool) *auth.Auth {
 	}
 	var e *entry
 	if len(eligible) == 0 {
-		// top5 全部刚被用过：LRU 兜底，维持发散且不 starve 任一候选。
-		e = cands[0]
-		for _, c := range cands[1:] {
-			if c.lastUsed.Before(e.lastUsed) {
-				e = c
+		// Top5 全部刚被用过时，先从完整健康候选集扩散，避免在高并发
+		// 下反复命中 Top5 中同一个 LRU 账号。
+		expanded := make([]*entry, 0, len(allCands))
+		for _, c := range allCands {
+			if now.Sub(c.lastUsed) >= minPickGap {
+				expanded = append(expanded, c)
+			}
+		}
+		if len(expanded) > 0 {
+			e = p.pickWeighted(expanded)
+		} else {
+			// 所有健康账号都在窗口内：从完整候选集选择全局 LRU。
+			e = allCands[0]
+			for _, c := range allCands[1:] {
+				if c.lastUsed.Before(e.lastUsed) {
+					e = c
+				}
 			}
 		}
 	} else {
 		e = p.pickWeighted(eligible) // eligible 保序 = top5 降序子集
 	}
-	e.lastUsed = time.Now()
+	p.markUsedLocked(e)
 	return e.a
+}
+
+// markUsedLocked records a strictly increasing selection timestamp. Some
+// platforms expose wall-clock time with millisecond resolution; without the
+// tie-breaker, simultaneous picks would all look equally old and the LRU
+// fallback would repeatedly choose the first UID.
+func (p *Pool) markUsedLocked(e *entry) {
+	usedAt := time.Now()
+	if minPickGap > 0 && !p.lastPickAt.IsZero() && !usedAt.After(p.lastPickAt) {
+		usedAt = p.lastPickAt.Add(time.Nanosecond)
+	}
+	p.lastPickAt = usedAt
+	e.lastUsed = usedAt
 }
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
@@ -556,7 +617,7 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time) *a
 		return nil
 	}
 	log.Printf("pool: fallback_earliest_expiry uid=%s until=%s kind=%s", best.a.UID, best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
-	best.lastUsed = time.Now()
+	p.markUsedLocked(best)
 	return best.a
 }
 
@@ -664,6 +725,24 @@ func (p *Pool) SetCredits(uid string, credits int64) {
 	}
 }
 
+// SetCreditDetail updates the latest upstream billing counters and applies the
+// cycle-aware remaining balance to the existing routing/cooldown state.
+func (p *Pool) SetCreditDetail(uid string, detail CreditDetail) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.capacitySize = detail.CapacitySize
+		e.capacityRemain = detail.CapacityRemain
+		e.capacityUsed = detail.CapacityUsed
+		e.cycleCapacitySize = detail.CycleCapacitySize
+		e.cycleCapacityRemain = detail.CycleCapacityRemain
+		e.cycleCapacityUsed = detail.CycleCapacityUsed
+		e.creditUpdatedAt = time.Now()
+		p.updateCreditsLocked(e, detail.Remaining)
+		p.dirty.Store(true)
+	}
+}
+
 // Cooldown 冷却账号至 now+d（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）。
 // 冷却入口同时是熔断器的失败信号：喂入 fails，达到阈值按指数退避熔断（与 until 正交）。
 func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason string) {
@@ -735,17 +814,21 @@ func (p *Pool) reviveCoolingLocked(e *entry, credits int64) {
 	e.reason = ""
 }
 
+func (p *Pool) updateCreditsLocked(e *entry, credits int64) {
+	if credits > 0 && !e.disabled {
+		p.reviveCoolingLocked(e, credits)
+	} else {
+		e.credits = credits
+	}
+}
+
 // ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清冷却（余额恢复）。
 // 注意：不碰熔断器——熔断到期（breakerUntil 过期）或下次 chat 成功（NoteSuccess）才恢复。
 func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		if remain > 0 && !e.disabled {
-			p.reviveCoolingLocked(e, remain)
-		} else {
-			e.credits = remain
-		}
+		p.updateCreditsLocked(e, remain)
 		p.dirty.Store(true)
 	}
 }
@@ -835,7 +918,7 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 	if p.inFlightFull(e) {
 		return nil
 	}
-	e.lastUsed = now
+	p.markUsedLocked(e)
 	return e.a
 }
 
@@ -900,20 +983,29 @@ func (p *Pool) List() []Status {
 func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
 	st := Status{
-		UID:             uid,
-		Nickname:        e.a.Nickname,
-		Credits:         e.credits,
-		Cooling:         now.Before(e.until) || now.Before(e.breakerUntil),
-		Reason:          e.reason,
-		Disabled:        e.disabled,
-		SuccessCount:    e.successCount,
-		ErrTotal:        e.errTotal,
-		LastSuccessTime: e.lastSuccess,
-		LastErrTime:     e.lastErr,
-		Until:           e.until,
-		InFlight:        int(e.inFlight.Load()),
-		BreakerFails:    e.fails,
-		BreakerUntil:    e.breakerUntil,
+		UID:                 uid,
+		Nickname:            e.a.Nickname,
+		Credits:             e.credits,
+		CapacitySize:        e.capacitySize,
+		CapacityRemain:      e.capacityRemain,
+		CapacityUsed:        e.capacityUsed,
+		CycleCapacitySize:   e.cycleCapacitySize,
+		CycleCapacityRemain: e.cycleCapacityRemain,
+		CycleCapacityUsed:   e.cycleCapacityUsed,
+		Cooling:             now.Before(e.until) || now.Before(e.breakerUntil),
+		Reason:              e.reason,
+		Disabled:            e.disabled,
+		SuccessCount:        e.successCount,
+		ErrTotal:            e.errTotal,
+		LastSuccessTime:     e.lastSuccess,
+		LastErrTime:         e.lastErr,
+		Until:               e.until,
+		InFlight:            int(e.inFlight.Load()),
+		BreakerFails:        e.fails,
+		BreakerUntil:        e.breakerUntil,
+	}
+	if !e.creditUpdatedAt.IsZero() {
+		st.CreditUpdatedAt = e.creditUpdatedAt.Unix()
 	}
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。
@@ -953,16 +1045,23 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			errTotal = int64(s.ErrCount)
 		}
 		p.byUID[uid] = &entry{
-			a:            &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:      s.Credits,
-			disabled:     s.Disabled,
-			reason:       s.Reason,
-			until:        s.Until,
-			coolKind:     s.CoolKind,
-			successCount: s.SuccessCount,
-			errTotal:     errTotal,
-			lastErr:      s.LastErr,
-			lastSuccess:  s.LastSuccess,
+			a:                   &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:             s.Credits,
+			capacitySize:        s.CapacitySize,
+			capacityRemain:      s.CapacityRemain,
+			capacityUsed:        s.CapacityUsed,
+			cycleCapacitySize:   s.CycleCapacitySize,
+			cycleCapacityRemain: s.CycleCapacityRemain,
+			cycleCapacityUsed:   s.CycleCapacityUsed,
+			creditUpdatedAt:     s.CreditUpdatedAt,
+			disabled:            s.Disabled,
+			reason:              s.Reason,
+			until:               s.Until,
+			coolKind:            s.CoolKind,
+			successCount:        s.SuccessCount,
+			errTotal:            errTotal,
+			lastErr:             s.LastErr,
+			lastSuccess:         s.LastSuccess,
 		}
 	}
 }
@@ -1029,15 +1128,22 @@ func (p *Pool) stateOverviewLocked() stateFile {
 	sf := stateFile{Accounts: map[string]stateAccount{}}
 	for uid, e := range p.byUID {
 		sf.Accounts[uid] = stateAccount{
-			Credits:      e.credits,
-			Disabled:     e.disabled,
-			Reason:       e.reason,
-			Until:        e.until,
-			CoolKind:     e.coolKind,
-			SuccessCount: e.successCount,
-			ErrTotal:     e.errTotal,
-			LastSuccess:  e.lastSuccess,
-			LastErr:      e.lastErr,
+			Credits:             e.credits,
+			CapacitySize:        e.capacitySize,
+			CapacityRemain:      e.capacityRemain,
+			CapacityUsed:        e.capacityUsed,
+			CycleCapacitySize:   e.cycleCapacitySize,
+			CycleCapacityRemain: e.cycleCapacityRemain,
+			CycleCapacityUsed:   e.cycleCapacityUsed,
+			CreditUpdatedAt:     e.creditUpdatedAt,
+			Disabled:            e.disabled,
+			Reason:              e.reason,
+			Until:               e.until,
+			CoolKind:            e.coolKind,
+			SuccessCount:        e.successCount,
+			ErrTotal:            e.errTotal,
+			LastSuccess:         e.lastSuccess,
+			LastErr:             e.lastErr,
 		}
 	}
 	return sf

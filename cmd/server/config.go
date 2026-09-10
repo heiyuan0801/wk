@@ -4,6 +4,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -38,7 +39,16 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// Passthrough enables raw upstream SSE forwarding for streaming chat completions.
+		Passthrough bool `json:"passthrough"`
 	} `json:"features"`
+
+	Billing struct {
+		// Values are credits per 1,000 tokens. Zero leaves unknown usage unestimated.
+		InputCreditsPer1KTokens       float64 `json:"input_credits_per_1k_tokens"`
+		OutputCreditsPer1KTokens      float64 `json:"output_credits_per_1k_tokens"`
+		CachedInputCreditsPer1KTokens float64 `json:"cached_input_credits_per_1k_tokens"`
+	} `json:"billing"`
 
 	Upstash struct {
 		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
@@ -82,6 +92,7 @@ func Default() *Config {
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Upstream.TimeoutSeconds = 120
 	c.Features.SanitizeBlacklistFingerprints = true
+	c.Features.Passthrough = false
 	c.Pool.MaxInFlight = 3
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
@@ -145,6 +156,26 @@ func applyEnv(c *Config) {
 			c.Features.SanitizeBlacklistFingerprints = b
 		}
 	}
+	if v := os.Getenv("WB2A_PASSTHROUGH"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.Passthrough = b
+		}
+	}
+	if v := os.Getenv("WB2A_INPUT_CREDITS_PER_1K"); v != "" {
+		if n, err := strconv.ParseFloat(v, 64); err == nil {
+			c.Billing.InputCreditsPer1KTokens = n
+		}
+	}
+	if v := os.Getenv("WB2A_OUTPUT_CREDITS_PER_1K"); v != "" {
+		if n, err := strconv.ParseFloat(v, 64); err == nil {
+			c.Billing.OutputCreditsPer1KTokens = n
+		}
+	}
+	if v := os.Getenv("WB2A_CACHED_INPUT_CREDITS_PER_1K"); v != "" {
+		if n, err := strconv.ParseFloat(v, 64); err == nil {
+			c.Billing.CachedInputCreditsPer1KTokens = n
+		}
+	}
 }
 
 func (c *Config) normalize() error {
@@ -176,6 +207,9 @@ func (c *Config) normalize() error {
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
 	}
+	c.Billing.InputCreditsPer1KTokens = validCreditRate(c.Billing.InputCreditsPer1KTokens)
+	c.Billing.OutputCreditsPer1KTokens = validCreditRate(c.Billing.OutputCreditsPer1KTokens)
+	c.Billing.CachedInputCreditsPer1KTokens = validCreditRate(c.Billing.CachedInputCreditsPer1KTokens)
 	if c.Region == "" {
 		c.Region = "cn"
 	}
@@ -187,4 +221,11 @@ func (c *Config) normalize() error {
 		c.Listen = ":" + c.Listen
 	}
 	return nil
+}
+
+func validCreditRate(value float64) float64 {
+	if value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
+	return value
 }

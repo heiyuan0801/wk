@@ -5,7 +5,7 @@ import {
   Select, Space, Statistic, Switch, Table, Tag, Typography, message,
 } from 'antd';
 import {
-  ApiOutlined, DashboardOutlined, KeyOutlined, ReloadOutlined, SendOutlined,
+  ApiOutlined, DashboardOutlined, FileSearchOutlined, KeyOutlined, ReloadOutlined, SendOutlined,
   SettingOutlined, ToolOutlined, UnlockOutlined,
 } from '@ant-design/icons';
 import 'antd/dist/reset.css';
@@ -14,6 +14,7 @@ import './theme.css';
 const { Header, Sider, Content } = Layout;
 const { Title, Text, Paragraph } = Typography;
 const fmt = value => Number(value || 0).toLocaleString();
+const fmtCredits = value => Number(value || 0).toFixed(4);
 const parseHours = value => String(value || '').split(',').map(item => item.trim()).filter(Boolean).map(Number);
 const initialAPIKey = sessionStorage.getItem('wb2api-api-key') || localStorage.getItem('wb2api-api-key') || '';
 localStorage.removeItem('wb2api-api-key');
@@ -41,6 +42,10 @@ function App() {
   const [activeSection, setActiveSection] = useState('dashboard');
   const [data, setData] = useState({ accounts: [], metrics: {}, total: 0, healthy: 0, cooling: 0, disabled: 0 });
   const [models, setModels] = useState([]);
+  const [requestLogs, setRequestLogs] = useState([]);
+  const [requestSearch, setRequestSearch] = useState('');
+  const [requestModeFilter, setRequestModeFilter] = useState('all');
+  const [requestStatusFilter, setRequestStatusFilter] = useState('all');
   const [config, setConfig] = useState({ checkin_hours: [9, 21], keepalive_hours: [22] });
   const [selectedModel, setSelectedModel] = useState('');
   const [promptText, setPromptText] = useState('你好，请简短介绍一下你自己。');
@@ -49,6 +54,7 @@ function App() {
   const [stream, setStream] = useState(true);
   const [requestInfo, setRequestInfo] = useState(null);
   const [metricSamples, setMetricSamples] = useState([]);
+  const [creditRefreshing, setCreditRefreshing] = useState(false);
   const refreshController = useRef(null);
   const refreshSerial = useRef(0);
   const requestController = useRef(null);
@@ -68,13 +74,15 @@ function App() {
     const controller = new AbortController();
     refreshController.current = controller;
     try {
-      const [status, modelList] = await Promise.all([
+      const [status, modelList, requestList] = await Promise.all([
         api('/status', { signal: controller.signal }),
         api('/v1/models', { signal: controller.signal }),
+        api('/requests?limit=200', { signal: controller.signal }).catch(() => ({ data: [] })),
       ]);
       if (serial !== refreshSerial.current) return;
       setData(status);
       setModels(modelList.data || []);
+      setRequestLogs(requestList.data || []);
       setSelectedModel(current => current || modelList.data?.[0]?.id || '');
       const metrics = status.metrics || {};
       const inputTokens = Number(metrics.input_tokens || 0);
@@ -158,6 +166,19 @@ function App() {
       message.success(result.restart_required ? '配置已保存，重启后生效' : '配置已保存');
     } catch (error) {
       message.error(error.message);
+    }
+  };
+
+  const refreshCredits = async () => {
+    setCreditRefreshing(true);
+    try {
+      const result = await api('/admin/credits/refresh', { method: 'POST' });
+      message.success(result.message || '上游积分刷新已启动');
+      window.setTimeout(refresh, 2500);
+    } catch (error) {
+      message.error(error.message);
+    } finally {
+      setCreditRefreshing(false);
     }
   };
 
@@ -264,7 +285,20 @@ function App() {
         </Tag>
       ),
     },
-    { title: '积分', dataIndex: 'credits', render: fmt },
+    { title: '可用积分', dataIndex: 'credits', render: fmt },
+    {
+      title: '周期积分',
+      render: (_, record) => record.cycle_capacity_size
+        ? `${fmt(record.cycle_capacity_used)} / ${fmt(record.cycle_capacity_size)}`
+        : '-',
+    },
+    {
+      title: '累计积分',
+      render: (_, record) => record.capacity_size
+        ? `${fmt(record.capacity_used)} / ${fmt(record.capacity_size)}`
+        : '-',
+    },
+    { title: '积分更新', dataIndex: 'credit_updated_at', render: value => value ? new Date(value * 1000).toLocaleString() : '-' },
     {
       title: '成功率',
       render: (_, record) => {
@@ -275,6 +309,55 @@ function App() {
     { title: '在途', dataIndex: 'in_flight' },
   ];
 
+  const requestColumns = [
+    { title: '时间', dataIndex: 'created_at', render: value => value ? new Date(value * 1000).toLocaleString() : '-' },
+    { title: '端点', dataIndex: 'route', render: value => <Text code>{value || '-'}</Text> },
+    { title: '模型', dataIndex: 'model', render: value => <Text strong>{value || '-'}</Text> },
+    { title: '模式', render: (_, record) => <Tag color={record.passthrough ? 'purple' : 'blue'}>{record.passthrough ? '透传' : record.mode === 'stream' ? '流式' : record.mode === 'sync' ? '同步' : record.mode || '-'}</Tag> },
+    { title: '状态', dataIndex: 'status', render: value => <Tag color={value >= 200 && value < 300 ? 'green' : 'red'}>{value || '-'}</Tag> },
+    { title: '输入', dataIndex: 'input_tokens', render: fmt },
+    { title: '输出', dataIndex: 'output_tokens', render: fmt },
+    { title: '总量', dataIndex: 'total_tokens', render: fmt },
+    { title: '请求上限', dataIndex: 'requested_output_tokens', render: value => value ? fmt(value) : '-' },
+    {
+      title: '积分消耗',
+      render: (_, record) => (
+        <Space direction="vertical" size={0}>
+          <Text>{record.credit_source && record.credit_source !== 'unknown' ? fmtCredits(record.credits_consumed) : '-'}</Text>
+          <Text type="secondary">{{ upstream: '上游', estimated: '估算', unknown: '未知' }[record.credit_source] || '未知'}</Text>
+        </Space>
+      ),
+    },
+    { title: '首 token', dataIndex: 'ttfb_millis', render: value => value ? `${value}ms` : '-' },
+    { title: '耗时', dataIndex: 'latency_millis', render: value => value ? `${(value / 1000).toFixed(2)}s` : '-' },
+    { title: '账号', dataIndex: 'account_uid', render: value => value ? <Text code>{value.slice(0, 12)}</Text> : '-' },
+    {
+      title: '错误',
+      render: (_, record) => record.error_code || record.error_message
+        ? <Text type="danger" title={record.error_message || record.error_code}>{record.error_code || 'error'}</Text>
+        : '-',
+    },
+  ];
+
+  const filteredRequestLogs = useMemo(() => {
+    const query = requestSearch.trim().toLowerCase();
+    return requestLogs.filter(record => {
+      const matchesQuery = !query || [record.model, record.route, record.account_uid, record.error_code, record.error_message]
+        .some(value => String(value || '').toLowerCase().includes(query));
+      const matchesMode = requestModeFilter === 'all' || (record.passthrough ? 'passthrough' : record.mode) === requestModeFilter;
+      const success = Number(record.status) >= 200 && Number(record.status) < 300;
+      const matchesStatus = requestStatusFilter === 'all' || (requestStatusFilter === 'success' ? success : !success);
+      return matchesQuery && matchesMode && matchesStatus;
+    });
+  }, [requestLogs, requestSearch, requestModeFilter, requestStatusFilter]);
+
+  const requestLogSummary = useMemo(() => ({
+    total: filteredRequestLogs.length,
+    failures: filteredRequestLogs.filter(record => Number(record.status) < 200 || Number(record.status) >= 300).length,
+    tokens: filteredRequestLogs.reduce((sum, record) => sum + Number(record.total_tokens || 0), 0),
+    credits: filteredRequestLogs.reduce((sum, record) => sum + Number(record.credits_consumed || 0), 0),
+  }), [filteredRequestLogs]);
+
   const metrics = data.metrics || {};
   const cacheHitRate = Number(metrics.input_tokens || 0)
     ? (Number(metrics.cache_read_tokens || 0) / Number(metrics.input_tokens || 1)) * 100
@@ -284,13 +367,14 @@ function App() {
     ['失败请求', metrics.failures, '#ff7875'], ['输入 token', metrics.input_tokens, '#69c0ff'],
     ['输出 token', metrics.output_tokens, '#b37feb'], ['总 token', metrics.total_tokens, '#9254de'],
     ['缓存读取', metrics.cache_read_tokens, '#36cfc9'], ['缓存创建', metrics.cache_write_tokens, '#13c2c2'],
-    ['工具调用', metrics.tool_calls, '#ffc53d'],
+    ['工具调用', metrics.tool_calls, '#ffc53d'], ['积分消耗', metrics.credits_consumed, '#fa8c16', fmtCredits],
   ];
   const activeTab = activeSection === 'dashboard' ? 'pool' : activeSection === 'settings' ? 'admin' : activeSection;
   const pageCopy = {
     dashboard: ['运营概览', '账号池、请求量和 token 用量实时汇总，数据每 30 秒自动更新。'],
     models: ['模型与请求', '查看当前可用的上游模型。'],
     playground: ['请求测试', '发送 Responses API 请求并查看标准化的 output_text。'],
+    requests: ['请求日志', '查看每次请求的端点、模式、token、耗时、积分和错误详情。'],
     settings: ['管理设置', '配置签到计划和管理授权账号。'],
   };
   const [pageTitle, pageDescription] = pageCopy[activeSection] || pageCopy.dashboard;
@@ -298,14 +382,15 @@ function App() {
     { key: 'dashboard', icon: <DashboardOutlined />, label: '仪表盘' },
     { key: 'models', icon: <ApiOutlined />, label: '模型目录' },
     { key: 'playground', icon: <SendOutlined />, label: '请求测试' },
+    { key: 'requests', icon: <FileSearchOutlined />, label: '请求日志' },
     { key: 'settings', icon: <SettingOutlined />, label: '管理设置' },
   ];
   const tabItems = [
     {
       key: 'pool', label: '账号池',
       children: (
-        <Card title="账号状态" extra={<Text type="secondary">{data.total || 0} 个账号</Text>}>
-          <Table rowKey="uid" columns={columns} dataSource={data.accounts || []} pagination={false} scroll={{ x: 760 }} />
+        <Card title="账号状态" extra={<Space><Text type="secondary">{data.total || 0} 个账号</Text><Button size="small" icon={<ReloadOutlined />} loading={creditRefreshing} onClick={refreshCredits}>刷新上游积分</Button></Space>}>
+          <Table rowKey="uid" columns={columns} dataSource={data.accounts || []} pagination={false} scroll={{ x: 980 }} />
         </Card>
       ),
     },
@@ -346,6 +431,46 @@ function App() {
             <Card size="small" title="output_text"><pre className="response-output" aria-live="polite">{answer || '等待响应…'}</pre></Card>
           </Space>
         </Card>
+      ),
+    },
+    {
+      key: 'requests', label: '请求日志',
+      children: (
+        <Space direction="vertical" size={16} style={{ width: '100%' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(180px,1fr))', gap: 12 }}>
+            <Card><Statistic title="当前记录" value={requestLogSummary.total} /></Card>
+            <Card><Statistic title="失败记录" value={requestLogSummary.failures} valueStyle={{ color: '#cf1322' }} /></Card>
+            <Card><Statistic title="记录 token" value={fmt(requestLogSummary.tokens)} /></Card>
+            <Card><Statistic title="记录积分" value={fmtCredits(requestLogSummary.credits)} valueStyle={{ color: '#d46b08' }} /></Card>
+          </div>
+          <Card title="请求筛选">
+            <Space wrap style={{ width: '100%' }}>
+              <Input allowClear value={requestSearch} onChange={event => setRequestSearch(event.target.value)} placeholder="搜索模型、端点、账号或错误" style={{ minWidth: 280 }} />
+              <Select value={requestModeFilter} onChange={setRequestModeFilter} style={{ width: 150 }} options={[{ value: 'all', label: '全部模式' }, { value: 'stream', label: '流式' }, { value: 'sync', label: '同步' }, { value: 'passthrough', label: '透传' }]} />
+              <Select value={requestStatusFilter} onChange={setRequestStatusFilter} style={{ width: 150 }} options={[{ value: 'all', label: '全部状态' }, { value: 'success', label: '成功' }, { value: 'failed', label: '失败' }]} />
+              <Button icon={<ReloadOutlined />} onClick={refresh}>刷新日志</Button>
+            </Space>
+          </Card>
+          <Card title="请求明细" extra={<Text type="secondary">显示 {filteredRequestLogs.length} / {requestLogs.length} 条</Text>}>
+            <Table
+              rowKey="id"
+              columns={requestColumns}
+              dataSource={filteredRequestLogs}
+              pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: [10, 20, 50] }}
+              scroll={{ x: 1680 }}
+              locale={{ emptyText: '暂无匹配的请求记录' }}
+              expandable={{
+                expandedRowRender: record => (
+                  <Space direction="vertical" size={4}>
+                    <Text type="secondary">请求 ID：{record.id || '-'}</Text>
+                    <Text type="secondary">请求上限：{record.requested_output_tokens ? fmt(record.requested_output_tokens) : '未设置'}；缓存读取：{fmt(record.cache_read_tokens)}；缓存创建：{fmt(record.cache_write_tokens)}；工具调用：{fmt(record.tool_calls)}</Text>
+                    {(record.error_code || record.error_message) && <Text type="danger">{record.error_code || 'error'}：{record.error_message || '无错误详情'}</Text>}
+                  </Space>
+                ),
+              }}
+            />
+          </Card>
+        </Space>
       ),
     },
     {
@@ -409,7 +534,7 @@ function App() {
             {activeSection === 'dashboard' && (
               <>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(170px,1fr))', gap: 16, marginBottom: 20 }}>
-                  {statCards.map(([label, value, color]) => <Card key={label}><Statistic title={label} value={fmt(value)} valueStyle={{ color }} /></Card>)}
+                  {statCards.map(([label, value, color, formatter]) => <Card key={label}><Statistic title={label} value={formatter ? formatter(value) : fmt(value)} valueStyle={{ color }} /></Card>)}
                 </div>
                 <Card className="trend-card" title="性能趋势" extra={<Text type="secondary">最近 {metricSamples.length} 次刷新</Text>}>
                   <div className="trend-grid">
@@ -430,6 +555,9 @@ function App() {
                       <Sparkline values={metricSamples.map(sample => sample.avgTTFB)} color="#12a594" ariaLabel="平均首 token 趋势" />
                     </div>
                   </div>
+                </Card>
+                <Card title="最近请求" extra={<Text type="secondary">{requestLogs.length} 条</Text>} style={{ marginTop: 20 }}>
+                  <Table rowKey="id" columns={requestColumns} dataSource={requestLogs} pagination={{ pageSize: 10 }} scroll={{ x: 1480 }} locale={{ emptyText: '暂无请求记录' }} />
                 </Card>
               </>
             )}

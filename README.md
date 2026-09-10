@@ -1,4 +1,19 @@
 
+> WorkBuddy CN（CodeBuddy / copilot.tencent.com）的 OpenAI 兼容反向代理，支持 OAuth 登录、多账号轮转、工具调用与流式响应。
+
+## 功能特性
+
+- 🔐 **OAuth 登录** — 通过 `/v2/plugin/auth/state` 设备授权流程获取凭证，支持 token 自动刷新
+- 🔄 **多账号轮转** — 三因子加权随机选号（credits ×闲置×成功率），防热点 + 防惊群（100ms 窗口）
+- 🛠 **工具调用** — 完整支持 OpenAI tools/tool_choice，流式 `tool_calls` 按 index 合并
+- 📡 **流式 + 非流式** — 默认规范化上游 SSE；可配置原始流透传；非流式本地聚合（上游拒绝非流式请求）
+- ⏰ **定时签到** — 每日 09:00 / 21:00 自动签到 + 积分查询，积分耗尽账号次日 04:00 自动恢复
+- 📊 **积分监控** — 保存上游总积分、已用积分、周期总量和周期余额，控制台与 `credit.sh` 均可查看
+- 🔑 **登录工具** — `login.sh` 交互式登录，落盘即生效
+- 🏗 **Docker 部署** — 一键 `docker compose up`，healthcheck 常驻
+- 📈 **请求审计** — 每次请求的模型、token、积分、耗时和错误持久化到 SQLite，并提供控制台和 API 查询
+- 🏥 **健康检查** — `/healthz` 无健康账号时返回 503，可接负载均衡器
+- 📉 **状态汇总** — `/status` 返回 total/healthy/cooling/disabled 计数 + 每账号完整画像
 
 ## 快速开始
 
@@ -71,7 +86,13 @@ curl -s http://localhost:7863/v1/chat/completions \
     "timeout_seconds": 120
   },
   "features": {
-    "sanitize_blacklist_fingerprints": true
+    "sanitize_blacklist_fingerprints": true,
+    "passthrough": false
+  },
+  "billing": {
+    "input_credits_per_1k_tokens": 0,
+    "output_credits_per_1k_tokens": 0,
+    "cached_input_credits_per_1k_tokens": 0
   },
   "upstash": {
     "url": "",
@@ -139,13 +160,20 @@ Disabled ←────┘ (session 死亡，永久)
 - Redis 仅做异步镜像（粘性会话映射防重启丢失 + 池状态快照恢复备份），**不在请求热路径同步调用**。
 - 池状态快照：每次本地 `state.json` 落盘同步镜像一份到 Redis（带 `saved_at`）；启动时**择新恢复**——Redis 快照比本地新才采用，否则本地优先。
 - `/status` 透出 `redis_mode`（`upstash`/`noop`）与池级 `sticky_sessions`。
+- 账号状态同时包含上游 `capacity_size/remain/used`、`cycle_capacity_size/remain/used` 和 `credit_updated_at`；服务启动、定时签到或调用积分刷新接口时更新，并随 `state.json` 与 Redis 快照持久化。
 
-### 请求级日志
+### 请求日志、token 与积分
 
-每个 `/v1/chat/completions` 请求结束后打一行表格日志到 stdout：
+每个 Chat Completions 和 Responses 请求结束后都会写入 `state_file` 同目录的
+`metrics.db`。记录只包含模型、路由、状态、账号 UID、token、耗时、积分来源和错误码，
+不会保存提示词或模型输出，但会保存最多 1,024 字符的错误详情。数据库保留最近 10,000 条，`GET /requests?limit=50`
+可查询最近记录，控制台也会展示同一份数据。
+控制台“请求日志”菜单支持按模型、端点、账号、错误、流式/同步/透传和成功状态筛选，并可展开查看缓存 token、工具调用与完整错误详情。
+
+stdout 同时保留一行便于排查的表格日志：
 
 ```
-| #001 | 18:31:31 | deepseek-v4 | stream | 200 | uid=0851ce35 | TTFB=801ms | tok=60 | 23.5tok/s | total=2.6s |
+| #001 | 18:31:31 | deepseek-v4 | stream | 200 | uid=0851ce35 | TTFB=801ms | tok=60 | 23.5tok/s | total=2.6s | credits=0.24(upstream) |
 ```
 
 字段说明：
@@ -153,6 +181,17 @@ Disabled ←────┘ (session 死亡，永久)
 - `TTFB`：首 token 到达时间（stream 模式）
 - `tok`：输出 token 数（从上游 usage.completion_tokens 精确读取，非估算）
 - `uid`：账号 UID 前 8 位
+- `credits`：积分消耗及来源；`upstream` 为上游真实值，`estimated` 为本地费率估算
+
+上游没有返回积分字段时，可用 `billing` 中三个“每 1,000 token 积分”费率估算。
+默认值均为 `0`，此时不猜测消耗并在请求记录中标记为 `unknown`。
+
+### 原始流透传
+
+设置 `features.passthrough=true` 后，流式 Chat Completions 会原样转发上游 SSE 字节，
+保留上游扩展字段，不再执行帧规范化或补写 `[DONE]`。启用总开关后，可在单次请求中
+发送 `X-WorkBuddy-Passthrough: false` 临时关闭。请求体中的未知字段本来就会保留；模型别名、
+`tool_choice`、`reasoning_effort` 和 `stream` 仍会按上游兼容要求转换。
 
 ## 工具脚本
 
@@ -171,7 +210,18 @@ Disabled ←────┘ (session 死亡，永久)
 | `POST /v1/responses` | Bearer | Responses API 适配（流式/非流式、工具调用、`previous_response_id`） |
 | `GET /v1/models` | Bearer | 模型列表（动态拉取 + 静态兜底） |
 | `GET /status` | Bearer | 账号状态汇总（total/healthy/cooling/disabled + 每账号详情） |
+| `GET /requests?limit=50` | Bearer | 最近请求日志（最多 200 条，不含提示词和响应正文） |
+| `POST /admin/credits/refresh` | 前端会话/Bearer | 异步刷新所有账号的上游积分明细，不执行签到 |
 | `GET /healthz` | 无 | 健康检查（无健康账号时 503） |
+
+ZCode 等使用 OpenAI Compatible 提供商的客户端，Base URL 应填写
+`https://你的域名/v1`（直连本服务时为 `http://服务器地址:7863/v1`），模型名称单独填写。
+客户端会在 Base URL 后追加 `/chat/completions`；如果填写域名根路径，中间网关可能
+返回 HTML 页面，使客户端误报“模型未返回任何内容”。检查响应应为
+`text/event-stream`（流式）或 `application/json`（非流式）。
+本服务也提供同鉴权的 `/chat/completions`、`/responses`、`/models` 别名，方便直连客户端。
+上游流读取超时会返回 `upstream_timeout` 错误帧和 `[DONE]`；Responses 使用
+`response.failed`，不会把中断保存为已完成的会话。
 
 重复调用 `/v1/responses` 时应复用稳定的 `prompt_cache_key` 或 `conversation`；使用上一轮返回的 `previous_response_id` 时，服务会恢复该轮上下文并继续使用同一账号。响应历史默认保留 1 小时；配置 Upstash 后会同步到 Redis，可跨进程重启和多实例继续会话，未配置时使用进程内存。
 
@@ -179,7 +229,7 @@ Disabled ←────┘ (session 死亡，永久)
 
 - **防雪崩**：上游 4xx/5xx 轮转重试（不直接返回），404 短冷却 60s 不累计失败
 - **错误分流**：网络层错误不计失败（避免抖动连坐）；HTTP 5xx 喂单一连续失败计数器，达 `breaker_threshold`（默认 3）触发指数退避熔断
-- **请求日志**：表格日志（seq/TTFB/uid/tokens/latency）便于排查慢请求
+- **请求日志**：SQLite 持久化模型、token、积分、TTFB、总耗时和错误码，stdout 保留精简表格
 - **连接池**：`MaxIdleConnsPerHost=20` 减少 TLS 握手
 - **凭证续期**：token 临近过期自动 refresh，失败禁用账号
 - **状态持久化**：`data/state.json` dirty flag + 5s 周期异步落盘，进程退出前强制 flush

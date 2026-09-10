@@ -348,7 +348,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		Efforts         []string
 	}, len(env.Data.Models))
 	for _, m := range env.Data.Models {
-		dynMap[m.ID] = struct {
+		info := struct {
 			ID              string
 			Name            string
 			MaxInputTokens  int64
@@ -356,15 +356,29 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			Disabled        bool
 			Efforts         []string
 		}{m.ID, m.Name, m.MaxInputTokens, m.MaxOutputTokens, m.Disabled, m.Reasoning.SupportedEfforts}
+		dynMap[m.ID] = info
+		canonical := NormalizeModelID(m.ID)
+		if _, exists := dynMap[canonical]; !exists {
+			dynMap[canonical] = info
+		}
 	}
 	out := make([]ModelInfo, 0, len(cliIDs))
+	seen := make(map[string]struct{}, len(cliIDs))
 	for _, id := range cliIDs {
+		canonical := NormalizeModelID(id)
 		m, ok := dynMap[id]
+		if !ok {
+			m, ok = dynMap[canonical]
+		}
 		if !ok || m.Disabled {
 			continue
 		}
+		if _, exists := seen[canonical]; exists {
+			continue
+		}
+		seen[canonical] = struct{}{}
 		out = append(out, ModelInfo{
-			ID:            m.ID,
+			ID:            canonical,
 			Name:          m.Name,
 			ContextWindow: m.MaxInputTokens,
 			MaxTokens:     m.MaxOutputTokens,
@@ -387,8 +401,20 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
-// UserResource 查询账号当前可花费积分余额（所有套餐 CycleCapacity 聚合，负值钳 0）。
-func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
+// ResourceUsage contains the aggregate upstream credit counters for one user.
+// Remaining follows the same cycle-first rule used by the account pool.
+type ResourceUsage struct {
+	Remaining           int64
+	CapacitySize        int64
+	CapacityRemain      int64
+	CapacityUsed        int64
+	CycleCapacitySize   int64
+	CycleCapacityRemain int64
+	CycleCapacityUsed   int64
+}
+
+// UserResourceDetails queries the upstream credit counters for one account.
+func (c *Client) UserResourceDetails(a *auth.Auth) (ResourceUsage, error) {
 	url := c.billingBase(a) + "/v2/billing/meter/get-user-resource"
 	now := time.Now()
 	body := map[string]any{
@@ -402,12 +428,12 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 	raw, _ := json.Marshal(body)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
-		return 0, err
+		return ResourceUsage{}, err
 	}
 	BillingHeaders(req, a)
 	data, err := c.doJSON(req)
 	if err != nil {
-		return 0, err
+		return ResourceUsage{}, err
 	}
 	var resp struct {
 		Response struct {
@@ -425,8 +451,9 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, fmt.Errorf("resource parse: %w", err)
+		return ResourceUsage{}, fmt.Errorf("resource parse: %w", err)
 	}
+	usage := ResourceUsage{}
 	for _, acct := range resp.Response.Data.Accounts {
 		var r int64
 		switch {
@@ -440,9 +467,31 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 		if r < 0 {
 			r = 0
 		}
-		remain += r
+		usage.CapacitySize += maxInt64(acct.CapacitySize, 0)
+		usage.CapacityRemain += maxInt64(acct.CapacityRemain, 0)
+		usage.CapacityUsed += maxInt64(acct.CapacityUsed, 0)
+		usage.CycleCapacitySize += maxInt64(acct.CycleCapacitySize, 0)
+		usage.CycleCapacityRemain += maxInt64(acct.CycleCapacityRemain, 0)
+		usage.CycleCapacityUsed += maxInt64(acct.CycleCapacityUsed, 0)
+		usage.Remaining += r
 	}
-	return remain, nil
+	return usage, nil
+}
+
+// UserResource keeps the legacy balance-only API used by older callers.
+func (c *Client) UserResource(a *auth.Auth) (int64, error) {
+	usage, err := c.UserResourceDetails(a)
+	if err != nil {
+		return 0, err
+	}
+	return usage.Remaining, nil
+}
+
+func maxInt64(value, floor int64) int64 {
+	if value < floor {
+		return floor
+	}
+	return value
 }
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。

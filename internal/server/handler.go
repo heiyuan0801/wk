@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,7 @@ type Config struct {
 	Region           string
 	LoginBin         string // OAuth 登录辅助程序路径
 	CheckinNow       func()
+	CreditRefreshNow func()
 	UpdateSchedule   func(checkinHours, keepaliveHours []int)
 	MaxRotate        int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
@@ -45,11 +47,14 @@ type Config struct {
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
 	StickyCount func() int
 	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
-	RedisMode     string
-	SoftCooldown  time.Duration // 429 冷却，默认 60s
-	RefreshSkew   time.Duration // token 提前刷新窗口，默认 10m
-	ResponseStore ResponseStore
-	MetricsStore  MetricsStore
+	RedisMode       string
+	SoftCooldown    time.Duration // 429 冷却，默认 60s
+	RefreshSkew     time.Duration // token 提前刷新窗口，默认 10m
+	ResponseStore   ResponseStore
+	MetricsStore    MetricsStore
+	RequestLogStore RequestLogStore
+	CreditPolicy    CreditPolicy
+	Passthrough     bool
 }
 
 // ResponseStore is the optional Redis-backed persistence used by
@@ -105,13 +110,21 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+	// Some OpenAI-compatible clients append endpoint paths to a bare base URL.
+	// Route these aliases through exactly the same authentication and handlers.
+	h.mux.HandleFunc("POST /chat/completions", h.withAuth(h.chatCompletions))
+	h.mux.HandleFunc("POST /responses", h.withAuth(h.responses))
+	h.mux.HandleFunc("GET /models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /stats", h.withAuth(h.stats))
+	h.mux.HandleFunc("GET /requests", h.withAuth(h.requests))
+	h.mux.HandleFunc("GET /v1/requests", h.withAuth(h.requests))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	h.mux.HandleFunc("POST /admin/unlock", h.unlock)
 	h.mux.HandleFunc("GET /admin/config", h.withFrontend(h.adminConfig))
 	h.mux.HandleFunc("POST /admin/config", h.withFrontend(h.saveAdminConfig))
 	h.mux.HandleFunc("POST /admin/checkin", h.withFrontend(h.runCheckin))
+	h.mux.HandleFunc("POST /admin/credits/refresh", h.withFrontend(h.refreshCredits))
 	h.mux.HandleFunc("POST /admin/account/url", h.withFrontend(h.accountURL))
 	h.mux.HandleFunc("POST /admin/account/poll", h.withFrontend(h.accountPoll))
 	// Static console assets are served from the image's frontend directory.
@@ -311,6 +324,15 @@ func (h *Handler) runCheckin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 202, map[string]any{"ok": true, "message": "签到任务已启动"})
 }
 
+func (h *Handler) refreshCredits(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.CreditRefreshNow == nil {
+		writeJSON(w, 503, map[string]string{"error": "积分刷新服务不可用"})
+		return
+	}
+	go h.cfg.CreditRefreshNow()
+	writeJSON(w, 202, map[string]any{"ok": true, "message": "上游积分刷新已启动"})
+}
+
 func (h *Handler) loginCommand(ctx context.Context, arg string) ([]byte, error) {
 	bin := h.cfg.LoginBin
 	if bin == "" {
@@ -409,6 +431,28 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, h.metricsSnapshot())
 }
 
+func (h *Handler) requests(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if value, err := strconv.Atoi(raw); err == nil {
+			limit = value
+		}
+	}
+	if h.cfg.RequestLogStore == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": []RequestLog{}})
+		return
+	}
+	records, err := h.cfg.RequestLogStore.RecentRequests(limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"code": "request_log_unavailable", "message": err.Error()}})
+		return
+	}
+	if records == nil {
+		records = []RequestLog{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": records})
+}
+
 func (h *Handler) metricsSnapshot() map[string]any {
 	if h.cfg.MetricsStore != nil {
 		return h.cfg.MetricsStore.SnapshotMetrics()
@@ -421,7 +465,8 @@ var staticModels = []map[string]any{
 	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "kimi-k2.7", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "kimi-k3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "kimi-k2.7-code", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "hy3-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
@@ -542,7 +587,11 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, http.StatusBadRequest, "previous_response_not_found", "previous_response_id is unknown or expired")
 			return
 		}
-		messages = append(previousMessages, messages...)
+		// Top-level Responses instructions apply to the current request. Keep
+		// them before the restored transcript and never insert them between a
+		// prior assistant tool call and its function_call_output.
+		messages = append(responseInstructionMessages(messages), stripInstructionMessages(previousMessages)...)
+		messages = append(messages, responseInputMessages(turnMessages)...)
 		routeKey = previousRouteKey
 	}
 	responseID := newResponseID()
@@ -576,8 +625,8 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		response := chatToResponse(chat, responseID)
-		if assistant := chatAssistantMessage(chat); assistant != nil {
-			h.storeResponse(responseID, append(append([]map[string]any{}, turnMessages...), assistant), routeKey, previousID)
+		if assistant := chatAssistantMessage(chat, responseID); assistant != nil {
+			h.storeResponse(responseID, append(responseInputMessages(turnMessages), assistant), routeKey, previousID)
 		}
 		writeJSON(w, http.StatusOK, response)
 		return
@@ -585,10 +634,34 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	sw := &responsesStreamWriter{
 		header: make(http.Header), dst: w, id: responseID,
 		onComplete: func(assistant map[string]any) {
-			h.storeResponse(responseID, append(append([]map[string]any{}, turnMessages...), assistant), routeKey, previousID)
+			h.storeResponse(responseID, append(responseInputMessages(turnMessages), assistant), routeKey, previousID)
 		},
 	}
 	h.chatCompletions(sw, chatReq)
+}
+
+func responseInstructionMessages(messages []map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, 1)
+	for _, message := range messages {
+		if role, _ := message["role"].(string); role == "system" || role == "developer" {
+			out = append(out, message)
+		}
+	}
+	return out
+}
+
+func responseInputMessages(messages []map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, len(messages))
+	for _, message := range messages {
+		if role, _ := message["role"].(string); role != "system" && role != "developer" {
+			out = append(out, message)
+		}
+	}
+	return out
+}
+
+func stripInstructionMessages(messages []map[string]any) []map[string]any {
+	return responseInputMessages(messages)
 }
 
 func responseMessages(raw []any) []map[string]any {
@@ -732,6 +805,20 @@ func responsesToChat(raw []byte) ([]byte, bool, error) {
 			continue
 		}
 		chat[k] = v
+	}
+	delete(chat, "reasoning")
+	delete(chat, "text")
+	if reasoning, ok := in["reasoning"].(map[string]any); ok {
+		if effort, ok := reasoning["effort"].(string); ok && strings.TrimSpace(effort) != "" {
+			chat["reasoning_effort"] = effort
+		}
+	}
+	if text, ok := in["text"].(map[string]any); ok {
+		if format, ok := text["format"].(map[string]any); ok {
+			if responseFormat := responsesFormatToChat(format); responseFormat != nil {
+				chat["response_format"] = responseFormat
+			}
+		}
 	}
 	// Responses tools are flat ({type,name,parameters}); Chat Completions
 	// expects function metadata nested under `function`.
@@ -928,6 +1015,29 @@ func selectFields(source map[string]any, keys ...string) map[string]any {
 	return out
 }
 
+func responsesFormatToChat(format map[string]any) map[string]any {
+	typ, _ := format["type"].(string)
+	switch typ {
+	case "text":
+		return map[string]any{"type": "text"}
+	case "json_object":
+		return map[string]any{"type": "json_object"}
+	case "json_schema":
+		name, _ := format["name"].(string)
+		schema := format["schema"]
+		if name == "" || schema == nil {
+			return nil
+		}
+		jsonSchema := map[string]any{"name": name, "schema": schema}
+		if strict, ok := format["strict"].(bool); ok {
+			jsonSchema["strict"] = strict
+		}
+		return map[string]any{"type": "json_schema", "json_schema": jsonSchema}
+	default:
+		return nil
+	}
+}
+
 func chatToResponse(chat map[string]any, id string) map[string]any {
 	if id == "" {
 		id = newResponseID()
@@ -944,7 +1054,7 @@ func chatToResponse(chat map[string]any, id string) map[string]any {
 		}
 	}
 
-	calls, _ := message["tool_calls"].([]any)
+	calls := normalizedAssistantToolCalls(message, id)
 	output := make([]any, 0, len(calls)+1)
 	if text != "" || len(calls) == 0 {
 		output = append(output, map[string]any{
@@ -985,7 +1095,7 @@ func chatToResponse(chat map[string]any, id string) map[string]any {
 	return out
 }
 
-func chatAssistantMessage(chat map[string]any) map[string]any {
+func chatAssistantMessage(chat map[string]any, responseID string) map[string]any {
 	choices, ok := chat["choices"].([]any)
 	if !ok || len(choices) == 0 {
 		return nil
@@ -1002,7 +1112,7 @@ func chatAssistantMessage(chat map[string]any) map[string]any {
 	if content, exists := message["content"]; exists {
 		assistant["content"] = content
 	}
-	if calls, exists := message["tool_calls"]; exists {
+	if calls := normalizedAssistantToolCalls(message, responseID); len(calls) > 0 {
 		assistant["tool_calls"] = calls
 	}
 	if _, hasContent := assistant["content"]; !hasContent {
@@ -1011,6 +1121,26 @@ func chatAssistantMessage(chat map[string]any) map[string]any {
 		}
 	}
 	return assistant
+}
+
+func normalizedAssistantToolCalls(message map[string]any, responseID string) []any {
+	raw, _ := message["tool_calls"].([]any)
+	out := make([]any, 0, len(raw))
+	for i, value := range raw {
+		call, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		copy := make(map[string]any, len(call)+1)
+		for k, v := range call {
+			copy[k] = v
+		}
+		if id, _ := copy["id"].(string); id == "" {
+			copy["id"] = fmt.Sprintf("call-%s-%d", responseID, i)
+		}
+		out = append(out, copy)
+	}
+	return out
 }
 
 // responseUsage normalizes the upstream Chat Completions usage shape into the
@@ -1110,11 +1240,12 @@ type responsesStreamWriter struct {
 }
 
 type responseStreamCall struct {
-	index int
-	id    string
-	name  string
-	args  strings.Builder
-	added bool
+	index       int
+	id          string
+	name        string
+	args        strings.Builder
+	added       bool
+	emittedArgs int
 }
 
 func (w *responsesStreamWriter) Header() http.Header { return w.header }
@@ -1231,7 +1362,12 @@ func (w *responsesStreamWriter) Write(p []byte) (int, error) {
 									}
 									if args != "" {
 										state.args.WriteString(args)
-										if err := w.emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "response_id": w.id, "output_index": state.index, "item_id": state.id, "call_id": state.id, "delta": args}); err != nil {
+									}
+									if state.added && state.emittedArgs < state.args.Len() {
+										allArgs := state.args.String()
+										pending := allArgs[state.emittedArgs:]
+										state.emittedArgs = len(allArgs)
+										if err := w.emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "response_id": w.id, "output_index": state.index, "item_id": state.id, "call_id": state.id, "delta": pending}); err != nil {
 											return 0, err
 										}
 									}
@@ -1300,6 +1436,18 @@ func (w *responsesStreamWriter) complete() error {
 	if w.usage != nil {
 		response["usage"] = responseUsage(w.usage)
 	}
+	if w.onComplete != nil {
+		assistant := map[string]any{"role": "assistant", "content": text}
+		if len(indexes) > 0 {
+			toolCalls := make([]any, 0, len(indexes))
+			for _, index := range indexes {
+				call := w.calls[index]
+				toolCalls = append(toolCalls, map[string]any{"id": call.id, "type": "function", "function": map[string]any{"name": call.name, "arguments": call.args.String()}})
+			}
+			assistant["tool_calls"] = toolCalls
+		}
+		w.onComplete(assistant)
+	}
 	if w.textStarted {
 		if err := w.emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "response_id": w.id, "item_id": w.id + "-item", "output_index": w.textIndex, "content_index": 0, "text": text}); err != nil {
 			return err
@@ -1326,21 +1474,6 @@ func (w *responsesStreamWriter) complete() error {
 	}
 	if f, ok := w.dst.(http.Flusher); ok {
 		f.Flush()
-	}
-	if w.onComplete != nil {
-		assistant := map[string]any{"role": "assistant", "content": text}
-		if len(indexes) > 0 {
-			toolCalls := make([]any, 0, len(indexes))
-			for _, index := range indexes {
-				call := w.calls[index]
-				toolCalls = append(toolCalls, map[string]any{
-					"id": call.id, "type": "function",
-					"function": map[string]any{"name": call.name, "arguments": call.args.String()},
-				})
-			}
-			assistant["tool_calls"] = toolCalls
-		}
-		w.onComplete(assistant)
 	}
 	return nil
 }
@@ -1396,7 +1529,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(body, &peek)
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
-	st := newChatStatWithStore(time.Now(), body, peek.Stream, h.cfg.MetricsStore)
+	passthrough := h.requestPassthrough(r)
+	st := newChatStatWithOptions(time.Now(), body, peek.Stream, h.cfg.MetricsStore, h.cfg.RequestLogStore, h.cfg.CreditPolicy, passthrough, r.URL.Path)
 	defer st.done()
 
 	tried := map[string]bool{}
@@ -1493,6 +1627,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
 			st.status = http.StatusServiceUnavailable
+			setRequestError(st, "transport_error", terr.Error())
 			lastErr = terr
 			fail(acct.UID)
 			continue
@@ -1500,6 +1635,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if status >= 400 {
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))
+			setRequestError(st, kind.String(), string(respBody))
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			h.applyErrorPolicy(acct.UID, kind)
 			fail(acct.UID)
@@ -1509,13 +1645,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
-			streamErr := upstream.Stream(w, stats)
+			streamErr := upstream.StreamWithOptions(w, stats, passthrough)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
 			st.inputTokens, st.toks, st.totalTokens, st.cacheRead, st.cacheWrite, st.toolCalls = stats.UsageStats()
+			if _, ok := stats.Tokens(); !ok {
+				st.toks = -1
+			}
+			if credits, ok := stats.CreditUsage(); ok {
+				st.creditsConsumed = credits
+				st.creditSource = "upstream"
+			}
 			rc.Close()
 			if streamErr != nil {
 				st.status = http.StatusBadGateway
+				setRequestError(st, "upstream_stream_error", streamErr.Error())
+				log.Printf("chat_stream model=%s: %v", st.model, streamErr)
 				return
 			}
 			h.cfg.Pool.NoteSuccess(acct.UID)
@@ -1523,6 +1668,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.cfg.Session.Bind(sessKey, acct.UID)
 			}
 			st.status = http.StatusOK
+			st.errorCode = ""
+			st.errorMessage = ""
 			return
 		}
 		resp, err := upstream.Aggregate(rc)
@@ -1531,6 +1678,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
+			setRequestError(st, "upstream_parse", err.Error())
 			return
 		}
 		usageStats(resp, st)
@@ -1540,6 +1688,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			h.cfg.Session.Bind(sessKey, acct.UID)
 		}
 		st.status = http.StatusOK
+		st.errorCode = ""
+		st.errorMessage = ""
 		st.toks = completionTokens(resp)
 		return
 	}
@@ -1549,6 +1699,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
 	st.status = http.StatusServiceUnavailable
+	setRequestError(st, "no_healthy_account", msg)
+}
+
+func setRequestError(st *chatStat, code, message string) {
+	st.errorCode = code
+	st.errorMessage = truncateRequestError(message)
+}
+
+func truncateRequestError(message string) string {
+	message = strings.TrimSpace(message)
+	if len(message) > 1024 {
+		return message[:1024]
+	}
+	return message
+}
+
+func (h *Handler) requestPassthrough(r *http.Request) bool {
+	if !h.cfg.Passthrough {
+		return false
+	}
+	value := strings.TrimSpace(strings.ToLower(r.Header.Get("X-WorkBuddy-Passthrough")))
+	if value == "" {
+		return true
+	}
+	return value == "1" || value == "true" || value == "yes" || value == "on"
 }
 
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。

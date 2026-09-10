@@ -11,3 +11,8 @@ services:
       - ./auths:/app/auths
       - ./data:/app/data
       - ./config.json:/app/config.json
+
+networks:
+  default:
+    external: true
+    name: deploy_default

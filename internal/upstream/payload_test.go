@@ -5,6 +5,30 @@ import (
 	"testing"
 )
 
+func TestNormalizeModelID(t *testing.T) {
+	cases := map[string]string{
+		"kimi-k3-1": "kimi-k3",
+		"kimi-k2.7": "kimi-k2.7-code",
+		"glm-5.2":   "glm-5.2",
+	}
+	for input, want := range cases {
+		if got := NormalizeModelID(input); got != want {
+			t.Errorf("NormalizeModelID(%q)=%q want %q", input, got, want)
+		}
+	}
+}
+
+func TestPrepareBodyNormalizesModelID(t *testing.T) {
+	out := PrepareBodyOpt([]byte(`{"model":"kimi-k2.7","messages":[]}`), true)
+	var body map[string]any
+	if err := json.Unmarshal(out, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["model"] != "kimi-k2.7-code" {
+		t.Fatalf("model=%v want kimi-k2.7-code", body["model"])
+	}
+}
+
 func TestPrepareBodyOptWithEfforts(t *testing.T) {
 	efforts := map[string][]string{
 		"glm-5.2":      {"off", "low", "high"},

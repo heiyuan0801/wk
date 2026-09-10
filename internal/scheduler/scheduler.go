@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/upstream"
 )
@@ -130,13 +131,40 @@ func (s *Scheduler) RunCheckinNow() {
 			log.Printf("checkin %s: %v", st.UID, err)
 			// 已签到等业务错误也继续走余额查询
 		}
-		remain, err := s.cfg.Upstream.UserResource(a)
-		if err != nil {
-			log.Printf("user-resource %s: %v", st.UID, err)
+		s.refreshAccountCredits(st.UID, a)
+	}
+}
+
+// RunCreditRefreshNow refreshes upstream credit counters without performing a
+// daily check-in. It is safe to run asynchronously during service startup.
+func (s *Scheduler) RunCreditRefreshNow() {
+	for _, st := range s.cfg.Pool.List() {
+		if st.Disabled {
 			continue
 		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || a.Snapshot().RefreshToken == "" {
+			continue
+		}
+		s.refreshAccountCredits(st.UID, a)
 	}
+}
+
+func (s *Scheduler) refreshAccountCredits(uid string, a *auth.Auth) {
+	resource, err := s.cfg.Upstream.UserResourceDetails(a)
+	if err != nil {
+		log.Printf("user-resource %s: %v", uid, err)
+		return
+	}
+	s.cfg.Pool.SetCreditDetail(uid, pool.CreditDetail{
+		Remaining:           resource.Remaining,
+		CapacitySize:        resource.CapacitySize,
+		CapacityRemain:      resource.CapacityRemain,
+		CapacityUsed:        resource.CapacityUsed,
+		CycleCapacitySize:   resource.CycleCapacitySize,
+		CycleCapacityRemain: resource.CycleCapacityRemain,
+		CycleCapacityUsed:   resource.CycleCapacityUsed,
+	})
 }
 
 // RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。

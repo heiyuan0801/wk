@@ -16,7 +16,13 @@
     "timeout_seconds": 120
   },
   "features": {
-    "sanitize_blacklist_fingerprints": true
+    "sanitize_blacklist_fingerprints": true,
+    "passthrough": false
+  },
+  "billing": {
+    "input_credits_per_1k_tokens": 0,
+    "output_credits_per_1k_tokens": 0,
+    "cached_input_credits_per_1k_tokens": 0
   },
   "upstash": {
     "url": "",

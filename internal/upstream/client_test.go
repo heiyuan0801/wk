@@ -214,6 +214,22 @@ func TestChatStreamHardCreditError(t *testing.T) {
 	}
 }
 
+func TestFetchModelsCanonicalizesKimiIDs(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"models":[
+			{"id":"kimi-k3-1","name":"Kimi K3","maxInputTokens":131072,"maxOutputTokens":8192},
+			{"id":"kimi-k2.7","name":"Kimi K2.7","maxInputTokens":131072,"maxOutputTokens":8192}
+		],"agents":[{"name":"cli","models":["kimi-k3-1","kimi-k2.7"]}]}}`), nil
+	})
+	infos, err := c.FetchModels(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err != nil {
+		t.Fatalf("fetch models: %v", err)
+	}
+	if len(infos) != 2 || infos[0].ID != "kimi-k3" || infos[1].ID != "kimi-k2.7-code" {
+		t.Fatalf("canonical model IDs=%+v", infos)
+	}
+}
+
 func TestUserResourceAggregation(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {

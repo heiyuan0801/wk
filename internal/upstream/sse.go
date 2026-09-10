@@ -3,9 +3,12 @@ package upstream
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -36,17 +39,21 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			return nil, err
 		}
 		line = strings.TrimRight(line, "\r\n")
-		if strings.HasPrefix(line, "data: ") {
-			payload := strings.TrimPrefix(line, "data: ")
+		if strings.HasPrefix(line, "data:") {
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			if payload == "[DONE]" {
 				// 上游显式结束：停止读取，DONE 之后的任何数据一律忽略。
 				break
 			} else {
 				var chunk map[string]any
 				if json.Unmarshal([]byte(payload), &chunk) == nil {
+					if rawErr, ok := chunk["error"]; ok {
+						return nil, fmt.Errorf("upstream returned an error: %v", rawErr)
+					}
 					// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
 					validEvents++
-					chunk = normalizeFrame(chunk)
+					// Aggregate handles complete message snapshots itself so a
+					// snapshot after deltas is not appended twice.
 					if v, ok := chunk["id"].(string); ok && id == "" {
 						id = v
 					}
@@ -101,10 +108,29 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 										mergeToolCallDelta(merged, call)
 									}
 								}
+								if _, modern := delta["tool_calls"]; !modern {
+									for _, rawCall := range normalizedToolCalls(delta) {
+										call, ok := rawCall.(map[string]any)
+										if !ok {
+											continue
+										}
+										idx := 0
+										if n, ok := call["index"].(float64); ok {
+											idx = int(n)
+										}
+										merged := toolCalls[idx]
+										if merged == nil {
+											merged = map[string]any{"index": idx}
+											toolCalls[idx] = merged
+											toolOrder = append(toolOrder, idx)
+										}
+										mergeToolCallDelta(merged, call)
+									}
+								}
 							}
 							// 有的上游把完整消息放在 message 里（非 delta）
-							if msg, ok := c["message"].(map[string]any); ok && !gotAnyContent {
-								if txt := contentText(msg["content"]); txt != "" {
+							if msg, ok := c["message"].(map[string]any); ok {
+								if txt := contentText(msg["content"]); txt != "" && !gotAnyContent {
 									content.WriteString(txt)
 									gotAnyContent = true
 								}
@@ -113,6 +139,25 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 								}
 								if text := contentText(msg["refusal"]); text != "" {
 									refusal.WriteString(text)
+								}
+								if calls := normalizedToolCalls(msg); len(calls) > 0 {
+									for _, rawCall := range calls {
+										call, ok := rawCall.(map[string]any)
+										if !ok {
+											continue
+										}
+										idx := 0
+										if n, ok := call["index"].(float64); ok {
+											idx = int(n)
+										}
+										merged := toolCalls[idx]
+										if merged == nil {
+											merged = map[string]any{"index": idx}
+											toolCalls[idx] = merged
+											toolOrder = append(toolOrder, idx)
+										}
+										mergeToolCallDelta(merged, call)
+									}
 								}
 							}
 						}
@@ -349,10 +394,41 @@ func normalizeFrame(obj map[string]any) map[string]any {
 	return out
 }
 
-// Stream 透传上游 SSE 到 w（逐帧规范化后 flush），保证至少写一个 [DONE]。
-// 调用方必须先设置过 status 200；本函数自设 SSE headers。
-// 流式策略：逐帧透传（规范化已剥空 content 噪声），恢复与上游一致的平滑流式。
+// Stream keeps the existing normalized SSE behavior.
 func Stream(w http.ResponseWriter, r io.Reader) error {
+	return StreamWithOptions(w, r, false)
+}
+
+// StreamWithOptions forwards upstream SSE with optional raw passthrough.
+// Raw passthrough deliberately skips normalization and [DONE] repair so the
+// client receives the upstream bytes as-is.
+func StreamWithOptions(w http.ResponseWriter, r io.Reader, passthrough bool) error {
+	if passthrough {
+		return StreamRaw(w, r)
+	}
+	return streamNormalized(w, r)
+}
+
+// StreamRaw copies upstream SSE bytes without changing frames or sentinels.
+func StreamRaw(w http.ResponseWriter, r io.Reader) error {
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+	h.Set("X-WorkBuddy-Passthrough", "true")
+	fl, _ := w.(http.Flusher)
+	if n, err := io.Copy(w, r); err != nil {
+		return err
+	} else if n > 0 && fl != nil {
+		fl.Flush()
+	}
+	return nil
+}
+
+// streamNormalized forwards upstream SSE frame-by-frame after normalizing it
+// to the OpenAI-compatible shape.
+func streamNormalized(w http.ResponseWriter, r io.Reader) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -364,6 +440,10 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 	toolCallSeen := false
 	fallbackEmitted := false
 	emptyCompletion := false
+	protocolError := ""
+	var readErr error
+	toolArgs := make(map[int]*strings.Builder)
+	toolFinished := false
 
 	writePayload := func(payload string) error {
 		if _, err := io.WriteString(w, "data: "+payload+"\n\n"); err != nil {
@@ -405,6 +485,13 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 		var obj map[string]any
 		valid := 0
 		if json.Unmarshal([]byte(payload), &obj) == nil {
+			if rawErr, ok := obj["error"]; ok {
+				protocolError = fmt.Sprint(rawErr)
+				if err := writeRawPayload(w, payload, fl); err != nil {
+					return 0, err
+				}
+				return 1, nil
+			}
 			normalized := normalizeFrame(obj)
 			if id, _ := normalized["id"].(string); id != "" {
 				streamID = id
@@ -421,6 +508,11 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 					}
 					if finish, _ := choice["finish_reason"].(string); finish != "" {
 						hasFinish = true
+						// Some compatible providers use "stop" even when the
+						// final chunk contains tool calls. Any non-empty finish
+						// reason is therefore a terminal marker; the argument
+						// JSON is validated below independently.
+						toolFinished = true
 					}
 					delta, _ := choice["delta"].(map[string]any)
 					if text := contentText(delta["content"]); text != "" {
@@ -434,6 +526,22 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 					}
 					if calls, ok := delta["tool_calls"].([]any); ok && len(calls) > 0 {
 						toolCallSeen = true
+						for _, rawCall := range calls {
+							call, ok := rawCall.(map[string]any)
+							if !ok {
+								continue
+							}
+							idx := 0
+							if n, ok := call["index"].(float64); ok {
+								idx = int(n)
+							}
+							fn, _ := call["function"].(map[string]any)
+							arg, _ := fn["arguments"].(string)
+							if toolArgs[idx] == nil {
+								toolArgs[idx] = &strings.Builder{}
+							}
+							toolArgs[idx].WriteString(arg)
+						}
 					}
 				}
 			}
@@ -472,15 +580,18 @@ readLoop:
 		line, err := br.ReadString('\n')
 		trimmed := strings.TrimRight(line, "\r\n")
 		switch {
-		case strings.HasPrefix(trimmed, "data: [DONE]"):
+		case strings.HasPrefix(trimmed, "data:") && strings.TrimSpace(strings.TrimPrefix(trimmed, "data:")) == "[DONE]":
 			// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
 			// [DONE] 统一在循环结束后写出，保证恰好一个。
 			break readLoop
-		case strings.HasPrefix(trimmed, "data: "):
-			n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
+		case strings.HasPrefix(trimmed, "data:"):
+			n, werr := writeFrame(strings.TrimSpace(strings.TrimPrefix(trimmed, "data:")))
 			validFrames += n
 			if werr != nil {
 				return werr
+			}
+			if protocolError != "" {
+				break readLoop
 			}
 		case trimmed != "":
 			// 注释/其他行：原样透传
@@ -496,15 +607,31 @@ readLoop:
 			if err == io.EOF {
 				break
 			}
-			return err
+			readErr = err
+			break
 		}
 	}
 	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），
 	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
-	if validFrames == 0 {
+	if readErr != nil {
+		code, message := "upstream_stream_error", "upstream stream interrupted before completion"
+		var timeout net.Error
+		if errors.Is(readErr, context.DeadlineExceeded) || (errors.As(readErr, &timeout) && timeout.Timeout()) {
+			code, message = "upstream_timeout", "upstream stream timed out before completion"
+		}
+		raw, _ := json.Marshal(map[string]any{"error": map[string]any{"type": "upstream_error", "code": code, "message": message}})
+		if err := writeRaw(string(raw)); err != nil {
+			return err
+		}
+	} else if validFrames == 0 {
 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error"}}`)
+	} else if protocolError != "" {
+		// The original error frame has already been forwarded. Only DONE remains.
 	} else if err := emitFallback(); err != nil {
 		return err
+	} else if toolCallSeen && (!toolFinished || !toolArgumentsValid(toolArgs)) {
+		_ = writeRaw(`{"error":{"message":"truncated tool call","type":"upstream_error"}}`)
+		emptyCompletion = true
 	} else if streamedContent.Len() == 0 && !toolCallSeen {
 		_ = writeRaw(`{"error":{"message":"upstream completed response contained no content","type":"upstream_error"}}`)
 		emptyCompletion = true
@@ -516,13 +643,41 @@ readLoop:
 	if fl != nil {
 		fl.Flush()
 	}
+	if readErr != nil {
+		return fmt.Errorf("upstream stream read failed: %w", readErr)
+	}
 	if validFrames == 0 {
 		return fmt.Errorf("upstream stream contained no valid data events")
 	}
 	if emptyCompletion {
 		return fmt.Errorf("upstream completed response contained no content")
 	}
+	if protocolError != "" {
+		return fmt.Errorf("upstream returned an error: %s", protocolError)
+	}
 	return nil
+}
+
+func writeRawPayload(w io.Writer, payload string, fl http.Flusher) error {
+	if _, err := io.WriteString(w, "data: "+payload+"\n\n"); err != nil {
+		return err
+	}
+	if fl != nil {
+		fl.Flush()
+	}
+	return nil
+}
+
+func toolArgumentsValid(args map[int]*strings.Builder) bool {
+	if len(args) == 0 {
+		return false
+	}
+	for _, value := range args {
+		if !json.Valid([]byte(value.String())) {
+			return false
+		}
+	}
+	return true
 }
 
 // normalizedToolCalls accepts modern calls and the legacy single-function shape.
