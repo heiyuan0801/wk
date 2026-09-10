@@ -29,6 +29,40 @@ func TestPrepareBodyNormalizesModelID(t *testing.T) {
 	}
 }
 
+func TestPrepareBodyMapsDeveloperRoleToSystem(t *testing.T) {
+	out := PrepareBodyOpt([]byte(`{
+		"model":"glm-5.2",
+		"messages":[
+			{"role":"developer","content":"follow these rules"},
+			{"role":"Developer","content":"case-insensitive compatibility"},
+			{"role":"user","content":"hello"},
+			{"role":"assistant","content":"hi"}
+		]
+	}`), false)
+
+	var body map[string]any
+	if err := json.Unmarshal(out, &body); err != nil {
+		t.Fatal(err)
+	}
+	messages, ok := body["messages"].([]any)
+	if !ok || len(messages) != 4 {
+		t.Fatalf("messages=%#v", body["messages"])
+	}
+	wantRoles := []string{"system", "system", "user", "assistant"}
+	for i, want := range wantRoles {
+		message, ok := messages[i].(map[string]any)
+		if !ok {
+			t.Fatalf("messages[%d]=%#v", i, messages[i])
+		}
+		if got, _ := message["role"].(string); got != want {
+			t.Errorf("messages[%d].role=%q want %q", i, got, want)
+		}
+	}
+	if got := messages[0].(map[string]any)["content"]; got != "follow these rules" {
+		t.Errorf("developer content changed: %v", got)
+	}
+}
+
 func TestPrepareBodyOptWithEfforts(t *testing.T) {
 	efforts := map[string][]string{
 		"glm-5.2":      {"off", "low", "high"},

@@ -1,6 +1,7 @@
 // payload.go 改写发往上游的 chat 请求体：
 //  1. 强制 stream:true（上游拒绝非流式）
 //  2. tool_choice 归一化（上游该字段是 string，对象形式会 400 code=11101）
+//  3. developer 消息角色映射为 system（上游不接受 developer）
 package upstream
 
 import (
@@ -9,7 +10,7 @@ import (
 	"strings"
 )
 
-// PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
+// PrepareBodyOpt 单 pass 改写；sanitize=false 时跳过内容指纹脱敏，但仍执行上游协议兼容转换。
 func PrepareBodyOpt(src []byte, sanitize bool) []byte {
 	return PrepareBodyOptWithEfforts(src, sanitize, nil)
 }
@@ -29,6 +30,7 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 	if model, ok := obj["model"].(string); ok {
 		obj["model"] = NormalizeModelID(model)
 	}
+	normalizeMessageRoles(obj)
 	normalizeToolChoice(obj)
 	normalizeReasoningEffort(obj, efforts)
 	if sanitize {
@@ -41,6 +43,26 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 		return src
 	}
 	return out
+}
+
+// normalizeMessageRoles maps OpenAI's developer role to the system role
+// accepted by the WorkBuddy upstream while preserving message content and
+// every other role unchanged.
+func normalizeMessageRoles(obj map[string]any) {
+	messages, ok := obj["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, ok := message["role"].(string)
+		if ok && strings.EqualFold(role, "developer") {
+			message["role"] = "system"
+		}
+	}
 }
 
 // NormalizeModelID maps provider aliases to the stable public model IDs used
