@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -148,6 +149,27 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 	}
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) {
 		t.Errorf("stream not forced: %s", gotBody)
+	}
+}
+
+func TestChatStreamContextWithHeadersReturnsWorkBuddyRequestID(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+				"X-Request-Id": []string{"WB-Upstream_Req/7"},
+			},
+			Body: io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		}, nil
+	})
+	rc, status, _, headers, err := c.ChatStreamContextWithHeaders(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, []byte(`{}`))
+	if err != nil || status != 200 {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	defer rc.Close()
+	if got := headers.Get("X-Request-Id"); got != "WB-Upstream_Req/7" {
+		t.Fatalf("request ID=%q", got)
 	}
 }
 

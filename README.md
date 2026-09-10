@@ -208,6 +208,10 @@ ZCode 等使用 OpenAI Compatible 提供商的客户端，Base URL 应填写
 上游流读取超时会返回 `upstream_timeout` 错误帧和 `[DONE]`；Responses 使用
 `response.failed`，不会把中断保存为已完成的会话。
 
+上游 WorkBuddy 返回的请求 ID 会原值传给客户端：兼容响应体中的 `id`、`request_id`、
+`requestId`、`requestID`、`record_id`、`recordId`、`recordID` 以及常见请求 ID 响应头。Chat Completions、Responses
+和请求日志使用同一个上游 ID，不添加前缀，也不重新生成；只有上游完全未返回 ID 时才使用本地兜底 ID。
+
 重复调用 `/v1/responses` 时应复用稳定的 `prompt_cache_key` 或 `conversation`；使用上一轮返回的 `previous_response_id` 时，服务会恢复该轮上下文并继续使用同一账号。响应历史默认保留 1 小时；配置 Upstash 后会同步到 Redis，可跨进程重启和多实例继续会话，未配置时使用进程内存。
 
 ## 稳定性设计

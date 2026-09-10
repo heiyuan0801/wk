@@ -86,6 +86,61 @@ func TestResponsesCacheKeyPriorityPreservesConversationAffinity(t *testing.T) {
 	}
 }
 
+func TestResponsesNonStreamPreservesWorkBuddyRequestID(t *testing.T) {
+	const upstreamID = "WB-Request.Mixed_123/abc"
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, "data: {\"request_id\":\"" + upstreamID + "\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+			"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", true
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	rec := doResponsesRequest(h, `{"model":"glm-5.2","input":"hello"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["id"] != upstreamID {
+		t.Fatalf("response ID=%q want unchanged %q", response["id"], upstreamID)
+	}
+	if rec.Header().Get("X-Request-Id") != upstreamID {
+		t.Fatalf("response header ID=%q", rec.Header().Get("X-Request-Id"))
+	}
+	if _, ok := h.responseHistory[upstreamID]; !ok {
+		t.Fatalf("previous_response_id history was not keyed by upstream ID: %#v", h.responseHistory)
+	}
+}
+
+func TestResponsesStreamPreservesWorkBuddyRecordID(t *testing.T) {
+	const upstreamID = "WB.Record-ID_456"
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, "data: {\"record_id\":\"" + upstreamID + "\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+			"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", true
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	rec := doResponsesRequest(h, `{"model":"glm-5.2","input":"hello","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"id":"`+upstreamID+`"`) ||
+		!strings.Contains(rec.Body.String(), `"response_id":"`+upstreamID+`"`) {
+		t.Fatalf("stream replaced upstream ID: %s", rec.Body.String())
+	}
+	if rec.Header().Get("X-Request-Id") != upstreamID {
+		t.Fatalf("response header ID=%q", rec.Header().Get("X-Request-Id"))
+	}
+	if _, ok := h.responseHistory[upstreamID]; !ok {
+		t.Fatalf("stream history was not keyed by upstream ID: %#v", h.responseHistory)
+	}
+}
+
 func doResponsesRequest(h http.Handler, body string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))

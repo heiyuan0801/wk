@@ -98,6 +98,55 @@ func TestAggregate(t *testing.T) {
 	}
 }
 
+func TestAggregatePreservesWorkBuddyRequestID(t *testing.T) {
+	raw := "data: {\"request_id\":\"WB-Req_AbC-123\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp["id"] != "WB-Req_AbC-123" || resp["request_id"] != "WB-Req_AbC-123" {
+		t.Fatalf("WorkBuddy request ID was changed: %#v", resp)
+	}
+}
+
+func TestStreamMapsRecordIDWithoutChangingIt(t *testing.T) {
+	raw := "data: {\"recordId\":\"WB.Record/42\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Header().Get("X-Request-Id") != "WB.Record/42" {
+		t.Fatalf("response header ID=%q", rec.Header().Get("X-Request-Id"))
+	}
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "data: {") {
+			continue
+		}
+		var frame map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame["id"] != "WB.Record/42" {
+			t.Fatalf("stream ID was changed between frames: %#v", frame)
+		}
+	}
+}
+
+func TestStreamUsesUnchangedHeaderIDAsFallback(t *testing.T) {
+	raw := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	if err := StreamWithOptionsAndID(rec, strings.NewReader(raw), false, "WB-Header-ID_9"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rec.Body.String(), `"id":"WB-Header-ID_9"`) {
+		t.Fatalf("header fallback ID missing: %s", rec.Body.String())
+	}
+}
+
 func TestAggregateSkipsNonDataLines(t *testing.T) {
 	raw := ": comment\n\n" + sseFixture
 	resp, err := Aggregate(strings.NewReader(raw))

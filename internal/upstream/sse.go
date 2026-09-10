@@ -18,20 +18,27 @@ import (
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
 func Aggregate(r io.Reader) (map[string]any, error) {
+	return AggregateWithID(r, "")
+}
+
+// AggregateWithID aggregates an upstream stream and uses fallbackID only when
+// WorkBuddy did not include an identifier in any SSE frame.
+func AggregateWithID(r io.Reader, fallbackID string) (map[string]any, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var (
-		id, model     string
-		created       float64
-		content       strings.Builder
-		reasoning     strings.Builder
-		refusal       strings.Builder
-		role          = "assistant"
-		finishReason  = "stop"
-		usage         map[string]any
-		gotAnyContent bool
-		validEvents   int
-		toolCalls     = map[int]map[string]any{}
-		toolOrder     []int
+		id, model        string
+		created          float64
+		content          strings.Builder
+		reasoning        strings.Builder
+		refusal          strings.Builder
+		role             = "assistant"
+		finishReason     = "stop"
+		usage            map[string]any
+		gotAnyContent    bool
+		validEvents      int
+		toolCalls        = map[int]map[string]any{}
+		toolOrder        []int
+		identifierFields = map[string]any{}
 	)
 	for {
 		line, err := br.ReadString('\n')
@@ -54,8 +61,9 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 					validEvents++
 					// Aggregate handles complete message snapshots itself so a
 					// snapshot after deltas is not appended twice.
-					if v, ok := chunk["id"].(string); ok && id == "" {
-						id = v
+					copyResponseIDFields(identifierFields, chunk)
+					if id == "" {
+						id = ResponseID(chunk)
 					}
 					if v, ok := chunk["model"].(string); ok && model == "" {
 						model = v
@@ -188,6 +196,9 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		content.WriteString(fallback)
 	}
 	if id == "" {
+		id = fallbackID
+	}
+	if id == "" {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	}
 	if created == 0 {
@@ -221,6 +232,10 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			},
 		},
 	}
+	copyResponseIDFields(resp, identifierFields)
+	// id is the canonical OpenAI field and always carries the exact upstream
+	// request/record ID when WorkBuddy supplied one under an alternate name.
+	resp["id"] = id
 	if usage != nil {
 		resp["usage"] = usage
 	}
@@ -296,16 +311,25 @@ func sortInts(a []int) {
 // 空占位 function_call、顶层未知字段），空 delta 键一律省略，
 // usage 缺失 → null，保证任意标准客户端按规范解析。
 func normalizeFrame(obj map[string]any) map[string]any {
+	return normalizeFrameWithID(obj, "")
+}
+
+func normalizeFrameWithID(obj map[string]any, fallbackID string) map[string]any {
 	out := map[string]any{}
 	for _, k := range []string{"id", "object", "created", "model", "system_fingerprint", "service_tier"} {
 		if v, ok := obj[k]; ok && v != nil {
 			out[k] = v
 		}
 	}
+	copyResponseIDFields(out, obj)
 	if _, ok := out["object"]; !ok {
 		out["object"] = "chat.completion.chunk"
 	}
-	if _, ok := out["id"]; !ok {
+	if id := ResponseID(obj); id != "" {
+		out["id"] = id
+	} else if fallbackID != "" {
+		out["id"] = fallbackID
+	} else {
 		out["id"] = "chatcmpl-wb2api"
 	}
 	if chs, ok := obj["choices"].([]any); ok {
@@ -403,10 +427,16 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 // Raw passthrough deliberately skips normalization and [DONE] repair so the
 // client receives the upstream bytes as-is.
 func StreamWithOptions(w http.ResponseWriter, r io.Reader, passthrough bool) error {
+	return StreamWithOptionsAndID(w, r, passthrough, "")
+}
+
+// StreamWithOptionsAndID behaves like StreamWithOptions and uses fallbackID
+// only for normalized frames that do not carry their own WorkBuddy ID.
+func StreamWithOptionsAndID(w http.ResponseWriter, r io.Reader, passthrough bool, fallbackID string) error {
 	if passthrough {
 		return StreamRaw(w, r)
 	}
-	return streamNormalized(w, r)
+	return streamNormalizedWithID(w, r, fallbackID)
 }
 
 // StreamRaw copies upstream SSE bytes without changing frames or sentinels.
@@ -429,6 +459,10 @@ func StreamRaw(w http.ResponseWriter, r io.Reader) error {
 // streamNormalized forwards upstream SSE frame-by-frame after normalizing it
 // to the OpenAI-compatible shape.
 func streamNormalized(w http.ResponseWriter, r io.Reader) error {
+	return streamNormalizedWithID(w, r, "")
+}
+
+func streamNormalizedWithID(w http.ResponseWriter, r io.Reader, fallbackID string) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -492,9 +526,16 @@ func streamNormalized(w http.ResponseWriter, r io.Reader) error {
 				}
 				return 1, nil
 			}
-			normalized := normalizeFrame(obj)
+			frameFallbackID := streamID
+			if frameFallbackID == "" {
+				frameFallbackID = fallbackID
+			}
+			normalized := normalizeFrameWithID(obj, frameFallbackID)
 			if id, _ := normalized["id"].(string); id != "" {
 				streamID = id
+				if h.Get("X-Request-Id") == "" {
+					h.Set("X-Request-Id", id)
+				}
 			}
 			if model, _ := normalized["model"].(string); model != "" {
 				streamModel = model

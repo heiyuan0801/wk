@@ -594,9 +594,9 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		messages = append(messages, responseInputMessages(turnMessages)...)
 		routeKey = previousRouteKey
 	}
-	responseID := newResponseID()
+	fallbackResponseID := newResponseID()
 	if routeKey == "" {
-		routeKey = "responses:" + responseID
+		routeKey = "responses:" + fallbackResponseID
 	}
 	chatDoc["messages"] = messages
 	meta, _ := chatDoc["metadata"].(map[string]any)
@@ -624,6 +624,14 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 			copyResponse(w, rec)
 			return
 		}
+		responseID := upstream.ResponseID(chat)
+		if responseID == "" {
+			responseID = fallbackResponseID
+		}
+		upstream.CopyResponseIDHeaders(w.Header(), rec.Header())
+		if w.Header().Get("X-Request-Id") == "" {
+			w.Header().Set("X-Request-Id", responseID)
+		}
 		response := chatToResponse(chat, responseID)
 		if assistant := chatAssistantMessage(chat, responseID); assistant != nil {
 			h.storeResponse(responseID, append(responseInputMessages(turnMessages), assistant), routeKey, previousID)
@@ -631,11 +639,9 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, response)
 		return
 	}
-	sw := &responsesStreamWriter{
-		header: make(http.Header), dst: w, id: responseID,
-		onComplete: func(assistant map[string]any) {
-			h.storeResponse(responseID, append(responseInputMessages(turnMessages), assistant), routeKey, previousID)
-		},
+	sw := &responsesStreamWriter{header: make(http.Header), dst: w, fallbackID: fallbackResponseID}
+	sw.onComplete = func(responseID string, assistant map[string]any) {
+		h.storeResponse(responseID, append(responseInputMessages(turnMessages), assistant), routeKey, previousID)
 	}
 	h.chatCompletions(sw, chatReq)
 }
@@ -1228,6 +1234,7 @@ type responsesStreamWriter struct {
 	passthrough bool
 	completed   bool
 	id          string
+	fallbackID  string
 	model       string
 	finish      string
 	outputText  strings.Builder
@@ -1236,7 +1243,7 @@ type responsesStreamWriter struct {
 	nextIndex   int
 	usage       map[string]any
 	calls       map[int]*responseStreamCall
-	onComplete  func(map[string]any)
+	onComplete  func(string, map[string]any)
 }
 
 type responseStreamCall struct {
@@ -1384,9 +1391,21 @@ func (w *responsesStreamWriter) Write(p []byte) (int, error) {
 
 func (w *responsesStreamWriter) ensureID(chunk map[string]any) {
 	if w.id == "" {
-		w.id = "resp-" + fmt.Sprintf("%d", time.Now().UnixNano())
+		w.id = upstream.ResponseID(chunk)
 	}
-	if w.model == "" {
+	if w.id == "" {
+		w.id = upstream.ResponseIDFromHeader(w.header)
+	}
+	if w.id == "" {
+		w.id = w.fallbackID
+	}
+	if w.id == "" {
+		w.id = newResponseID()
+	}
+	if w.dst.Header().Get("X-Request-Id") == "" {
+		w.dst.Header().Set("X-Request-Id", w.id)
+	}
+	if w.model == "" && chunk != nil {
 		w.model, _ = chunk["model"].(string)
 	}
 }
@@ -1446,7 +1465,7 @@ func (w *responsesStreamWriter) complete() error {
 			}
 			assistant["tool_calls"] = toolCalls
 		}
-		w.onComplete(assistant)
+		w.onComplete(w.id, assistant)
 	}
 	if w.textStarted {
 		if err := w.emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "response_id": w.id, "item_id": w.id + "-item", "output_index": w.textIndex, "content_index": 0, "text": text}); err != nil {
@@ -1502,6 +1521,7 @@ func (w *responsesStreamWriter) startTextOutput() error {
 func (w *responsesStreamWriter) emit(event string, v map[string]any) error {
 	raw, _ := json.Marshal(v)
 	if !w.started {
+		upstream.CopyResponseIDHeaders(w.dst.Header(), w.header)
 		w.dst.Header().Set("Content-Type", "text/event-stream")
 		w.dst.Header().Set("Cache-Control", "no-cache")
 		w.dst.Header().Set("X-Accel-Buffering", "no")
@@ -1622,7 +1642,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body)
+		rc, status, respBody, upstreamHeaders, terr := h.cfg.Upstream.ChatStreamContextWithHeaders(r.Context(), acct, body)
+		upstream.CopyResponseIDHeaders(w.Header(), upstreamHeaders)
+		upstreamHeaderID := upstream.ResponseIDFromHeader(upstreamHeaders)
+		if upstreamHeaderID != "" {
+			st.id = upstreamHeaderID
+		}
 		if terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
@@ -1645,7 +1670,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
-			streamErr := upstream.StreamWithOptions(w, stats, passthrough)
+			streamErr := upstream.StreamWithOptionsAndID(w, stats, passthrough, upstreamHeaderID)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
 			st.inputTokens, st.toks, st.totalTokens, st.cacheRead, st.cacheWrite, st.toolCalls = stats.UsageStats()
@@ -1655,6 +1680,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if credits, ok := stats.CreditUsage(); ok {
 				st.creditsConsumed = credits
 				st.creditSource = "upstream"
+			}
+			if responseID := stats.ResponseID(); responseID != "" {
+				st.id = responseID
 			}
 			rc.Close()
 			if streamErr != nil {
@@ -1672,7 +1700,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.errorMessage = ""
 			return
 		}
-		resp, err := upstream.Aggregate(rc)
+		resp, err := upstream.AggregateWithID(rc, upstreamHeaderID)
 		rc.Close()
 		if err != nil {
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
@@ -1682,6 +1710,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		usageStats(resp, st)
+		if responseID := upstream.ResponseID(resp); responseID != "" {
+			st.id = responseID
+			if w.Header().Get("X-Request-Id") == "" {
+				w.Header().Set("X-Request-Id", responseID)
+			}
+		}
 		writeJSON(w, http.StatusOK, resp)
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		if sessKey != "" && h.cfg.Session != nil {

@@ -51,6 +51,46 @@ func TestChatStatsReaderTokensFromUsage(t *testing.T) {
 	}
 }
 
+func TestChatStatsReaderCapturesUnchangedWorkBuddyID(t *testing.T) {
+	sse := "data: {\"recordId\":\"WB.Record/Case_7\",\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	if _, err := io.Copy(io.Discard, r); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.ResponseID(); got != "WB.Record/Case_7" {
+		t.Fatalf("response ID=%q", got)
+	}
+}
+
+type captureRequestLogStore struct{ records []RequestLog }
+
+func (s *captureRequestLogStore) RecordRequest(record RequestLog) error {
+	s.records = append(s.records, record)
+	return nil
+}
+
+func (s *captureRequestLogStore) RecentRequests(int) ([]RequestLog, error) {
+	return append([]RequestLog(nil), s.records...), nil
+}
+
+func TestRequestLogMapsToWorkBuddyResponseID(t *testing.T) {
+	store := &captureRequestLogStore{}
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{
+		Pool:            testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:        up,
+		RequestLogStore: store,
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(store.records) != 1 || store.records[0].ID != "chatcmpl-1" {
+		t.Fatalf("request log IDs=%#v", store.records)
+	}
+}
+
 func TestChatStatsReaderNoUsage(t *testing.T) {
 	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
 	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())

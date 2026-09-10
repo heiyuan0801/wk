@@ -249,26 +249,35 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 // ChatStreamContext attaches the caller context so a disconnected client can
 // cancel the upstream request and release the account lease promptly.
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	rc, status, respBody, _, err = c.ChatStreamContextWithHeaders(ctx, a, body)
+	return rc, status, respBody, err
+}
+
+// ChatStreamContextWithHeaders is ChatStreamContext plus the original
+// WorkBuddy response headers. Callers use them to pass request/record IDs to
+// downstream clients without rewriting their values.
+func (c *Client) ChatStreamContextWithHeaders(ctx context.Context, a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(c.prepareBody(body)))
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, 0, nil, nil, err
 	}
 	ChatHeaders(req, a)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
-		return nil, 0, nil, err
+		return nil, 0, nil, nil, err
 	}
+	headers = resp.Header.Clone()
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		kind := Classify(resp.StatusCode, string(raw))
 		log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
 			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
-		return nil, resp.StatusCode, raw, nil
+		return nil, resp.StatusCode, raw, headers, nil
 	}
-	return resp.Body, resp.StatusCode, nil, nil
+	return resp.Body, resp.StatusCode, nil, headers, nil
 }
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。

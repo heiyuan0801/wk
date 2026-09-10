@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"workbuddy2api/internal/upstream"
 )
 
 // chatSeq 进程级请求序号。
@@ -293,6 +295,7 @@ type chatStatsReader struct {
 	toolCalls   int
 	credits     float64
 	hasCredits  bool
+	responseID  string
 	toolCallIDs map[string]struct{}
 	pend        []byte // 已读未返回的行缓存
 }
@@ -311,6 +314,7 @@ func (s *chatStatsReader) UsageStats() (input, output, total, cacheRead, cacheWr
 	return s.inputTokens, s.tokens, s.totalTokens, s.cacheRead, s.cacheWrite, s.toolCalls
 }
 func (s *chatStatsReader) CreditUsage() (float64, bool) { return s.credits, s.hasCredits }
+func (s *chatStatsReader) ResponseID() string           { return s.responseID }
 
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
 func (s *chatStatsReader) parseSSELine(line string) {
@@ -333,6 +337,9 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 	var rawChunk map[string]any
 	if json.Unmarshal([]byte(payload), &rawChunk) == nil {
+		if s.responseID == "" {
+			s.responseID = upstream.ResponseID(rawChunk)
+		}
 		if credits, ok := extractCreditUsage(rawChunk); ok {
 			s.credits = credits
 			s.hasCredits = true

@@ -140,6 +140,44 @@ func TestChatNonStreamAggregates(t *testing.T) {
 	}
 }
 
+func TestChatNonStreamPreservesWorkBuddyHeaderID(t *testing.T) {
+	const upstreamID = "WB-Header.Request_ABC/9"
+	store := &captureRequestLogStore{}
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, "", true })
+	up.HTTP.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		body := "data: {\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+			"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+				"X-Request-Id": []string{upstreamID},
+			},
+			Body: io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})
+	h := NewHandler(Config{
+		Pool:            testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:        up,
+		RequestLogStore: store,
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["id"] != upstreamID || rec.Header().Get("X-Request-Id") != upstreamID {
+		t.Fatalf("body/header IDs=%q/%q", response["id"], rec.Header().Get("X-Request-Id"))
+	}
+	if len(store.records) != 1 || store.records[0].ID != upstreamID {
+		t.Fatalf("request log IDs=%#v", store.records)
+	}
+}
+
 func TestChatStreamPassthrough(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 200, sseOK, true
