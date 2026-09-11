@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: workbuddy
+      POSTGRES_USER: workbuddy
+      POSTGRES_PASSWORD: change-this-password
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U workbuddy -d workbuddy"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  wb2api:
+    environment:
+      - WB2A_POSTGRES_DSN=postgres://workbuddy:change-this-password@postgres:5432/workbuddy?sslmode=disable
+      - WB2A_POSTGRES_MAX_OPEN_CONNS=32
+      - WB2A_POSTGRES_MAX_IDLE_CONNS=16
+    depends_on:
+      postgres:
+        condition: service_healthy

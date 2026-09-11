@@ -22,7 +22,7 @@ import (
 	"workbuddy2api/internal/upstream"
 )
 
-type metricsAdapter struct{ store *metricsstore.Store }
+type metricsAdapter struct{ store metricsstore.Backend }
 
 func (m metricsAdapter) AddMetrics(requests, successes, failures, inputTokens, outputTokens, totalTokens, cacheRead, cacheWrite, toolCalls, ttfbMillis, ttfbSamples, latencyMillis, lastRequestUnix int64) error {
 	return m.store.Add(metricsstore.Snapshot{Requests: requests, Successes: successes, Failures: failures, InputTokens: inputTokens, OutputTokens: outputTokens, TotalTokens: totalTokens, CacheRead: cacheRead, CacheWrite: cacheWrite, ToolCalls: toolCalls, TTFBMillis: ttfbMillis, TTFBSamples: ttfbSamples, LatencyMillis: latencyMillis, LastRequestUnix: lastRequestUnix})
@@ -166,9 +166,21 @@ func main() {
 
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
-	metricsDB, err := metricsstore.Open(filepath.Join(filepath.Dir(cfg.StateFile), "metrics.db"))
-	if err != nil {
-		log.Printf("metrics sqlite unavailable: %v; using in-memory metrics", err)
+	var metricsDB metricsstore.Backend
+	if cfg.Postgres.DSN != "" {
+		metricsDB, err = metricsstore.OpenPostgres(cfg.Postgres.DSN, cfg.Postgres.MaxOpenConns, cfg.Postgres.MaxIdleConns, cfg.PostgresMaxLifetime, cfg.PostgresMaxIdleTime)
+		if err != nil && cfg.Postgres.FallbackToSQLite {
+			log.Printf("metrics postgres unavailable: %v; falling back to sqlite", err)
+			metricsDB, err = metricsstore.Open(filepath.Join(filepath.Dir(cfg.StateFile), "metrics.db"))
+		}
+		if err != nil {
+			log.Printf("metrics postgres unavailable: %v; using in-memory metrics", err)
+		}
+	} else {
+		metricsDB, err = metricsstore.Open(filepath.Join(filepath.Dir(cfg.StateFile), "metrics.db"))
+		if err != nil {
+			log.Printf("metrics sqlite unavailable: %v; using in-memory metrics", err)
+		}
 	}
 	if metricsDB != nil {
 		defer metricsDB.Close()

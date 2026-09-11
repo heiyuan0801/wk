@@ -17,6 +17,9 @@ func TestDefault(t *testing.T) {
 	if c.SoftRateDur.Seconds() != 60 {
 		t.Errorf("soft=%v", c.SoftRateDur)
 	}
+	if c.Postgres.MaxOpenConns != 16 || c.Postgres.MaxIdleConns != 8 {
+		t.Errorf("postgres pool defaults=%+v", c.Postgres)
+	}
 }
 
 func TestLoadFile(t *testing.T) {
@@ -64,6 +67,21 @@ func TestEnvOverride(t *testing.T) {
 	}
 	if c.Listen != ":7777" || c.APIKey != "envkey" {
 		t.Errorf("c=%+v", c)
+	}
+}
+
+func TestPostgresConfig(t *testing.T) {
+	t.Setenv("WB2A_POSTGRES_DSN", "postgres://user:pass@localhost/db")
+	t.Setenv("WB2A_POSTGRES_MAX_OPEN_CONNS", "24")
+	t.Setenv("WB2A_POSTGRES_MAX_IDLE_CONNS", "12")
+	t.Setenv("WB2A_POSTGRES_CONN_MAX_LIFETIME", "1h")
+	t.Setenv("WB2A_POSTGRES_CONN_MAX_IDLE_TIME", "2m")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Postgres.DSN == "" || c.Postgres.MaxOpenConns != 24 || c.Postgres.MaxIdleConns != 12 || c.PostgresMaxLifetime.Hours() != 1 || c.PostgresMaxIdleTime.Minutes() != 2 {
+		t.Fatalf("postgres config=%+v durations=%v/%v", c.Postgres, c.PostgresMaxLifetime, c.PostgresMaxIdleTime)
 	}
 }
 

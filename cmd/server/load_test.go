@@ -102,7 +102,13 @@ func runProxyLoad(t *testing.T, concurrency int, duration, delay time.Duration) 
 	for i := 0; i < accounts; i++ {
 		p.Add(&auth.Auth{UID: fmt.Sprint(i), ExpiresAt: time.Now().Add(time.Hour).Unix()})
 	}
-	db, err := metricsstore.Open(filepath.Join(t.TempDir(), "metrics.db"))
+	var db metricsstore.Backend
+	var err error
+	if dsn := os.Getenv("WK_LOAD_POSTGRES_DSN"); dsn != "" {
+		db, err = metricsstore.OpenPostgres(dsn, 32, 16, 30*time.Minute, 5*time.Minute)
+	} else {
+		db, err = metricsstore.Open(filepath.Join(t.TempDir(), "metrics.db"))
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

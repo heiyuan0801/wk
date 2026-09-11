@@ -68,6 +68,19 @@ type Store struct {
 	requestWrites int
 }
 
+// Backend is the common persistence contract used by the server. Store and
+// PostgresStore both implement it, allowing deployments to switch databases
+// without changing request handling code.
+type Backend interface {
+	Add(Snapshot) error
+	AddCredit(float64, string) error
+	RecordRequest(RequestRecord) error
+	RecordCompletion(Snapshot, RequestRecord) error
+	RecentRequests(int) ([]RequestRecord, error)
+	Snapshot() (Snapshot, error)
+	Close() error
+}
+
 const maxRequestLogs = 10000
 
 func Open(path string) (*Store, error) {

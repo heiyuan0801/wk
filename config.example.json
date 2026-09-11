@@ -28,6 +28,14 @@
     "url": "",
     "token": ""
   },
+  "postgres": {
+    "dsn": "",
+    "max_open_conns": 16,
+    "max_idle_conns": 8,
+    "conn_max_lifetime": "30m",
+    "conn_max_idle_time": "5m",
+    "fallback_to_sqlite": false
+  },
   "pool": {
     "max_in_flight": 3,
     "breaker_threshold": 3,

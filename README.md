@@ -25,6 +25,9 @@ cp config.example.json config.json
 
 ```bash
 docker compose up -d --build
+
+# 使用 PostgreSQL（首次使用前请修改 docker-compose.postgres.yml 中的密码）
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --build
 ```
 
 ### 4. 验证
@@ -101,6 +104,14 @@ curl -sN http://localhost:7863/v1/chat/completions \
     "url": "",
     "token": ""
   },
+  "postgres": {
+    "dsn": "",
+    "max_open_conns": 16,
+    "max_idle_conns": 8,
+    "conn_max_lifetime": "30m",
+    "conn_max_idle_time": "5m",
+    "fallback_to_sqlite": false
+  },
   "pool": {
     "max_in_flight": 3,
     "breaker_threshold": 3,
@@ -138,6 +149,10 @@ curl -sN http://localhost:7863/v1/chat/completions \
 
 本地性能优化包括：账号选择和名额占用合并为原子操作；SQLite 将统计、积分和请求日志合并到一个持久事务；SSE 使用按需增长的 4 KiB 初始缓冲；上游连接池保留更多空闲连接并采用标准 HTTP/2、拨号和 TLS 配置。请求 ID 仍原样透传。
 
+指标和请求日志支持 PostgreSQL。配置 `postgres.dsn` 或设置 `WB2A_POSTGRES_DSN` 后，服务会使用带连接池的 PostgreSQL，并在同一事务中提交统计和请求日志；未配置 DSN 时继续使用本地 SQLite。PostgreSQL 连接失败默认进入内存指标模式，可将 `postgres.fallback_to_sqlite` 设为 `true` 以回退本地 SQLite。连接池可通过 `max_open_conns`、`max_idle_conns`、`conn_max_lifetime` 和 `conn_max_idle_time` 调整。
+
+首次切换到 PostgreSQL 时会自动创建表，已有 `metrics.db` 不会被删除或自动导入；切换前请保留该文件，需要历史数据时再安排离线迁移。
+
 可运行不调用真实上游、不消耗账号额度的回环压测：
 
 ```bash
@@ -152,7 +167,7 @@ WK_LOADTEST=1 WK_LOAD_ACCOUNTS=5 WK_LOAD_CONCURRENCY=15 WK_LOAD_DELAY=2s \
   go test ./cmd/server -run '^TestProxyLoad$' -count=1 -v -timeout=120s
 ```
 
-默认使用 100 个模拟账号、每账号 3 个名额、1 KiB 文本请求、100 ms 上游 SSE 响应，并启用实际 SQLite 日志/积分写入。`WK_LOAD_PER_ACCOUNT` 可改变模拟账号名额，`WK_LOAD_STREAM=false` 可测非流式聚合。输出的 `LOADTEST` JSON 包含成功 RPS、延迟分位数、HTTP 状态分布、实际最大上游并发和持久化计数。内存值是压测客户端、模拟上游和代理共同进程的 Go 堆峰值，不是生产服务器 RSS。它不包含公网 TLS、Redis、账号刷新、磁盘池快照、大图片或真实模型生成成本，也不是生产容量保证。
+默认使用 100 个模拟账号、每账号 3 个名额、1 KiB 文本请求、100 ms 上游 SSE 响应，并启用实际 SQLite 日志/积分写入。`WK_LOAD_POSTGRES_DSN` 可指定 PostgreSQL DSN 进行同样的持久化压测；`WK_LOAD_PER_ACCOUNT` 可改变模拟账号名额，`WK_LOAD_STREAM=false` 可测非流式聚合。输出的 `LOADTEST` JSON 包含成功 RPS、延迟分位数、HTTP 状态分布、实际最大上游并发和持久化计数。内存值是压测客户端、模拟上游和代理共同进程的 Go 堆峰值，不是生产服务器 RSS。它不包含公网 TLS、Redis、账号刷新、磁盘池快照、大图片或真实模型生成成本，也不是生产容量保证。
 
 ## 账号轮换与冷却策略
 
@@ -206,8 +221,8 @@ Disabled ←────┘ (session 死亡，永久)
 
 ### 请求日志、token 与积分
 
-每个 Chat Completions 和 Responses 请求结束后都会写入 `state_file` 同目录的
-`metrics.db`。记录只包含模型、路由、状态、账号 UID、token、耗时、积分来源和错误码，
+每个 Chat Completions 和 Responses 请求结束后都会写入配置的指标存储：默认是 `state_file` 同目录的
+`metrics.db`，配置 PostgreSQL DSN 后则写入 PostgreSQL。记录只包含模型、路由、状态、账号 UID、token、耗时、积分来源和错误码，
 不会保存提示词或模型输出，但会保存最多 1,024 字符的错误详情。数据库保留最近 10,000 条，`GET /requests?limit=50`
 可查询最近记录，控制台也会展示同一份数据。
 控制台“请求日志”菜单支持按模型、端点、账号、错误、流式/同步/透传和成功状态筛选，并可展开查看缓存 token、工具调用与完整错误详情。

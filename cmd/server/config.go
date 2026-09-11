@@ -55,6 +55,15 @@ type Config struct {
 		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
 	} `json:"upstash"`
 
+	Postgres struct {
+		DSN              string `json:"dsn"`
+		MaxOpenConns     int    `json:"max_open_conns"`
+		MaxIdleConns     int    `json:"max_idle_conns"`
+		ConnMaxLifetime  string `json:"conn_max_lifetime"`
+		ConnMaxIdleTime  string `json:"conn_max_idle_time"`
+		FallbackToSQLite bool   `json:"fallback_to_sqlite"`
+	} `json:"postgres"`
+
 	Pool struct {
 		MaxInFlight        int     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
 		BreakerThreshold   int     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
@@ -76,6 +85,8 @@ type Config struct {
 	BreakerCooldownMaxD time.Duration `json:"-"`
 	SessionTTL          time.Duration `json:"-"`
 	SessionGCInterval   time.Duration `json:"-"`
+	PostgresMaxLifetime time.Duration `json:"-"`
+	PostgresMaxIdleTime time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -102,6 +113,10 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	c.Postgres.MaxOpenConns = 16
+	c.Postgres.MaxIdleConns = 8
+	c.Postgres.ConnMaxLifetime = "30m"
+	c.Postgres.ConnMaxIdleTime = "5m"
 	return c
 }
 
@@ -142,6 +157,30 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_REGION"); v != "" {
 		c.Region = v
+	}
+	if v := os.Getenv("WB2A_POSTGRES_DSN"); v != "" {
+		c.Postgres.DSN = v
+	}
+	if v := os.Getenv("WB2A_POSTGRES_MAX_OPEN_CONNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Postgres.MaxOpenConns = n
+		}
+	}
+	if v := os.Getenv("WB2A_POSTGRES_MAX_IDLE_CONNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Postgres.MaxIdleConns = n
+		}
+	}
+	if v := os.Getenv("WB2A_POSTGRES_CONN_MAX_LIFETIME"); v != "" {
+		c.Postgres.ConnMaxLifetime = v
+	}
+	if v := os.Getenv("WB2A_POSTGRES_CONN_MAX_IDLE_TIME"); v != "" {
+		c.Postgres.ConnMaxIdleTime = v
+	}
+	if v := os.Getenv("WB2A_POSTGRES_FALLBACK_SQLITE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Postgres.FallbackToSQLite = b
+		}
 	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
@@ -194,6 +233,27 @@ func (c *Config) normalize() error {
 	}
 	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
 		return fmt.Errorf("session_sticky.gc_interval: %w", err)
+	}
+	if c.Postgres.ConnMaxLifetime == "" {
+		c.Postgres.ConnMaxLifetime = "30m"
+	}
+	if c.Postgres.ConnMaxIdleTime == "" {
+		c.Postgres.ConnMaxIdleTime = "5m"
+	}
+	if c.PostgresMaxLifetime, err = time.ParseDuration(c.Postgres.ConnMaxLifetime); err != nil {
+		return fmt.Errorf("postgres.conn_max_lifetime: %w", err)
+	}
+	if c.PostgresMaxIdleTime, err = time.ParseDuration(c.Postgres.ConnMaxIdleTime); err != nil {
+		return fmt.Errorf("postgres.conn_max_idle_time: %w", err)
+	}
+	if c.Postgres.MaxOpenConns <= 0 {
+		c.Postgres.MaxOpenConns = 16
+	}
+	if c.Postgres.MaxIdleConns <= 0 || c.Postgres.MaxIdleConns > c.Postgres.MaxOpenConns {
+		c.Postgres.MaxIdleConns = c.Postgres.MaxOpenConns / 2
+		if c.Postgres.MaxIdleConns < 1 {
+			c.Postgres.MaxIdleConns = 1
+		}
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
