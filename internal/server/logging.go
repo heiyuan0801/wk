@@ -134,19 +134,39 @@ func newChatStatWithOptions(now time.Time, body []byte, stream bool, metricsStor
 	if stream {
 		mode = "stream"
 	}
+	model, requestedOutputTokens := parseRequestMetadata(body)
 	return &chatStat{
 		id:                    fmt.Sprintf("req_%d_%d", now.UnixNano(), requestIDSeq.Add(1)),
 		start:                 now,
 		route:                 route,
-		model:                 parseModelFromBody(body),
+		model:                 model,
 		mode:                  mode,
 		toks:                  -1,
-		requestedOutputTokens: parseRequestedOutputTokens(body),
+		requestedOutputTokens: requestedOutputTokens,
 		passthrough:           passthrough,
 		creditPolicy:          creditPolicy,
 		metricsStore:          metricsStore,
 		requestLogStore:       requestLogStore,
 	}
+}
+
+// parseRequestMetadata decodes the request body once for the two fields used
+// by request logging, avoiding two JSON unmarshals on every request.
+func parseRequestMetadata(body []byte) (string, int) {
+	var obj struct {
+		Model               string `json:"model"`
+		MaxCompletionTokens int    `json:"max_completion_tokens"`
+		MaxOutputTokens     int    `json:"max_output_tokens"`
+		MaxTokens           int    `json:"max_tokens"`
+	}
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return "-", 0
+	}
+	model := obj.Model
+	if model == "" {
+		model = "-"
+	}
+	return model, maxInts(obj.MaxCompletionTokens, obj.MaxOutputTokens, obj.MaxTokens)
 }
 
 // done 幂等落一行表格日志。
