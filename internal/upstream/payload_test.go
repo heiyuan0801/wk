@@ -63,6 +63,58 @@ func TestPrepareBodyMapsDeveloperRoleToSystem(t *testing.T) {
 	}
 }
 
+func TestPrepareBodyAddsSystemPromptBeforeUserMessage(t *testing.T) {
+	out := PrepareBodyOpt([]byte(`{
+		"model":"deepseek-v4.1-flash",
+		"messages":[{"role":"user","content":"hello"}]
+	}`), false)
+
+	var body map[string]any
+	if err := json.Unmarshal(out, &body); err != nil {
+		t.Fatal(err)
+	}
+	messages, ok := body["messages"].([]any)
+	if !ok || len(messages) != 2 {
+		t.Fatalf("messages=%#v", body["messages"])
+	}
+	first, ok := messages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("messages[0]=%#v", messages[0])
+	}
+	if first["role"] != "system" {
+		t.Fatalf("first role=%v want system", first["role"])
+	}
+	if first["content"] != "You are a helpful assistant." {
+		t.Fatalf("default system content=%v", first["content"])
+	}
+	second, _ := messages[1].(map[string]any)
+	if second["role"] != "user" || second["content"] != "hello" {
+		t.Fatalf("user message changed: %#v", second)
+	}
+}
+
+func TestPrepareBodyKeepsExistingSystemPromptFirst(t *testing.T) {
+	out := PrepareBodyOpt([]byte(`{
+		"messages":[
+			{"role":"system","content":"follow project rules"},
+			{"role":"user","content":"hello"}
+		]
+	}`), false)
+
+	var body map[string]any
+	if err := json.Unmarshal(out, &body); err != nil {
+		t.Fatal(err)
+	}
+	messages := body["messages"].([]any)
+	if len(messages) != 2 {
+		t.Fatalf("messages=%#v", messages)
+	}
+	first := messages[0].(map[string]any)
+	if first["role"] != "system" || first["content"] != "follow project rules" {
+		t.Fatalf("existing system prompt changed: %#v", first)
+	}
+}
+
 func TestPrepareBodyOptWithEfforts(t *testing.T) {
 	efforts := map[string][]string{
 		"glm-5.2":      {"off", "low", "high"},

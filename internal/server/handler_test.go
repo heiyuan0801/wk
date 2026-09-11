@@ -469,7 +469,7 @@ func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	if rec.Code != 503 {
+	if rec.Code != 400 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	st, _ := p.Status("u1")

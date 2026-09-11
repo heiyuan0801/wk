@@ -1852,6 +1852,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	tried := map[string]bool{}
 	var lastErr error
+	var lastKind upstream.ErrKind
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	sessKey := ""
@@ -1958,6 +1959,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = status
 			bodyText := string(respBody)
 			kind := upstream.Classify(status, bodyText)
+			lastKind = kind
 			setRequestError(st, kind.String(), bodyText)
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: bodyText}
 			h.applyErrorPolicy(acct.UID, routeModel, kind, bodyText)
@@ -2024,6 +2026,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.errorMessage = ""
 		st.toks = completionTokens(resp)
 		return
+	}
+	// A deterministic upstream 4xx (for example code=11128, which means the
+	// first message must be system) is a request error, not an account-pool
+	// outage. Preserve that status after rotation so clients can act on the
+	// actual cause instead of receiving a misleading 503/no_healthy_account.
+	if lastErr != nil && lastKind == upstream.ErrClient {
+		if ue, ok := lastErr.(*upstream.Error); ok && ue.Status >= 400 && ue.Status < 500 {
+			writeOpenAIError(w, ue.Status, "upstream_client_error", ue.Msg)
+			st.status = ue.Status
+			setRequestError(st, "upstream_client_error", ue.Msg)
+			return
+		}
 	}
 	msg := "all accounts unavailable (cooling/disabled)"
 	if lastErr != nil {

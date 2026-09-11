@@ -2,6 +2,7 @@
 //  1. 强制 stream:true（上游拒绝非流式）
 //  2. tool_choice 归一化（上游该字段是 string，对象形式会 400 code=11101）
 //  3. developer 消息角色映射为 system（上游不接受 developer）
+//  4. 确保首条消息为 system（上游会拒绝 user-first 请求，code=11128）
 package upstream
 
 import (
@@ -31,6 +32,7 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 		obj["model"] = NormalizeModelID(model)
 	}
 	normalizeMessageRoles(obj)
+	ensureSystemFirstMessage(obj)
 	normalizeToolChoice(obj)
 	normalizeReasoningEffort(obj, efforts)
 	if sanitize {
@@ -63,6 +65,30 @@ func normalizeMessageRoles(obj map[string]any) {
 			message["role"] = "system"
 		}
 	}
+}
+
+// ensureSystemFirstMessage handles a WorkBuddy upstream requirement that the
+// first chat message must be a system prompt. OpenAI-compatible clients are
+// allowed to start with a user message, so add a neutral prompt only when the
+// request does not already begin with system. Existing system/developer
+// messages are left untouched and retain their original order.
+func ensureSystemFirstMessage(obj map[string]any) {
+	messages, ok := obj["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		return
+	}
+	first, ok := messages[0].(map[string]any)
+	if ok {
+		if role, _ := first["role"].(string); strings.EqualFold(role, "system") {
+			return
+		}
+	}
+	obj["messages"] = append([]any{
+		map[string]any{
+			"role":    "system",
+			"content": "You are a helpful assistant.",
+		},
+	}, messages...)
 }
 
 // NormalizeModelID maps provider aliases to the stable public model IDs used
