@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -74,6 +75,14 @@ type Handler struct {
 	responsesMu     sync.Mutex
 	responseHistory map[string]storedResponse
 	responseBytes   int
+	unlockRateMu    sync.Mutex
+	unlockAttempts  map[string]unlockAttempt
+}
+
+type unlockAttempt struct {
+	windowStart  time.Time
+	failures     int
+	blockedUntil time.Time
 }
 
 type storedResponse struct {
@@ -94,6 +103,10 @@ const (
 	responseHistoryTTL      = time.Hour
 	maxResponseHistory      = 1024
 	maxResponseHistoryBytes = 64 << 20
+	maxRequestBodyBytes     = 8 << 20
+	unlockFailureLimit      = 5
+	unlockFailureWindow     = time.Minute
+	unlockBlockDuration     = 5 * time.Minute
 )
 
 // NewHandler 构建 handler。
@@ -107,7 +120,7 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sessions: make(map[string]time.Time), responseHistory: make(map[string]storedResponse)}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sessions: make(map[string]time.Time), responseHistory: make(map[string]storedResponse), unlockAttempts: make(map[string]unlockAttempt)}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
@@ -190,13 +203,21 @@ func (h *Handler) withFrontend(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (h *Handler) unlock(w http.ResponseWriter, r *http.Request) {
+	if retryAfter := h.unlockRetryAfter(unlockClientKey(r)); retryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"ok": false, "error": "尝试次数过多，请稍后重试"})
+		return
+	}
 	var req struct {
 		Password string `json:"password"`
 	}
+	clientKey := unlockClientKey(r)
 	if json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req) != nil || h.cfg.FrontendPassword == "" || req.Password != h.cfg.FrontendPassword {
+		h.recordUnlockFailure(clientKey)
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "密码错误"})
 		return
 	}
+	h.clearUnlockFailures(clientKey)
 	b := make([]byte, 24)
 	if _, err := rand.Read(b); err != nil {
 		http.Error(w, "session error", 500)
@@ -208,6 +229,68 @@ func (h *Handler) unlock(w http.ResponseWriter, r *http.Request) {
 	h.sessionsMu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: "wb2api_frontend", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 86400})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func unlockClientKey(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr)); err == nil && host != "" {
+		return host
+	}
+	if raw := strings.TrimSpace(r.RemoteAddr); raw != "" {
+		return raw
+	}
+	return "unknown"
+}
+
+func (h *Handler) unlockRetryAfter(key string) int {
+	if h.cfg.FrontendPassword == "" {
+		return 0
+	}
+	now := time.Now()
+	h.unlockRateMu.Lock()
+	defer h.unlockRateMu.Unlock()
+	h.cleanupUnlockAttemptsLocked(now)
+	attempt := h.unlockAttempts[key]
+	if now.Before(attempt.blockedUntil) {
+		seconds := int(time.Until(attempt.blockedUntil).Seconds())
+		if seconds < 1 {
+			seconds = 1
+		}
+		return seconds
+	}
+	return 0
+}
+
+func (h *Handler) recordUnlockFailure(key string) {
+	if h.cfg.FrontendPassword == "" {
+		return
+	}
+	now := time.Now()
+	h.unlockRateMu.Lock()
+	defer h.unlockRateMu.Unlock()
+	h.cleanupUnlockAttemptsLocked(now)
+	attempt := h.unlockAttempts[key]
+	if attempt.windowStart.IsZero() || now.Sub(attempt.windowStart) >= unlockFailureWindow {
+		attempt = unlockAttempt{windowStart: now}
+	}
+	attempt.failures++
+	if attempt.failures >= unlockFailureLimit {
+		attempt.blockedUntil = now.Add(unlockBlockDuration)
+	}
+	h.unlockAttempts[key] = attempt
+}
+
+func (h *Handler) clearUnlockFailures(key string) {
+	h.unlockRateMu.Lock()
+	delete(h.unlockAttempts, key)
+	h.unlockRateMu.Unlock()
+}
+
+func (h *Handler) cleanupUnlockAttemptsLocked(now time.Time) {
+	for key, attempt := range h.unlockAttempts {
+		if now.Sub(attempt.windowStart) >= unlockFailureWindow && !now.Before(attempt.blockedUntil) {
+			delete(h.unlockAttempts, key)
+		}
+	}
 }
 
 func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
@@ -853,7 +936,11 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 // execution path, preserving account rotation, retries, sticky sessions and
 // upstream error handling in one place.
 func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	body, tooLarge, err := readRequestBody(r)
+	if tooLarge {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 8 MiB limit")
+		return
+	}
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
@@ -1836,7 +1923,11 @@ func (w *responsesStreamWriter) emit(event string, v map[string]any) error {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	body, tooLarge, err := readRequestBody(r)
+	if tooLarge {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 8 MiB limit")
+		return
+	}
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
@@ -2195,6 +2286,14 @@ func (h *Handler) applyErrorPolicy(uid, model string, kind upstream.ErrKind, bod
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+func readRequestBody(r *http.Request) ([]byte, bool, error) {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes+1))
+	if len(raw) > maxRequestBodyBytes {
+		return nil, true, nil
+	}
+	return raw, false, err
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	raw, _ := json.Marshal(v)

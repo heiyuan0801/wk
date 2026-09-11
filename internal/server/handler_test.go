@@ -49,6 +49,35 @@ func TestValidateImagePartsAcceptsDataURLAndFileID(t *testing.T) {
 	}
 }
 
+func TestReadRequestBodyDetectsLimit(t *testing.T) {
+	body := strings.Repeat("x", maxRequestBodyBytes+1)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	got, tooLarge, err := readRequestBody(req)
+	if err != nil || !tooLarge || got != nil {
+		t.Fatalf("readRequestBody = (%d bytes, tooLarge=%v, err=%v)", len(got), tooLarge, err)
+	}
+}
+
+func TestUnlockRateLimitBlocksRepeatedFailures(t *testing.T) {
+	h := NewHandler(Config{FrontendPassword: "correct"})
+	for i := 0; i < unlockFailureLimit; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/admin/unlock", strings.NewReader(`{"password":"wrong"}`))
+		req.RemoteAddr = "192.0.2.10:1234"
+		rec := httptest.NewRecorder()
+		h.unlock(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("failure %d status=%d", i+1, rec.Code)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, "/admin/unlock", strings.NewReader(`{"password":"correct"}`))
+	req.RemoteAddr = "192.0.2.10:5678"
+	rec := httptest.NewRecorder()
+	h.unlock(rec, req)
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("blocked unlock status=%d retry-after=%q body=%s", rec.Code, rec.Header().Get("Retry-After"), rec.Body.String())
+	}
+}
+
 // newFakeUpstream 返回一个 ChatStream 走 fake 的 upstream.Client。
 // fake 依据 Authorization 头决定行为。
 func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body string, isStream bool)) *upstream.Client {
