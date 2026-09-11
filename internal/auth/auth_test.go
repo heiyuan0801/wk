@@ -38,7 +38,7 @@ func TestParseMissingToken(t *testing.T) {
 }
 
 func TestGlobalRegion(t *testing.T) {
-	for _, d := range []string{"workbuddy.ai", "www.workbuddy.ai", "api.workbuddy.ai", "WorkBuddy.AI"} {
+	for _, d := range []string{"workbuddy.ai", "www.workbuddy.ai", "api.workbuddy.ai", "WorkBuddy.AI", "codebuddy.ai", "api.codebuddy.ai", "https://www.workbuddy.ai/"} {
 		sa := &Auth{Domain: d}
 		if sa.Region() != "global" {
 			t.Errorf("domain %q want global, got %s", d, sa.Region())
@@ -94,6 +94,32 @@ func TestLoadDirFiltersRegion(t *testing.T) {
 	}
 	if list[0].FilePath == "" {
 		t.Error("FilePath not set")
+	}
+}
+
+func TestLoadDirAllRegions(t *testing.T) {
+	dir := t.TempDir()
+	cn := `{"auth":{"accessToken":"at1","domain":"codebuddy.cn"},"account":{"uid":"cn1"}}`
+	gl := `{"auth":{"accessToken":"at2","domain":"www.workbuddy.ai"},"account":{"uid":"g1"}}`
+	if err := os.WriteFile(filepath.Join(dir, "workbuddy-cn1.json"), []byte(cn), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "workbuddy-g1.json"), []byte(gl), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	list, err := LoadDir(dir, RegionAll)
+	if err != nil {
+		t.Fatalf("load all: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("want 2 accounts, got %d", len(list))
+	}
+	regions := map[string]bool{}
+	for _, a := range list {
+		regions[a.Region()] = true
+	}
+	if !regions[RegionCN] || !regions[RegionGlobal] {
+		t.Fatalf("want both regions, got %v", regions)
 	}
 }
 

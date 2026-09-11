@@ -18,7 +18,7 @@ type Config struct {
 	FrontendPassword string `json:"frontend_password"` // 前端控制台密码；空 = 不启用
 	AuthDir          string `json:"auth_dir"`          // ./auths
 	StateFile        string `json:"state_file"`        // ./data/state.json
-	Region           string `json:"region"`            // 只收 "cn"
+	Region           string `json:"region"`            // "cn" / "global" / "all"
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -210,12 +210,15 @@ func (c *Config) normalize() error {
 	c.Billing.InputCreditsPer1KTokens = validCreditRate(c.Billing.InputCreditsPer1KTokens)
 	c.Billing.OutputCreditsPer1KTokens = validCreditRate(c.Billing.OutputCreditsPer1KTokens)
 	c.Billing.CachedInputCreditsPer1KTokens = validCreditRate(c.Billing.CachedInputCreditsPer1KTokens)
+	c.Region = strings.ToLower(strings.TrimSpace(c.Region))
 	if c.Region == "" {
 		c.Region = "cn"
 	}
-	c.Region = strings.ToLower(c.Region)
-	if c.Region != "cn" && c.Region != "global" {
-		return fmt.Errorf("region must be cn or global, got %q", c.Region)
+	if c.Region == "mixed" {
+		c.Region = "all"
+	}
+	if c.Region != "cn" && c.Region != "global" && c.Region != "all" {
+		return fmt.Errorf("region must be cn, global, or all, got %q", c.Region)
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen

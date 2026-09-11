@@ -70,6 +70,7 @@ type Handler struct {
 	mux             *http.ServeMux
 	sessionsMu      sync.Mutex
 	sessions        map[string]time.Time
+	configMu        sync.Mutex
 	responsesMu     sync.Mutex
 	responseHistory map[string]storedResponse
 	responseBytes   int
@@ -210,6 +211,8 @@ func (h *Handler) unlock(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
+	h.configMu.Lock()
+	defer h.configMu.Unlock()
 	if h.cfg.ConfigPath == "" {
 		writeJSON(w, 200, map[string]any{})
 		return
@@ -234,6 +237,8 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
+	h.configMu.Lock()
+	defer h.configMu.Unlock()
 	var req struct {
 		CheckinHours   []int `json:"checkin_hours"`
 		KeepaliveHours []int `json:"keepalive_hours"`
@@ -336,64 +341,212 @@ func (h *Handler) refreshCredits(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 202, map[string]any{"ok": true, "message": "上游积分刷新已启动"})
 }
 
-func (h *Handler) loginCommand(ctx context.Context, arg string) ([]byte, error) {
+func normalizeLoginRegion(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "cn", "china":
+		return "cn", nil
+	case "global", "overseas", "international", "intl":
+		return "global", nil
+	default:
+		return "", fmt.Errorf("登录区域只能选择 cn 或 global")
+	}
+}
+
+func (h *Handler) loginRegion(r *http.Request) (string, error) {
+	if raw := strings.TrimSpace(r.URL.Query().Get("region")); raw != "" {
+		return normalizeLoginRegion(raw)
+	}
+	h.configMu.Lock()
+	configured := strings.ToLower(strings.TrimSpace(h.cfg.Region))
+	h.configMu.Unlock()
+	if configured == "global" {
+		return "global", nil
+	}
+	// all means the pool is mixed, but an OAuth request still needs one
+	// concrete upstream host. Keep the historical CN default for API callers
+	// that do not send the new query parameter.
+	return "cn", nil
+}
+
+func (h *Handler) loginCommand(ctx context.Context, arg, region string) ([]byte, error) {
 	bin := h.cfg.LoginBin
 	if bin == "" {
 		bin = "./login"
 	}
 	cmd := exec.CommandContext(ctx, bin, arg)
 	cmd.Dir = filepath.Dir(h.cfg.ConfigPath)
+	cmd.Env = setCommandEnv(os.Environ(), "WB2A_LOGIN_REGION", region)
 	return cmd.Output()
 }
 
+func setCommandEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	updated := false
+	for i, item := range env {
+		if strings.HasPrefix(item, prefix) {
+			env[i] = prefix + value
+			updated = true
+		}
+	}
+	if !updated {
+		env = append(env, prefix+value)
+	}
+	return env
+}
+
 func (h *Handler) accountURL(w http.ResponseWriter, r *http.Request) {
-	out, err := h.loginCommand(r.Context(), "url")
+	region, err := h.loginRegion(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	out, err := h.loginCommand(r.Context(), "url", region)
 	if err != nil {
 		writeJSON(w, 502, map[string]string{"error": fmt.Sprintf("登录初始化失败: %v", err)})
 		return
 	}
-	writeJSON(w, 200, map[string]string{"url": strings.TrimSpace(string(out))})
+	loginURL := strings.TrimSpace(string(out))
+	if loginURL == "" {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "登录初始化未返回授权链接"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"url": loginURL, "region": region})
 }
 
 func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
-	out, err := h.loginCommand(r.Context(), "poll")
+	region, err := h.loginRegion(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	out, err := h.loginCommand(r.Context(), "poll", region)
 	if err != nil {
 		writeJSON(w, 409, map[string]string{"error": "登录尚未完成，请先在浏览器完成授权"})
 		return
 	}
 	var result struct {
-		AccessToken                         string `json:"access_token"`
-		RefreshToken                        string `json:"refresh_token"`
-		ExpiresIn                           int64  `json:"expires_in"`
-		Domain, UID, EnterpriseID, Nickname string
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+		Domain       string `json:"domain"`
+		Region       string `json:"region"`
+		UID          string `json:"uid"`
+		EnterpriseID string `json:"enterprise_id"`
+		Nickname     string `json:"nickname"`
 	}
 	if json.Unmarshal(out, &result) != nil || result.AccessToken == "" || result.UID == "" {
 		writeJSON(w, 409, map[string]string{"error": "登录尚未完成，请完成授权后重试"})
+		return
+	}
+	if result.Region != "" {
+		returnedRegion, regionErr := normalizeLoginRegion(result.Region)
+		if regionErr != nil || returnedRegion != region {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "授权区域与请求区域不一致，请重新生成登录链接"})
+			return
+		}
+	}
+	if region == "global" && strings.TrimSpace(result.Domain) == "" {
+		// Some international OAuth responses omit domain. Persisting the global
+		// host is necessary because account.Region() drives every later request.
+		result.Domain = "www.workbuddy.ai"
+	}
+	if filepath.Base(result.UID) != result.UID || strings.ContainsAny(result.UID, `/\`) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "授权返回的 UID 无效"})
 		return
 	}
 	if err := os.MkdirAll(h.cfg.AuthDir, 0700); err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	expiresAt := time.Now().Unix() + result.ExpiresIn
+	expiresAt := int64(0)
+	if result.ExpiresIn > 0 {
+		expiresAt = time.Now().Unix() + result.ExpiresIn
+	}
 	doc := map[string]any{"auth": map[string]any{"accessToken": result.AccessToken, "refreshToken": result.RefreshToken, "expiresAt": expiresAt, "domain": result.Domain}, "account": map[string]any{"uid": result.UID, "enterpriseId": result.EnterpriseID, "nickname": result.Nickname}}
 	raw, _ := json.MarshalIndent(doc, "", "  ")
 	path := filepath.Join(h.cfg.AuthDir, "workbuddy-"+result.UID+".json")
-	if err := os.WriteFile(path, append(raw, '\n'), 0600); err != nil {
+	if err := writeFileAtomic(path, append(raw, '\n'), 0600); err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	if loaded, err := auth.LoadDir(h.cfg.AuthDir, h.cfg.Region); err == nil {
-		h.cfg.Pool.SyncToDir(loaded)
-	}
+	loadedMixed := false
 	if h.cfg.Pool != nil {
+		if loaded, loadErr := auth.LoadDir(h.cfg.AuthDir, auth.RegionAll); loadErr == nil {
+			regions := make(map[string]struct{}, 2)
+			for _, loadedAuth := range loaded {
+				regions[loadedAuth.Region()] = struct{}{}
+			}
+			loadedMixed = len(regions) > 1
+			h.cfg.Pool.SyncToDir(loaded)
+		} else {
+			log.Printf("account poll: reload auths failed: %v", loadErr)
+		}
 		h.cfg.Pool.Add(&auth.Auth{
 			AccessToken: result.AccessToken, RefreshToken: result.RefreshToken, ExpiresAt: expiresAt,
 			Domain: result.Domain, UID: result.UID, EnterpriseID: result.EnterpriseID,
 			Nickname: result.Nickname, FilePath: path,
 		})
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "uid": result.UID, "nickname": result.Nickname})
+	// A newly added account may expose a different regional model catalogue.
+	// Force the next /models request to fetch with the expanded pool.
+	invalidateDynamicModelsCache()
+
+	response := map[string]any{"ok": true, "uid": result.UID, "nickname": result.Nickname, "region": region}
+	var configErr error
+	if loadedMixed {
+		configErr = h.promoteMixedRegion()
+	} else {
+		configErr = h.promoteMixedRegionIfNeeded(region)
+	}
+	if configErr != nil {
+		// The account is already usable in the current process. Return a warning
+		// so an unwritable config mount does not hide the restart persistence fix.
+		response["warning"] = "账号已添加，但混合区域配置未能保存：" + configErr.Error()
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+// promoteMixedRegionIfNeeded keeps both CN and global credentials available
+// after a user adds an account from the other region. It persists region=all
+// for the next restart and updates the running handler after a successful write.
+func (h *Handler) promoteMixedRegionIfNeeded(loginRegion string) error {
+	h.configMu.Lock()
+	configured := strings.ToLower(strings.TrimSpace(h.cfg.Region))
+	h.configMu.Unlock()
+	if configured == "all" || configured == loginRegion {
+		return nil
+	}
+	return h.promoteMixedRegion()
+}
+
+func (h *Handler) promoteMixedRegion() error {
+	h.configMu.Lock()
+	defer h.configMu.Unlock()
+	if h.cfg.ConfigPath == "" {
+		h.cfg.Region = "all"
+		return nil
+	}
+	raw, err := os.ReadFile(h.cfg.ConfigPath)
+	if err != nil {
+		return err
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+	doc["region"] = "all"
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600); err != nil {
+		// Keep the in-memory region unchanged when persistence fails. The caller
+		// already added the account to the live pool, and a later account add can
+		// retry this write instead of incorrectly considering it complete.
+		return err
+	}
+	h.cfg.Region = "all"
+	return nil
 }
 
 func (h *Handler) enableAccount(w http.ResponseWriter, r *http.Request) {
@@ -555,7 +708,7 @@ func (h *Handler) metricsSnapshot() map[string]any {
 	return metricsSnapshot()
 }
 
-// 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
+// 静态 WorkBuddy 模型表（动态接口失败时的回退；两种区域共用兼容别名）。
 var staticModels = []map[string]any{
 	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
@@ -582,6 +735,14 @@ const (
 	dynamicModelsTTL        = time.Hour
 	modelsFetchFailCooldown = 5 * time.Minute
 )
+
+func invalidateDynamicModelsCache() {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = nil
+	dynamicModelsCache.fetched = time.Time{}
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
+}
 
 // models 返回模型列表：优先动态（缓存 1h），失败回退静态表。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {

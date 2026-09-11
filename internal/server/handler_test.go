@@ -707,7 +707,7 @@ func TestStatusEndpoint(t *testing.T) {
 		t.Fatalf("code=%d", rec.Code)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, `"uid":"u1"`) || !strings.Contains(body, `"credits":42`) {
+	if !strings.Contains(body, `"uid":"u1"`) || !strings.Contains(body, `"region":"cn"`) || !strings.Contains(body, `"credits":42`) {
 		t.Errorf("body=%s", body)
 	}
 	if strings.Contains(body, "AccessToken") || strings.Contains(body, `"at"`) {

@@ -32,6 +32,29 @@ func TestLoadFile(t *testing.T) {
 	}
 }
 
+func TestMixedRegionConfig(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	if err := os.WriteFile(fp, []byte(`{"region":"mixed"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("load mixed region: %v", err)
+	}
+	if c.Region != "all" {
+		t.Fatalf("region=%q want all", c.Region)
+	}
+
+	if err := os.WriteFile(fp, []byte(`{"region":"all"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err = Load(fp)
+	if err != nil || c.Region != "all" {
+		t.Fatalf("load all region: region=%q err=%v", c.Region, err)
+	}
+}
+
 func TestEnvOverride(t *testing.T) {
 	t.Setenv("WB2A_LISTEN", ":7777")
 	t.Setenv("WB2A_API_KEY", "envkey")

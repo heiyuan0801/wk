@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# login.sh — WorkBuddy CN OAuth 登录 → 落盘 auth 文件
+# login.sh — WorkBuddy OAuth 登录（中国区/海外版）→ 落盘 auth 文件
 #
 # 用法:
-#   ./login.sh
+#   ./login.sh              # 中国区
+#   ./login.sh global       # 海外版
 #
 # 流程:
 #   1. POST /v2/plugin/auth/state 拿授权 URL（无 PKCE，state 由服务端签发）
@@ -14,21 +15,32 @@ set -euo pipefail
 cd "$(dirname "$0")"
 AUTH_DIR="./auths"
 CONTAINER="workbuddy2api"
+CONFIG_FILE="${WB2A_CONFIG_FILE:-./config.json}"
+
+case "${1:-cn}" in
+    cn|china) REGION="cn" ;;
+    global|overseas|international|intl) REGION="global" ;;
+    *)
+        echo "用法: $0 [cn|global]" >&2
+        exit 2
+        ;;
+esac
 
 mkdir -p "$AUTH_DIR"
 
-# login 工具：不存在才编译（源码改动后手动 go build -o login ./cmd/login）
+# login 工具：不存在或源码更新时自动编译
 LOGIN_BIN="./login"
-if [[ ! -x "$LOGIN_BIN" ]]; then
+if [[ ! -x "$LOGIN_BIN" || "./cmd/login/main.go" -nt "$LOGIN_BIN" ]]; then
     go build -o "$LOGIN_BIN" ./cmd/login
 fi
 
 echo "============================================================"
 echo "  WorkBuddy OAuth 登录"
+echo "  区域: $([[ "$REGION" == "global" ]] && echo "海外版" || echo "中国区")"
 echo "============================================================"
 echo ""
 
-AUTH_URL=$("$LOGIN_BIN" url)
+AUTH_URL=$("$LOGIN_BIN" url "$REGION")
 
 echo "请在浏览器中打开以下链接完成登录："
 echo ""
@@ -51,7 +63,7 @@ fi
 echo ""
 echo "正在获取 token..."
 
-RESULT=$("$LOGIN_BIN" poll) || {
+RESULT=$("$LOGIN_BIN" poll "$REGION") || {
     echo ""
     echo "获取 token 失败。可能原因："
     echo "  - 登录还没完成就按了 y（重新运行 ./login.sh 再试）"
@@ -67,6 +79,13 @@ USER_ID=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdi
 ENT_ID=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('enterprise_id',''))")
 NICKNAME=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('nickname',''))")
 
+if [[ "$REGION" == "global" ]]; then
+    BILLING_BASE="https://www.workbuddy.ai"
+    [[ -n "$DOMAIN" ]] || DOMAIN="www.workbuddy.ai"
+else
+    BILLING_BASE="https://www.codebuddy.cn"
+fi
+
 if [[ -z "$USER_ID" ]]; then
     echo "无法获取 uid，请检查 token 是否有效"
     exit 1
@@ -74,20 +93,26 @@ fi
 
 EXPIRES_AT=$(( $(date +%s) + EXPIRES_IN ))
 
-# ─── 签到（CN：POST codebuddy.cn/v2/billing/meter/daily-checkin，幂等不阻塞）───
-python3 - <<PYEOF
-import json, urllib.request, urllib.error
+# ─── 签到（按账号区域选择 billing host，幂等不阻塞）─────────────────────
+WB2A_LOGIN_TOKEN="$TOKEN" WB2A_LOGIN_USER_ID="$USER_ID" WB2A_LOGIN_ENT_ID="$ENT_ID" WB2A_LOGIN_DOMAIN="$DOMAIN" WB2A_LOGIN_BILLING_BASE="$BILLING_BASE" python3 - <<'PYEOF'
+import json, os, urllib.request, urllib.error
+
+token = os.environ["WB2A_LOGIN_TOKEN"]
+user_id = os.environ["WB2A_LOGIN_USER_ID"]
+enterprise_id = os.environ.get("WB2A_LOGIN_ENT_ID", "")
+domain = os.environ.get("WB2A_LOGIN_DOMAIN", "")
+billing_base = os.environ["WB2A_LOGIN_BILLING_BASE"].rstrip("/")
 
 req = urllib.request.Request(
-    "https://www.codebuddy.cn/v2/billing/meter/daily-checkin",
+    billing_base + "/v2/billing/meter/daily-checkin",
     method="POST", data=b"{}",
     headers={
-        "Authorization": "Bearer $TOKEN",
+        "Authorization": "Bearer " + token,
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "X-User-Id": "$USER_ID",
-        **({"X-Enterprise-Id": "$ENT_ID", "X-Tenant-Id": "$ENT_ID"} if "$ENT_ID" else {}),
-        **({"X-Domain": "$DOMAIN"} if "$DOMAIN" else {}),
+        "X-User-Id": user_id,
+        **({"X-Enterprise-Id": enterprise_id, "X-Tenant-Id": enterprise_id} if enterprise_id else {}),
+        **({"X-Domain": domain} if domain else {}),
     })
 try:
     with urllib.request.urlopen(req, timeout=15) as r:
@@ -117,26 +142,82 @@ else
     echo "新账号（uid=$USER_ID），新增 auth 文件"
     ACTION="新增"
 fi
-python3 - <<PYEOF
-import json
+WB2A_LOGIN_AUTH_FILE="$AUTH_FILE" WB2A_LOGIN_USER_ID="$USER_ID" WB2A_LOGIN_ENT_ID="$ENT_ID" WB2A_LOGIN_NICKNAME="$NICKNAME" WB2A_LOGIN_TOKEN="$TOKEN" WB2A_LOGIN_REFRESH="$REFRESH" WB2A_LOGIN_EXPIRES_AT="$EXPIRES_AT" WB2A_LOGIN_DOMAIN="$DOMAIN" python3 - <<'PYEOF'
+import json, os
 
 auth = {
     "account": {
-        "uid": "$USER_ID",
-        "enterpriseId": "$ENT_ID",
-        "nickname": "$NICKNAME"
+        "uid": os.environ["WB2A_LOGIN_USER_ID"],
+        "enterpriseId": os.environ.get("WB2A_LOGIN_ENT_ID", ""),
+        "nickname": os.environ.get("WB2A_LOGIN_NICKNAME", "")
     },
     "auth": {
-        "accessToken": "$TOKEN",
-        "refreshToken": "$REFRESH",
-        "expiresAt": $EXPIRES_AT,
-        "domain": "$DOMAIN"
+        "accessToken": os.environ["WB2A_LOGIN_TOKEN"],
+        "refreshToken": os.environ.get("WB2A_LOGIN_REFRESH", ""),
+        "expiresAt": int(os.environ["WB2A_LOGIN_EXPIRES_AT"]),
+        "domain": os.environ.get("WB2A_LOGIN_DOMAIN", "")
     }
 }
-with open("$AUTH_FILE", "w") as f:
+with open(os.environ["WB2A_LOGIN_AUTH_FILE"], "w") as f:
     json.dump(auth, f, indent=1)
-print(f"已保存（$ACTION）: $AUTH_FILE")
 PYEOF
+chmod 600 "$AUTH_FILE"
+echo "已保存（$ACTION）: $AUTH_FILE"
+
+# Dockerfile 以 UID/GID 10001 运行服务。脚本常由 root 执行时，修正新文件
+# 的所有权，否则容器会因 600 权限无法读取海外或中国区凭证。
+if [[ "$(id -u)" == "0" ]]; then
+    APP_UID="10001"
+    APP_GID="10001"
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
+        CONTAINER_UID=$(docker exec "$CONTAINER" id -u 2>/dev/null || true)
+        CONTAINER_GID=$(docker exec "$CONTAINER" id -g 2>/dev/null || true)
+        [[ "$CONTAINER_UID" =~ ^[0-9]+$ ]] && APP_UID="$CONTAINER_UID"
+        [[ "$CONTAINER_GID" =~ ^[0-9]+$ ]] && APP_GID="$CONTAINER_GID"
+    fi
+    chown "$APP_UID:$APP_GID" "$AUTH_FILE" 2>/dev/null || true
+fi
+
+# 添加另一地区账号后，账号池必须改为混合模式，否则下一次启动会按
+# 原来的单区域配置把新账号过滤掉。保留配置文件原有权限和所有权。
+if [[ -f "$CONFIG_FILE" ]]; then
+    if ! WB2A_LOGIN_CONFIG_FILE="$CONFIG_FILE" WB2A_LOGIN_REGION="$REGION" python3 - <<'PYEOF'
+import json, os, stat, tempfile
+
+path = os.environ["WB2A_LOGIN_CONFIG_FILE"]
+login_region = os.environ["WB2A_LOGIN_REGION"]
+with open(path, encoding="utf-8") as f:
+    doc = json.load(f)
+configured = str(doc.get("region", "cn")).strip().lower()
+if configured not in ("all", login_region):
+    doc["region"] = "all"
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    fd, tmp_path = tempfile.mkstemp(prefix=".wb2api-config-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, mode)
+        try:
+            owner = os.stat(path)
+            os.chown(tmp_path, owner.st_uid, owner.st_gid)
+        except (AttributeError, PermissionError, OSError):
+            pass
+        os.replace(tmp_path, path)
+        print("账号池配置已切换为混合模式")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+PYEOF
+    then
+        echo "警告：无法保存混合区域配置；请手动将 $CONFIG_FILE 的 region 设置为 all"
+    fi
+fi
 
 # ─── 重启服务 ────────────────────────────────────────────
 echo ""

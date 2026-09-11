@@ -61,6 +61,7 @@ type ModelCooldownStatus struct {
 type Status struct {
 	UID                 string                         `json:"uid"`
 	Nickname            string                         `json:"nickname,omitempty"`
+	Region              string                         `json:"region"`
 	Credits             int64                          `json:"credits"`
 	CapacitySize        int64                          `json:"capacity_size,omitempty"`
 	CapacityRemain      int64                          `json:"capacity_remain,omitempty"`
@@ -1186,6 +1187,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	st := Status{
 		UID:                 uid,
 		Nickname:            e.a.Nickname,
+		Region:              e.a.Region(),
 		Credits:             e.credits,
 		CapacitySize:        e.capacitySize,
 		CapacityRemain:      e.capacityRemain,

@@ -46,7 +46,8 @@ function App() {
   const [requestSearch, setRequestSearch] = useState('');
   const [requestModeFilter, setRequestModeFilter] = useState('all');
   const [requestStatusFilter, setRequestStatusFilter] = useState('all');
-  const [config, setConfig] = useState({ checkin_hours: [9, 21], keepalive_hours: [22] });
+  const [config, setConfig] = useState({ checkin_hours: [9, 21], keepalive_hours: [22], region: 'cn' });
+  const [loginRegion, setLoginRegion] = useState('cn');
   const [selectedModel, setSelectedModel] = useState('');
   const [promptText, setPromptText] = useState('你好，请简短介绍一下你自己。');
   const [answer, setAnswer] = useState('');
@@ -56,6 +57,9 @@ function App() {
   const [metricSamples, setMetricSamples] = useState([]);
   const [creditRefreshing, setCreditRefreshing] = useState(false);
   const [accountAction, setAccountAction] = useState('');
+  const [loginURL, setLoginURL] = useState('');
+  const [loginPendingRegion, setLoginPendingRegion] = useState('');
+  const loginRegionTouched = useRef(false);
   const refreshController = useRef(null);
   const refreshSerial = useRef(0);
   const requestController = useRef(null);
@@ -98,7 +102,10 @@ function App() {
     try {
       const currentConfig = await api('/admin/config', { signal: controller.signal });
       if (serial !== refreshSerial.current) return;
-      if (currentConfig.schedule) setConfig(currentConfig.schedule);
+      if (currentConfig.schedule || currentConfig.region) {
+        setConfig(current => ({ ...current, ...(currentConfig.schedule || {}), region: currentConfig.region || current.region || 'cn' }));
+      }
+      if (!loginRegionTouched.current && currentConfig.region === 'global') setLoginRegion('global');
     } catch (error) {
       if (error.name === 'AbortError') return;
       // Dashboard data can still refresh when configuration is unavailable.
@@ -163,7 +170,7 @@ function App() {
       const result = await api('/admin/config', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(nextConfig),
       });
-      setConfig(result.schedule || nextConfig);
+      setConfig(current => ({ ...current, ...(result.schedule || nextConfig) }));
       message.success(result.restart_required ? '配置已保存，重启后生效' : '配置已保存');
     } catch (error) {
       message.error(error.message);
@@ -329,6 +336,11 @@ function App() {
       ),
     },
     {
+      title: '区域',
+      dataIndex: 'region',
+      render: value => <Tag color={value === 'global' ? 'blue' : 'default'}>{value === 'global' ? '海外版' : '中国区'}</Tag>,
+    },
+    {
       title: '状态',
       render: (_, record) => {
         const rateLimited = record.cool_kind === 'rate_limit';
@@ -483,6 +495,8 @@ function App() {
     settings: ['管理设置', '配置签到计划和管理授权账号。'],
   };
   const [pageTitle, pageDescription] = pageCopy[activeSection] || pageCopy.dashboard;
+  const poolRegionLabel = config.region === 'all' ? '混合区域' : config.region === 'global' ? '海外版' : '中国区';
+  const pollRegion = loginPendingRegion || loginRegion;
   const menuItems = [
     { key: 'dashboard', icon: <DashboardOutlined />, label: '仪表盘' },
     { key: 'models', icon: <ApiOutlined />, label: '模型目录' },
@@ -589,23 +603,48 @@ function App() {
               <Button type="primary" htmlType="submit">保存</Button>
             </Form>
           </Card>
-          <Card title="账号授权">
+          <Card title="账号授权" extra={<Tag color={config.region === 'all' ? 'green' : 'blue'}>账号池：{poolRegionLabel}</Tag>}>
             <Space wrap>
+              <Text type="secondary">登录区域</Text>
+              <Select
+                value={loginRegion}
+                onChange={value => { loginRegionTouched.current = true; setLoginRegion(value); }}
+                style={{ width: 150 }}
+                options={[{ value: 'cn', label: '中国区' }, { value: 'global', label: '海外版' }]}
+              />
               <Button icon={<UnlockOutlined />} onClick={async () => {
                 try {
-                  const result = await api('/admin/account/url', { method: 'POST' });
-                  window.open(result.url, '_blank', 'noopener');
-                  message.info('完成浏览器授权后回到此页面再次点击轮询');
+                  const query = `?region=${encodeURIComponent(loginRegion)}`;
+                  const result = await api(`/admin/account/url${query}`, { method: 'POST' });
+                  setLoginURL(result.url || '');
+                  setLoginPendingRegion(result.region || loginRegion);
+                  const popup = window.open(result.url, '_blank', 'noopener');
+                  message.info(popup
+                    ? `${loginRegion === 'global' ? '海外版' : '中国区'}授权链接已打开，完成浏览器授权后点击轮询`
+                    : '浏览器拦截了弹窗，请点击下方授权链接完成登录后轮询');
                 } catch (error) { message.error(error.message); }
               }}>生成 OAuth 登录链接</Button>
               <Button icon={<ToolOutlined />} onClick={async () => {
                 try {
-                  await api('/admin/account/poll', { method: 'POST' });
-                  message.success('账号已添加');
+                  const query = `?region=${encodeURIComponent(pollRegion)}`;
+                  const result = await api(`/admin/account/poll${query}`, { method: 'POST' });
+                  if (result.warning) message.warning(result.warning);
+                  else message.success(`${result.region === 'global' ? '海外版' : '中国区'}账号已添加`);
+                  setLoginURL('');
+                  setLoginPendingRegion('');
                   await refresh();
                 } catch (error) { message.error(error.message); }
               }}>轮询授权结果</Button>
             </Space>
+            {loginURL && (
+              <div style={{ marginTop: 12, wordBreak: 'break-all' }}>
+                <Text type="secondary">{pollRegion === 'global' ? '海外版' : '中国区'}授权链接：</Text>{' '}
+                <a href={loginURL} target="_blank" rel="noreferrer">点击打开浏览器登录</a>
+              </div>
+            )}
+            <Paragraph type="secondary" style={{ margin: '12px 0 0' }}>
+              中国区与海外版账号可以同时使用；登录后系统会按账号区域自动选择对应的模型、聊天和积分接口。
+            </Paragraph>
           </Card>
         </Space>
       ),

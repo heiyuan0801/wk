@@ -5,6 +5,7 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -76,16 +77,46 @@ func (a *Auth) ApplyRefresh(accessToken, refreshToken, domain string, expiresAt 
 	}
 }
 
-// globalSuffix 判定全球区（global）账号的域名后缀；子域（如 www./api.）也属于全球区。
-const globalSuffix = ".workbuddy.ai"
+const (
+	RegionCN     = "cn"
+	RegionGlobal = "global"
+	RegionAll    = "all"
+)
+
+// globalSuffixes 判定全球区（global）账号的域名后缀；子域（如 www./api.）
+// 也属于全球区。国际版部分接口会返回 codebuddy.ai，需与 workbuddy.ai
+// 一并识别；中国区使用的是 .cn 后缀，不会产生歧义。
+var globalSuffixes = []string{".workbuddy.ai", ".codebuddy.ai"}
+
+func normalizedDomain(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	// domain 字段历史上既出现过主机名，也可能带 scheme/path；统一成
+	// hostname 后再做区域判断，避免保存 "https://www.workbuddy.ai/" 时
+	// 被误判为中国区。
+	candidate := raw
+	if !strings.Contains(candidate, "://") {
+		candidate = "https://" + candidate
+	}
+	if parsed, err := url.Parse(candidate); err == nil {
+		if host := parsed.Hostname(); host != "" {
+			return strings.ToLower(strings.TrimSuffix(host, "."))
+		}
+	}
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+}
 
 // Region 返回 "cn" 或 "global"。domain 为空视为 CN（向后兼容）。
 func (a *Auth) Region() string {
-	d := strings.ToLower(strings.TrimSpace(a.Snapshot().Domain))
-	if d == strings.TrimPrefix(globalSuffix, ".") || strings.HasSuffix(d, globalSuffix) {
-		return "global"
+	d := normalizedDomain(a.Snapshot().Domain)
+	for _, suffix := range globalSuffixes {
+		if d == strings.TrimPrefix(suffix, ".") || strings.HasSuffix(d, suffix) {
+			return RegionGlobal
+		}
 	}
-	return "cn"
+	return RegionCN
 }
 
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
@@ -203,11 +234,20 @@ func (a *Auth) SaveAtomic() error {
 }
 
 // LoadDir 扫描 dir 下 workbuddy*.json，只收 wantRegion（"cn"/"global"）。
+// wantRegion 为 "all"（或兼容别名 "mixed"）时加载全部区域账号，供
+// 中国区与国际版账号混合运行。
 // 解析失败与 region 不符的文件静默跳过（启动日志由调用方统计）。
 func LoadDir(dir, wantRegion string) ([]*Auth, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
 	if err != nil {
 		return nil, err
+	}
+	wantRegion = strings.ToLower(strings.TrimSpace(wantRegion))
+	if wantRegion == "" {
+		wantRegion = RegionCN
+	}
+	if wantRegion == "mixed" {
+		wantRegion = RegionAll
 	}
 	var out []*Auth
 	for _, f := range files {
@@ -216,7 +256,7 @@ func LoadDir(dir, wantRegion string) ([]*Auth, error) {
 			continue
 		}
 		a, err := Parse(raw)
-		if err != nil || a.Region() != wantRegion {
+		if err != nil || (wantRegion != RegionAll && a.Region() != wantRegion) {
 			continue
 		}
 		a.FilePath = f
