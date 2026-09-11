@@ -406,6 +406,7 @@ func (h *Handler) enableAccount(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "账号不存在"})
 		return
 	}
+	h.cfg.Pool.Flush()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "message": "账号已启用"})
 }
 
@@ -420,6 +421,7 @@ func (h *Handler) disableAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.cfg.Pool.Disable(uid, "manual disabled")
+	h.cfg.Pool.Flush()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "message": "账号已禁用"})
 }
 
@@ -452,6 +454,7 @@ func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("删除账号文件失败: %v", err)})
 		return
 	}
+	h.cfg.Pool.Flush()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "message": "账号已删除"})
 }
 

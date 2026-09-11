@@ -268,35 +268,53 @@ function App() {
     }
   };
 
-  const accountActionHandler = (record, action) => {
+  const runAccountAction = async (record, action) => {
     const uid = record.uid || '';
     const isDelete = action === 'delete';
     const isEnable = action === 'enable';
-    const title = isDelete ? '确认删除账号？' : isEnable ? '确认手动启用账号？' : '确认禁用账号？';
-    const content = isDelete
-      ? `账号 ${uid.slice(0, 12)} 将从账号池和本地授权文件中删除，删除后需要重新登录才能恢复。`
-      : isEnable
-        ? `账号 ${uid.slice(0, 12)} 将清除禁用和冷却状态，并立即重新参与请求。`
-        : `账号 ${uid.slice(0, 12)} 将停止接收新请求，之后可以手动启用。`;
+    setAccountAction(`${uid}:${action}`);
+    try {
+      const path = isDelete ? `/admin/account/${encodeURIComponent(uid)}` : `/admin/account/${encodeURIComponent(uid)}/${action}`;
+      await api(path, { method: isDelete ? 'DELETE' : 'POST' });
+      if (isEnable) {
+        setData(current => ({
+          ...current,
+          accounts: (current.accounts || []).map(account => account.uid === uid
+            ? { ...account, disabled: false, cooling: false, reason: '' }
+            : account),
+          disabled: Math.max(0, Number(current.disabled || 0) - (record.disabled ? 1 : 0)),
+          healthy: Number(current.healthy || 0) + (record.disabled ? 1 : 0),
+        }));
+      }
+      const sessionWarning = isEnable && /12153|session dead/i.test(record.reason || '')
+        ? '账号已启用，但凭证曾失效；如果再次被禁用，请重新授权登录。'
+        : isDelete ? '账号已删除' : isEnable ? '账号已手动启用' : '账号已禁用';
+      message.success(sessionWarning);
+      await refresh();
+    } catch (error) {
+      message.error(error.message);
+    } finally {
+      setAccountAction('');
+    }
+  };
+
+  const accountActionHandler = (record, action) => {
+    // 启用是可逆操作，直接执行并立即反馈；删除和禁用仍需二次确认。
+    if (action === 'enable') {
+      runAccountAction(record, action);
+      return;
+    }
+    const uid = record.uid || '';
+    const isDelete = action === 'delete';
     Modal.confirm({
-      title,
-      content,
-      okText: isDelete ? '删除' : isEnable ? '启用' : '禁用',
+      title: isDelete ? '确认删除账号？' : '确认禁用账号？',
+      content: isDelete
+        ? `账号 ${uid.slice(0, 12)} 将从账号池和本地授权文件中删除，删除后需要重新登录才能恢复。`
+        : `账号 ${uid.slice(0, 12)} 将停止接收新请求，之后可以手动启用。`,
+      okText: isDelete ? '删除' : '禁用',
       cancelText: '取消',
-      okButtonProps: isDelete || !isEnable ? { danger: true } : undefined,
-      onOk: async () => {
-        setAccountAction(`${uid}:${action}`);
-        try {
-          const path = isDelete ? `/admin/account/${encodeURIComponent(uid)}` : `/admin/account/${encodeURIComponent(uid)}/${action}`;
-          await api(path, { method: isDelete ? 'DELETE' : 'POST' });
-          message.success(isDelete ? '账号已删除' : isEnable ? '账号已手动启用' : '账号已禁用');
-          await refresh();
-        } catch (error) {
-          message.error(error.message);
-        } finally {
-          setAccountAction('');
-        }
-      },
+      okButtonProps: { danger: true },
+      onOk: () => runAccountAction(record, action),
     });
   };
 
