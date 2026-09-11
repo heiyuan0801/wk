@@ -298,6 +298,15 @@ func normalizeScheduleHours(hours []int) ([]int, bool) {
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	return writeFileAtomicWith(path, data, mode, os.Rename)
+}
+
+// writeFileAtomicWith replaces a regular file atomically. A single-file
+// Docker bind mount cannot be replaced with rename from inside the container,
+// so fall back to a durable in-place write when the replacement is rejected.
+// The fallback keeps mounted config files writable on the host; directory
+// mounted auth files continue to use the atomic path.
+func writeFileAtomicWith(path string, data []byte, mode os.FileMode, rename func(string, string) error) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".wb2api-config-*.tmp")
 	if err != nil {
@@ -320,7 +329,35 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	if err := rename(tmpPath, path); err == nil {
+		return nil
+	} else {
+		renameErr := err
+		if err := writeFileInPlace(path, data, mode); err != nil {
+			return fmt.Errorf("replace %s: %w; in-place fallback: %v", path, renameErr, err)
+		}
+		return nil
+	}
+}
+
+func writeFileInPlace(path string, data []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if err := f.Chmod(mode); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func (h *Handler) runCheckin(w http.ResponseWriter, r *http.Request) {

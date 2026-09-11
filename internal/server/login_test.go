@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -55,5 +56,23 @@ func TestPromoteMixedRegionPersistsConfig(t *testing.T) {
 	// Repeated calls are idempotent and must not rewrite the configuration.
 	if err := h.promoteMixedRegionIfNeeded("global"); err != nil {
 		t.Fatalf("second promote: %v", err)
+	}
+}
+
+func TestWriteFileAtomicFallsBackForMountedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	forcedRenameError := func(_, _ string) error { return errors.New("mounted file") }
+	if err := writeFileAtomicWith(path, []byte("new"), 0o600, forcedRenameError); err != nil {
+		t.Fatalf("fallback write: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "new" {
+		t.Fatalf("content=%q want new", raw)
 	}
 }
