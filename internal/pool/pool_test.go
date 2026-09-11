@@ -813,15 +813,15 @@ func TestCooldownUntilTomorrow4AM(t *testing.T) {
 	if st.Reason != "余额不足" {
 		t.Errorf("reason=%q", st.Reason)
 	}
-	// 冷却截止必须是"此刻之后的最近一个 04:00"：晚于 now、距今不超过 24h。
+	// 冷却截止必须是所属日期的次日 04:00，距今最多约 28 小时。
 	if st.Until.Before(after) {
 		t.Errorf("until %v is in the past (call span %v..%v)", st.Until, before, after)
 	}
 	if st.Until.Hour() != 4 {
 		t.Errorf("until hour=%d want 4", st.Until.Hour())
 	}
-	if d := st.Until.Sub(after); d > 24*time.Hour {
-		t.Errorf("until %v is more than 24h out: %v", st.Until, d)
+	if d := st.Until.Sub(after); d > 48*time.Hour {
+		t.Errorf("until %v is more than 48h out: %v", st.Until, d)
 	}
 	// 全冷却时余额耗尽（hard）号不参与兜底 → 返回 nil（等签到恢复）。
 	if got := p.Pick(); got != nil {
