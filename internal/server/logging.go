@@ -354,35 +354,32 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			s.ttfb = time.Nanosecond
 		}
 	}
+	// Decode each SSE payload once. The previous implementation unmarshaled
+	// every chunk three times (map, tool-call struct, usage struct), which was a
+	// measurable CPU and allocation cost for token-heavy streams.
 	var rawChunk map[string]any
-	if json.Unmarshal([]byte(payload), &rawChunk) == nil {
-		if s.responseID == "" {
-			s.responseID = upstream.ResponseID(rawChunk)
-		}
-		if credits, ok := extractCreditUsage(rawChunk); ok {
-			s.credits = credits
-			s.hasCredits = true
-		}
+	if json.Unmarshal([]byte(payload), &rawChunk) != nil {
+		return
 	}
-	var toolChunk struct {
-		Choices []struct {
-			Delta struct {
-				ToolCalls []struct {
-					ID    string `json:"id"`
-					Index int    `json:"index"`
-				} `json:"tool_calls"`
-			} `json:"delta"`
-		} `json:"choices"`
+	if s.responseID == "" {
+		s.responseID = upstream.ResponseID(rawChunk)
 	}
-	if json.Unmarshal([]byte(payload), &toolChunk) == nil {
+	if credits, ok := extractCreditUsage(rawChunk); ok {
+		s.credits = credits
+		s.hasCredits = true
+	}
+	if choices, ok := rawChunk["choices"].([]any); ok {
 		if s.toolCallIDs == nil {
 			s.toolCallIDs = make(map[string]struct{})
 		}
-		for _, c := range toolChunk.Choices {
-			for _, call := range c.Delta.ToolCalls {
-				// IDs are commonly present only in the first delta; index remains
-				// stable across every fragment of the same tool call.
-				key := fmt.Sprintf("index:%d", call.Index)
+		for _, choice := range choices {
+			cm, _ := choice.(map[string]any)
+			delta, _ := cm["delta"].(map[string]any)
+			calls, _ := delta["tool_calls"].([]any)
+			for _, call := range calls {
+				callMap, _ := call.(map[string]any)
+				index, _ := usageInt(callMap["index"])
+				key := fmt.Sprintf("index:%d", index)
 				if _, seen := s.toolCallIDs[key]; !seen {
 					s.toolCallIDs[key] = struct{}{}
 					s.toolCalls++
@@ -390,40 +387,39 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			}
 		}
 	}
-	var chunk struct {
-		Usage *struct {
-			PromptTokens             int `json:"prompt_tokens"`
-			CompletionTokens         int `json:"completion_tokens"`
-			InputTokens              int `json:"input_tokens"`
-			OutputTokens             int `json:"output_tokens"`
-			TotalTokens              int `json:"total_tokens"`
-			PromptCacheHitTokens     int `json:"prompt_cache_hit_tokens"`
-			PromptCacheMissTokens    int `json:"prompt_cache_miss_tokens"`
-			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-			PromptTokensDetails      struct {
-				CachedTokens int `json:"cached_tokens"`
-			} `json:"prompt_tokens_details"`
-			InputTokensDetails struct {
-				CachedTokens             int `json:"cached_tokens"`
-				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-				CacheWriteTokens         int `json:"cache_write_tokens"`
-			} `json:"input_tokens_details"`
-		} `json:"usage"`
-	}
-	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
+	usage, ok := rawChunk["usage"].(map[string]any)
+	if !ok {
 		return
 	}
 	s.hasUsage = true
-	s.tokens = maxInts(chunk.Usage.CompletionTokens, chunk.Usage.OutputTokens)
-	s.inputTokens = maxInts(chunk.Usage.PromptTokens, chunk.Usage.InputTokens)
-	s.totalTokens = chunk.Usage.TotalTokens
+	prompt, _ := usageInt(usage["prompt_tokens"])
+	input, _ := usageInt(usage["input_tokens"])
+	completion, _ := usageInt(usage["completion_tokens"])
+	output, _ := usageInt(usage["output_tokens"])
+	s.tokens = maxInts(completion, output)
+	s.inputTokens = maxInts(prompt, input)
+	total, _ := usageInt(usage["total_tokens"])
+	s.totalTokens = total
 	if s.totalTokens == 0 && (s.inputTokens > 0 || s.tokens > 0) {
 		s.totalTokens = s.inputTokens + s.tokens
 	}
-	s.cacheRead = maxInts(chunk.Usage.PromptCacheHitTokens, chunk.Usage.CacheReadInputTokens, chunk.Usage.PromptTokensDetails.CachedTokens, chunk.Usage.InputTokensDetails.CachedTokens)
-	s.cacheWrite = maxInts(chunk.Usage.PromptCacheMissTokens, chunk.Usage.CacheCreationInputTokens, chunk.Usage.InputTokensDetails.CacheCreationInputTokens, chunk.Usage.InputTokensDetails.CacheWriteTokens)
-	s.totalTokens = chunk.Usage.TotalTokens
+	cacheRead, _ := usageInt(usage["prompt_cache_hit_tokens"])
+	cacheRead2, _ := usageInt(usage["cache_read_input_tokens"])
+	cacheWrite, _ := usageInt(usage["prompt_cache_miss_tokens"])
+	cacheWrite2, _ := usageInt(usage["cache_creation_input_tokens"])
+	if details, ok := usage["prompt_tokens_details"].(map[string]any); ok {
+		v, _ := usageInt(details["cached_tokens"])
+		cacheRead = maxInts(cacheRead, v)
+	}
+	if details, ok := usage["input_tokens_details"].(map[string]any); ok {
+		cached, _ := usageInt(details["cached_tokens"])
+		created, _ := usageInt(details["cache_creation_input_tokens"])
+		written, _ := usageInt(details["cache_write_tokens"])
+		cacheRead = maxInts(cacheRead, cached)
+		cacheWrite2 = maxInts(cacheWrite2, created, written)
+	}
+	s.cacheRead = maxInts(cacheRead, cacheRead2)
+	s.cacheWrite = maxInts(cacheWrite, cacheWrite2)
 }
 
 // Read 返回原始数据，同时解析统计 TTFB/token。
