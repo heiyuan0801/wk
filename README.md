@@ -197,6 +197,9 @@ stdout 同时保留一行便于排查的表格日志：
 | `GET /status` | Bearer | 账号状态汇总（total/healthy/cooling/disabled + 每账号详情） |
 | `GET /requests?limit=50` | Bearer | 最近请求日志（最多 200 条，不含提示词和响应正文） |
 | `POST /admin/credits/refresh` | 前端会话/Bearer | 异步刷新所有账号的上游积分明细，不执行签到 |
+| `POST /admin/account/{uid}/enable` | 前端会话/Bearer | 手动启用账号并清除禁用/冷却状态 |
+| `POST /admin/account/{uid}/disable` | 前端会话/Bearer | 手动禁用账号，停止新请求使用 |
+| `DELETE /admin/account/{uid}` | 前端会话/Bearer | 删除账号池记录及对应授权文件 |
 | `GET /healthz` | 无 | 健康检查（无健康账号时 503） |
 
 ZCode 等使用 OpenAI Compatible 提供商的客户端，Base URL 应填写

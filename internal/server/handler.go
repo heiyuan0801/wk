@@ -127,6 +127,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/credits/refresh", h.withFrontend(h.refreshCredits))
 	h.mux.HandleFunc("POST /admin/account/url", h.withFrontend(h.accountURL))
 	h.mux.HandleFunc("POST /admin/account/poll", h.withFrontend(h.accountPoll))
+	h.mux.HandleFunc("POST /admin/account/{uid}/enable", h.withFrontend(h.enableAccount))
+	h.mux.HandleFunc("POST /admin/account/{uid}/disable", h.withFrontend(h.disableAccount))
+	h.mux.HandleFunc("DELETE /admin/account/{uid}", h.withFrontend(h.deleteAccount))
 	// Static console assets are served from the image's frontend directory.
 	h.mux.Handle("/", http.FileServer(http.Dir("frontend")))
 	return h
@@ -391,6 +394,95 @@ func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "uid": result.UID, "nickname": result.Nickname})
+}
+
+func (h *Handler) enableAccount(w http.ResponseWriter, r *http.Request) {
+	uid := strings.TrimSpace(r.PathValue("uid"))
+	if uid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "账号 UID 不能为空"})
+		return
+	}
+	if h.cfg.Pool == nil || !h.cfg.Pool.Enable(uid) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "账号不存在"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "message": "账号已启用"})
+}
+
+func (h *Handler) disableAccount(w http.ResponseWriter, r *http.Request) {
+	uid := strings.TrimSpace(r.PathValue("uid"))
+	if uid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "账号 UID 不能为空"})
+		return
+	}
+	if h.cfg.Pool == nil || h.cfg.Pool.AuthByUID(uid) == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "账号不存在"})
+		return
+	}
+	h.cfg.Pool.Disable(uid, "manual disabled")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "message": "账号已禁用"})
+}
+
+func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
+	uid := strings.TrimSpace(r.PathValue("uid"))
+	if uid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "账号 UID 不能为空"})
+		return
+	}
+	if h.cfg.Pool == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "账号不存在"})
+		return
+	}
+	account := h.cfg.Pool.AuthByUID(uid)
+	if account == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "账号不存在"})
+		return
+	}
+	if removed, busy := h.cfg.Pool.Remove(uid); !removed {
+		if busy {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "账号仍有请求处理中，请稍后再删除"})
+			return
+		}
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "账号不存在"})
+		return
+	}
+	if err := h.removeAccountFile(uid, account); err != nil {
+		// 文件删除失败时恢复内存中的账号，避免控制台显示删除成功但账号仍会在下次同步出现。
+		h.cfg.Pool.Add(account)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("删除账号文件失败: %v", err)})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "message": "账号已删除"})
+}
+
+func (h *Handler) removeAccountFile(uid string, account *auth.Auth) error {
+	snapshot := account.Snapshot()
+	path := snapshot.FilePath
+	if path == "" {
+		if h.cfg.AuthDir == "" || filepath.Base(uid) != uid {
+			return nil
+		}
+		path = filepath.Join(h.cfg.AuthDir, "workbuddy-"+uid+".json")
+	}
+	if h.cfg.AuthDir == "" {
+		return fmt.Errorf("auth_dir 未配置")
+	}
+	root, err := filepath.Abs(h.cfg.AuthDir)
+	if err != nil {
+		return err
+	}
+	target, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("账号文件不在 auth_dir 内")
+	}
+	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {

@@ -59,6 +59,47 @@ func TestPickSkipsCooling(t *testing.T) {
 	}
 }
 
+func TestEnableClearsDisabledAndCoolingState(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "session dead")
+	p.Cooldown("u1", CoolSoft, time.Hour, "429")
+
+	if !p.Enable("u1") {
+		t.Fatal("enable should find account")
+	}
+	st, ok := p.Status("u1")
+	if !ok || st.Disabled || st.Cooling || st.Reason != "" {
+		t.Fatalf("enabled status=%+v", st)
+	}
+	if p.Enable("missing") {
+		t.Fatal("enable should report missing account")
+	}
+}
+
+func TestRemoveRejectsInFlightAndRemovesIdleAccount(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "busy"})
+	p.Add(&auth.Auth{UID: "idle"})
+	p.SetMaxInFlight(1)
+	if !p.Acquire("busy") {
+		t.Fatal("acquire busy account")
+	}
+	if removed, busy := p.Remove("busy"); removed || !busy {
+		t.Fatalf("remove busy=(%v,%v)", removed, busy)
+	}
+	p.Release("busy")
+	if removed, busy := p.Remove("idle"); !removed || busy {
+		t.Fatalf("remove idle=(%v,%v)", removed, busy)
+	}
+	if _, ok := p.Status("idle"); ok {
+		t.Fatal("idle account should be removed")
+	}
+	if removed, busy := p.Remove("missing"); removed || busy {
+		t.Fatalf("remove missing=(%v,%v)", removed, busy)
+	}
+}
+
 func TestPickExpiredCooldownReturnsToHealthy(t *testing.T) {
 	p := New("")
 	a1 := &auth.Auth{UID: "u1"}

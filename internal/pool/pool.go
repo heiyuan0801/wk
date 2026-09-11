@@ -803,6 +803,43 @@ func (p *Pool) Disable(uid, reason string) {
 	}
 }
 
+// Enable 手动恢复账号。清除禁用、即时冷却和熔断运行态，让账号可以立即参与选号。
+// 积分余额不在这里修改，后续请求或积分刷新会继续使用当前余额。
+func (p *Pool) Enable(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.disabled = false
+	e.reason = ""
+	e.until = time.Time{}
+	e.coolKind = 0
+	e.fails = 0
+	e.retryCount = 0
+	e.breakerUntil = time.Time{}
+	p.dirty.Store(true)
+	return true
+}
+
+// Remove 删除账号池中的账号。账号有在途请求时拒绝删除，避免请求结束时无法正确释放租约。
+// 返回值依次表示是否找到账号、是否因在途请求而繁忙。
+func (p *Pool) Remove(uid string) (removed, busy bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false, false
+	}
+	if e.inFlight.Load() > 0 {
+		return false, true
+	}
+	delete(p.byUID, uid)
+	p.dirty.Store(true)
+	return true, false
+}
+
 // reviveCoolingLocked 只清冷却（until/coolKind/reason）并更新 credits，不动熔断器
 // （fails/retryCount/breakerUntil）。签到解冻走这里：签到成功只证明余额恢复与
 // billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx 信号）不应被签到覆盖。

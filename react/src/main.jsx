@@ -6,7 +6,7 @@ import {
 } from 'antd';
 import {
   ApiOutlined, DashboardOutlined, FileSearchOutlined, KeyOutlined, ReloadOutlined, SendOutlined,
-  SettingOutlined, ToolOutlined, UnlockOutlined,
+  DeleteOutlined, SettingOutlined, StopOutlined, ToolOutlined, UnlockOutlined,
 } from '@ant-design/icons';
 import 'antd/dist/reset.css';
 import './theme.css';
@@ -55,6 +55,7 @@ function App() {
   const [requestInfo, setRequestInfo] = useState(null);
   const [metricSamples, setMetricSamples] = useState([]);
   const [creditRefreshing, setCreditRefreshing] = useState(false);
+  const [accountAction, setAccountAction] = useState('');
   const refreshController = useRef(null);
   const refreshSerial = useRef(0);
   const requestController = useRef(null);
@@ -267,6 +268,38 @@ function App() {
     }
   };
 
+  const accountActionHandler = (record, action) => {
+    const uid = record.uid || '';
+    const isDelete = action === 'delete';
+    const isEnable = action === 'enable';
+    const title = isDelete ? '确认删除账号？' : isEnable ? '确认手动启用账号？' : '确认禁用账号？';
+    const content = isDelete
+      ? `账号 ${uid.slice(0, 12)} 将从账号池和本地授权文件中删除，删除后需要重新登录才能恢复。`
+      : isEnable
+        ? `账号 ${uid.slice(0, 12)} 将清除禁用和冷却状态，并立即重新参与请求。`
+        : `账号 ${uid.slice(0, 12)} 将停止接收新请求，之后可以手动启用。`;
+    Modal.confirm({
+      title,
+      content,
+      okText: isDelete ? '删除' : isEnable ? '启用' : '禁用',
+      cancelText: '取消',
+      okButtonProps: isDelete || !isEnable ? { danger: true } : undefined,
+      onOk: async () => {
+        setAccountAction(`${uid}:${action}`);
+        try {
+          const path = isDelete ? `/admin/account/${encodeURIComponent(uid)}` : `/admin/account/${encodeURIComponent(uid)}/${action}`;
+          await api(path, { method: isDelete ? 'DELETE' : 'POST' });
+          message.success(isDelete ? '账号已删除' : isEnable ? '账号已手动启用' : '账号已禁用');
+          await refresh();
+        } catch (error) {
+          message.error(error.message);
+        } finally {
+          setAccountAction('');
+        }
+      },
+    });
+  };
+
   const columns = [
     {
       title: '账号', dataIndex: 'nickname',
@@ -284,6 +317,36 @@ function App() {
           {record.disabled ? '禁用' : record.cooling ? '冷却' : '可用'}
         </Tag>
       ),
+    },
+    {
+      title: '操作',
+      key: 'actions',
+      fixed: 'right',
+      render: (_, record) => {
+        const uid = record.uid || '';
+        const busy = accountAction.startsWith(`${uid}:`);
+        return (
+          <Space size={4}>
+            <Button
+              size="small"
+              type="link"
+              icon={record.disabled ? <UnlockOutlined /> : <StopOutlined />}
+              loading={busy}
+              onClick={() => accountActionHandler(record, record.disabled ? 'enable' : 'disable')}
+            >
+              {record.disabled ? '手动启用' : '禁用'}
+            </Button>
+            <Button
+              size="small"
+              type="link"
+              danger
+              icon={<DeleteOutlined />}
+              loading={busy}
+              onClick={() => accountActionHandler(record, 'delete')}
+            >删除</Button>
+          </Space>
+        );
+      },
     },
     { title: '可用积分', dataIndex: 'credits', render: fmt },
     {
@@ -390,7 +453,7 @@ function App() {
       key: 'pool', label: '账号池',
       children: (
         <Card title="账号状态" extra={<Space><Text type="secondary">{data.total || 0} 个账号</Text><Button size="small" icon={<ReloadOutlined />} loading={creditRefreshing} onClick={refreshCredits}>刷新上游积分</Button></Space>}>
-          <Table rowKey="uid" columns={columns} dataSource={data.accounts || []} pagination={false} scroll={{ x: 980 }} />
+          <Table rowKey="uid" columns={columns} dataSource={data.accounts || []} pagination={false} scroll={{ x: 1180 }} />
         </Card>
       ),
     },

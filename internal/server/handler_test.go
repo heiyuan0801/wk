@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -728,6 +729,54 @@ func TestStatusEndpoint(t *testing.T) {
 	}
 	if statusBody["redis_mode"] != "noop" {
 		t.Errorf("redis_mode=%v want noop", statusBody["redis_mode"])
+	}
+}
+
+func TestAdminAccountActions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "workbuddy-u1.json")
+	if err := os.WriteFile(path, []byte(`{"auth":{"accessToken":"at"},"account":{"uid":"u1"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", FilePath: path})
+	h := NewHandler(Config{Pool: p, AuthDir: dir})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/account/u1/disable", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable code=%d body=%s", rec.Code, rec.Body)
+	}
+	st, _ := p.Status("u1")
+	if !st.Disabled {
+		t.Fatalf("account should be disabled: %+v", st)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/account/u1/enable", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enable code=%d body=%s", rec.Code, rec.Body)
+	}
+	st, _ = p.Status("u1")
+	if st.Disabled {
+		t.Fatalf("account should be enabled: %+v", st)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("DELETE", "/admin/account/u1", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete code=%d body=%s", rec.Code, rec.Body)
+	}
+	if _, ok := p.Status("u1"); ok {
+		t.Fatal("account should be removed from pool")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("account file should be removed, stat err=%v", err)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/account/u1/enable", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing enable code=%d body=%s", rec.Code, rec.Body)
 	}
 }
 
