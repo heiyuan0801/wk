@@ -39,6 +39,49 @@ func TestResponsesPreservesPromptCacheFields(t *testing.T) {
 	}
 }
 
+func TestResponsesInputImageConvertsToChatImageURL(t *testing.T) {
+	body, _, err := responsesToChat([]byte(`{
+		"model":"glm-5.2",
+		"input":[{"role":"user","content":[
+			{"type":"input_text","text":"describe this"},
+			{"type":"input_image","image_url":"data:image/png;base64,AA==","detail":"high"}
+		]}]
+	}`))
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("chat body is not JSON: %v", err)
+	}
+	messages := got["messages"].([]any)
+	content := messages[0].(map[string]any)["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("content parts=%d, want 2: %#v", len(content), content)
+	}
+	image := content[1].(map[string]any)
+	if image["type"] != "image_url" {
+		t.Fatalf("converted image type=%v", image["type"])
+	}
+	imageURL := image["image_url"].(map[string]any)
+	if imageURL["url"] != "data:image/png;base64,AA==" || imageURL["detail"] != "high" {
+		t.Fatalf("converted image_url=%#v", imageURL)
+	}
+}
+
+func TestResponsesMalformedInputImageIsRejected(t *testing.T) {
+	body, _, err := responsesToChat([]byte(`{
+		"model":"glm-5.2",
+		"input":[{"role":"user","content":[{"type":"input_image","image_url":{}}]}]
+	}`))
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	if err := validateImageParts(body); err == nil {
+		t.Fatalf("malformed input_image should be rejected after conversion; body=%s", body)
+	}
+}
+
 func TestResponsesPromptCacheKeyKeepsAccountAffinity(t *testing.T) {
 	var mu sync.Mutex
 	var auths []string

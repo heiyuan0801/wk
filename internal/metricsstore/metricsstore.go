@@ -93,7 +93,8 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS request_logs (
-		id TEXT PRIMARY KEY,
+		log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id TEXT NOT NULL DEFAULT '',
 		created_at INTEGER NOT NULL,
 		route TEXT NOT NULL,
 		model TEXT NOT NULL,
@@ -124,11 +125,93 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// Older installations used the externally supplied id as the primary key.
+	// Migrate those tables to an internal row id so repeated/empty external IDs
+	// remain distinct while preserving the public id field and all rows.
+	if err := migrateRequestLogs(ctx, db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if _, err := db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS request_logs_created_at_idx ON request_logs(created_at DESC)`); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return &Store{db: db}, nil
+}
+
+func migrateRequestLogs(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(request_logs)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var hasLogID, idPrimary bool
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "log_id" {
+			hasLogID = true
+		}
+		if name == "id" && pk != 0 {
+			idPrimary = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if hasLogID || !idPrimary {
+		return nil
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `ALTER TABLE request_logs RENAME TO request_logs_legacy`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `CREATE TABLE request_logs (
+		log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		route TEXT NOT NULL,
+		model TEXT NOT NULL,
+		mode TEXT NOT NULL,
+		status INTEGER NOT NULL,
+		account_uid TEXT NOT NULL DEFAULT '',
+		requested_output_tokens INTEGER NOT NULL DEFAULT 0,
+		input_tokens INTEGER NOT NULL DEFAULT 0,
+		output_tokens INTEGER NOT NULL DEFAULT 0,
+		total_tokens INTEGER NOT NULL DEFAULT 0,
+		cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+		cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+		tool_calls INTEGER NOT NULL DEFAULT 0,
+		ttfb_millis INTEGER NOT NULL DEFAULT 0,
+		latency_millis INTEGER NOT NULL DEFAULT 0,
+		credits_consumed REAL NOT NULL DEFAULT 0,
+		credit_source TEXT NOT NULL DEFAULT '',
+		passthrough INTEGER NOT NULL DEFAULT 0,
+		error_code TEXT NOT NULL DEFAULT '',
+		error_message TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO request_logs(id, created_at, route, model, mode, status, account_uid, requested_output_tokens, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tool_calls, ttfb_millis, latency_millis, credits_consumed, credit_source, passthrough, error_code, error_message)
+		SELECT id, created_at, route, model, mode, status, account_uid, requested_output_tokens, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tool_calls, ttfb_millis, latency_millis, credits_consumed, credit_source, passthrough, error_code, error_message FROM request_logs_legacy`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DROP TABLE request_logs_legacy`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS request_logs_created_at_idx ON request_logs(created_at DESC)`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Add(delta Snapshot) error {

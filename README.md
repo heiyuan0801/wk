@@ -52,9 +52,24 @@ curl -s http://localhost:7863/v1/chat/completions \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
+### 图片请求
+
+支持 OpenAI 兼容的多模态 JSON 请求。图片可以使用公开 URL 或 Base64 data URL，建议使用上游已开放视觉能力的模型（例如 `glm-5v-turbo`）：
+
+```bash
+curl -sN http://localhost:7863/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"glm-5v-turbo","stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"请描述图片"},{"type":"image_url","image_url":{"url":"data:image/png;base64,<BASE64>"}}]}]}'
+```
+
+当前接口接收 JSON，不提供 multipart 文件上传接口；请求体上限为 8 MiB。图片模型能力由 WorkBuddy 上游账号决定，格式不完整时服务会返回 `400 invalid_image`。
+
 ## 配置说明
 
 > **权威字段定义见 [`config.example.json`](config.example.json)**：它是当前 schema 的唯一权威，下方样例与之保持一致。`cp config.example.json config.json` 即可得到完整默认配置。
+
+生产部署必须设置非空 `api_key`（也可使用 `WB2A_API_KEY` 环境变量）。配置文件缺失且没有 API key 时，服务会拒绝启动，避免意外以无鉴权模式暴露接口。
 
 ```json
 {

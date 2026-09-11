@@ -31,6 +31,24 @@ const sseOK = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\"
 	"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n" +
 	"data: [DONE]\n\n"
 
+func TestValidateImagePartsRejectsMissingURL(t *testing.T) {
+	err := validateImageParts([]byte(`{"model":"glm-5v-turbo","messages":[{"role":"user","content":[{"type":"image_url","image_url":{}}]}]}`))
+	if err == nil {
+		t.Fatal("expected malformed image part to be rejected")
+	}
+}
+
+func TestValidateImagePartsAcceptsDataURLAndFileID(t *testing.T) {
+	for _, body := range []string{
+		`{"messages":[{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}`,
+		`{"messages":[{"content":[{"type":"input_image","file_id":"file-123"}]}]}`,
+	} {
+		if err := validateImageParts([]byte(body)); err != nil {
+			t.Fatalf("valid image part rejected: %v", err)
+		}
+	}
+}
+
 // newFakeUpstream 返回一个 ChatStream 走 fake 的 upstream.Client。
 // fake 依据 Authorization 头决定行为。
 func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body string, isStream bool)) *upstream.Client {

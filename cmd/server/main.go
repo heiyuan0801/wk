@@ -120,6 +120,9 @@ func main() {
 		if os.IsNotExist(err) {
 			log.Printf("config %s not found, using defaults+env", *cfgPath)
 			cfg, err = Load("")
+			if err == nil && cfg.APIKey == "" {
+				log.Fatalf("config %s is missing and WB2A_API_KEY is not set; refusing to start without API authentication", *cfgPath)
+			}
 		}
 		if err != nil {
 			log.Fatalf("load config: %v", err)
@@ -235,6 +238,12 @@ func main() {
 		Addr:              cfg.Listen,
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
+		// Bound header memory usage for internet-facing deployments. Request
+		// bodies are limited by the handlers before they reach the upstream.
+		MaxHeaderBytes: 32 << 10,
+		// Close idle keep-alive connections periodically without affecting
+		// active streaming responses.
+		IdleTimeout: 120 * time.Second,
 	}
 	go func() {
 		<-ctx.Done()

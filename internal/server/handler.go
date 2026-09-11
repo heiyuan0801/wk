@@ -1279,6 +1279,11 @@ func responseContentToChat(content []any) []any {
 				// Some compatible providers accept uploaded image IDs in the
 				// image_url object even though the field name is historical.
 				out = append(out, map[string]any{"type": "image_url", "image_url": map[string]any{"file_id": fileID}})
+			} else {
+				// Preserve malformed image parts so the chat-path validator can
+				// return a deterministic invalid_image error instead of silently
+				// dropping the content.
+				out = append(out, map[string]any{"type": "image_url", "image_url": map[string]any{}})
 			}
 		case "input_audio", "audio":
 			audio, _ := part["input_audio"].(map[string]any)
@@ -1836,6 +1841,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
+	if err := validateImageParts(body); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_image", err.Error())
+		return
+	}
 	var peek struct {
 		Stream bool `json:"stream"`
 	}
@@ -2046,6 +2055,50 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
 	st.status = http.StatusServiceUnavailable
 	setRequestError(st, "no_healthy_account", msg)
+}
+
+// validateImageParts catches malformed multimodal parts before they reach the
+// upstream. It intentionally leaves unknown content-part types untouched for
+// provider compatibility.
+func validateImageParts(body []byte) error {
+	var doc struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil // preserve the existing upstream handling for generic JSON errors
+	}
+	for mi, message := range doc.Messages {
+		parts, ok := message["content"].([]any)
+		if !ok {
+			continue
+		}
+		for pi, raw := range parts {
+			part, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			typ, _ := part["type"].(string)
+			if typ != "image_url" && typ != "input_image" {
+				continue
+			}
+			if url, ok := part["image_url"].(string); ok && strings.TrimSpace(url) != "" {
+				continue
+			}
+			if image, ok := part["image_url"].(map[string]any); ok {
+				if url, _ := image["url"].(string); strings.TrimSpace(url) != "" {
+					continue
+				}
+				if fileID, _ := image["file_id"].(string); strings.TrimSpace(fileID) != "" {
+					continue
+				}
+			}
+			if fileID, _ := part["file_id"].(string); strings.TrimSpace(fileID) != "" {
+				continue
+			}
+			return fmt.Errorf("messages[%d].content[%d] image part requires image_url.url or file_id", mi, pi)
+		}
+	}
+	return nil
 }
 
 func setRequestError(st *chatStat, code, message string) {
