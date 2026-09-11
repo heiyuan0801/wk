@@ -144,3 +144,18 @@ func rateLimitFallbackReason(body string) string {
 	}
 	return reason + "; reset time unavailable"
 }
+
+// reasonWithModel keeps the affected model visible in the account status and
+// request logs. The model is bounded because it originates in a client request
+// and is persisted as part of the cooldown reason.
+func reasonWithModel(reason, model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" || model == "-" {
+		return reason
+	}
+	runes := []rune(model)
+	if len(runes) > 256 {
+		model = string(runes[:256])
+	}
+	return reason + "; model=" + model
+}

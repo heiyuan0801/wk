@@ -1,11 +1,14 @@
 // Package pool 账号池：单一状态机（健康/冷却/熔断）+ 在途租约 + 三因子加权挑选 + state.json 持久化。
 //
-// 每个账号只有三个正交状态维度：
+// 每个账号有三个正交的账号级状态维度，另有按模型拆分的上游限流窗口：
 //  1. 健康维度（唯一权威）：healthy = !disabled && !until 生效 && !breakerUntil 生效
-//     - until：按错误类型的即时冷却（CoolSoft 普通 429 / CoolRateLimit 上游明确恢复时间 / CoolHard 余额耗尽）
+//     - until：账号级即时冷却（CoolSoft / 旧版 CoolRateLimit / CoolHard）
 //     - breakerUntil：连续失败（fails）累计触发熔断的指数退避截止
 //  2. 并发维度：inFlight（在途租约，运行态）
 //  3. 统计维度：successCount / errTotal（累计，供成功率权重）/ lastUsed / lastSuccess / lastErr
+//
+// modelCooldowns 只影响对应模型的 healthyForModel 判断；一个模型的 6004
+// 不会让同一账号的其他模型停止服务。
 //
 // 挑选策略：healthy 账号中按三因子权重（credits 占比 ×10 + 闲置补偿 + 成功率 ×3）取 Top5，
 // 再在 Top5 内按同一三因子权重加权随机（credits 只是权重的一个因子，不单独决定短名单）。
@@ -18,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,7 +35,7 @@ type CoolKind int
 const (
 	CoolHard      CoolKind = iota // 余额不足 → 冷却到次日 04:00（等签到恢复）
 	CoolSoft                      // 429 → 短冷却
-	CoolRateLimit                 // 上游 6004/明确恢复时间的限流 → 到指定时间，期间不参与兜底
+	CoolRateLimit                 // 兼容旧状态的账号级明确限流；新请求使用 modelCooldowns
 )
 
 func (k CoolKind) String() string {
@@ -46,28 +50,36 @@ func (k CoolKind) String() string {
 	return "unknown"
 }
 
+// ModelCooldownStatus 单个模型的上游限流状态（脱敏）。
+type ModelCooldownStatus struct {
+	Until        time.Time `json:"until"`
+	RemainingSec int64     `json:"remaining_sec"`
+	Reason       string    `json:"reason,omitempty"`
+}
+
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID                 string    `json:"uid"`
-	Nickname            string    `json:"nickname,omitempty"`
-	Credits             int64     `json:"credits"`
-	CapacitySize        int64     `json:"capacity_size,omitempty"`
-	CapacityRemain      int64     `json:"capacity_remain,omitempty"`
-	CapacityUsed        int64     `json:"capacity_used,omitempty"`
-	CycleCapacitySize   int64     `json:"cycle_capacity_size,omitempty"`
-	CycleCapacityRemain int64     `json:"cycle_capacity_remain,omitempty"`
-	CycleCapacityUsed   int64     `json:"cycle_capacity_used,omitempty"`
-	CreditUpdatedAt     int64     `json:"credit_updated_at,omitempty"`
-	Cooling             bool      `json:"cooling"`
-	CoolKind            string    `json:"cool_kind,omitempty"`
-	CoolRemaining       int64     `json:"cool_remaining_sec,omitempty"`
-	Until               time.Time `json:"until,omitempty"`
-	Reason              string    `json:"reason,omitempty"`
-	Disabled            bool      `json:"disabled"`
-	SuccessCount        int64     `json:"success_count,omitempty"`
-	ErrTotal            int64     `json:"err_total,omitempty"`
-	LastSuccessTime     time.Time `json:"last_success,omitempty"`
-	LastErrTime         time.Time `json:"last_err,omitempty"`
+	UID                 string                         `json:"uid"`
+	Nickname            string                         `json:"nickname,omitempty"`
+	Credits             int64                          `json:"credits"`
+	CapacitySize        int64                          `json:"capacity_size,omitempty"`
+	CapacityRemain      int64                          `json:"capacity_remain,omitempty"`
+	CapacityUsed        int64                          `json:"capacity_used,omitempty"`
+	CycleCapacitySize   int64                          `json:"cycle_capacity_size,omitempty"`
+	CycleCapacityRemain int64                          `json:"cycle_capacity_remain,omitempty"`
+	CycleCapacityUsed   int64                          `json:"cycle_capacity_used,omitempty"`
+	CreditUpdatedAt     int64                          `json:"credit_updated_at,omitempty"`
+	Cooling             bool                           `json:"cooling"`
+	CoolKind            string                         `json:"cool_kind,omitempty"`
+	CoolRemaining       int64                          `json:"cool_remaining_sec,omitempty"`
+	Until               time.Time                      `json:"until,omitempty"`
+	Reason              string                         `json:"reason,omitempty"`
+	Disabled            bool                           `json:"disabled"`
+	ModelCooldowns      map[string]ModelCooldownStatus `json:"model_cooldowns,omitempty"`
+	SuccessCount        int64                          `json:"success_count,omitempty"`
+	ErrTotal            int64                          `json:"err_total,omitempty"`
+	LastSuccessTime     time.Time                      `json:"last_success,omitempty"`
+	LastErrTime         time.Time                      `json:"last_err,omitempty"`
 
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
@@ -105,6 +117,7 @@ type entry struct {
 	until               time.Time // 冷却截止（即时冷却：CoolSoft / CoolRateLimit / CoolHard）
 	disabled            bool
 	reason              string
+	modelCooldowns      map[string]modelCooldown
 	lastUsed            time.Time // 最近被选中时刻（防并发撞号）
 
 	// breakerUntil / fails / retryCount 为熔断器运行态（不持久化）。
@@ -116,6 +129,30 @@ type entry struct {
 
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
+}
+
+// modelCooldown 是模型级限流的内部/持久化表示。
+// 模型限流不会修改 entry 的账号级 until/coolKind，避免一个模型的 6004
+// 把同一账号提供的其他模型一起摘除。
+type modelCooldown struct {
+	Until  time.Time `json:"until"`
+	Reason string    `json:"reason,omitempty"`
+}
+
+const maxModelCooldownKeyRunes = 256
+
+// normalizeModel 规范化用于路由和持久化的模型键。缺省模型（日志中的 "-"）
+// 不建立模型级状态，避免无效请求污染状态表。
+func normalizeModel(model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" || model == "-" {
+		return ""
+	}
+	runes := []rune(model)
+	if len(runes) > maxModelCooldownKeyRunes {
+		model = string(runes[:maxModelCooldownKeyRunes])
+	}
+	return model
 }
 
 // healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期）。
@@ -132,6 +169,22 @@ func (e *entry) healthy(now time.Time) bool {
 	return true
 }
 
+// modelCooldownActive 报告指定模型是否处于模型级限流窗口。
+func (e *entry) modelCooldownActive(model string, now time.Time) bool {
+	model = normalizeModel(model)
+	if model == "" {
+		return false
+	}
+	c, ok := e.modelCooldowns[model]
+	return ok && !c.Until.IsZero() && now.Before(c.Until)
+}
+
+// healthyForModel 报告账号对指定模型是否可选。账号级状态和模型级状态
+// 必须同时通过；其他模型的限流不会影响本次请求。
+func (e *entry) healthyForModel(model string, now time.Time) bool {
+	return e.healthy(now) && !e.modelCooldownActive(model, now)
+}
+
 // expiry 返回账号当前仍在生效的最近冷却/熔断截止时间（两个截止取较早者）；不在冷却期返回零值。
 // 供全冷却兜底选取"最早到期"账号用。
 func (e *entry) expiry(now time.Time) time.Time {
@@ -142,6 +195,20 @@ func (e *entry) expiry(now time.Time) time.Time {
 	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
 		if t.IsZero() || e.breakerUntil.Before(t) {
 			t = e.breakerUntil
+		}
+	}
+	return t
+}
+
+// expiryForModel 返回指定模型相关的最近到期时间，供模型级兜底选择使用。
+func (e *entry) expiryForModel(model string, now time.Time) time.Time {
+	t := e.expiry(now)
+	model = normalizeModel(model)
+	if model != "" {
+		if c, ok := e.modelCooldowns[model]; ok && !c.Until.IsZero() && now.Before(c.Until) {
+			if t.IsZero() || c.Until.Before(t) {
+				t = c.Until
+			}
 		}
 	}
 	return t
@@ -161,19 +228,20 @@ func (e *entry) fallbackKind(now time.Time) string {
 
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
-	Credits             int64     `json:"credits"`
-	CapacitySize        int64     `json:"capacity_size,omitempty"`
-	CapacityRemain      int64     `json:"capacity_remain,omitempty"`
-	CapacityUsed        int64     `json:"capacity_used,omitempty"`
-	CycleCapacitySize   int64     `json:"cycle_capacity_size,omitempty"`
-	CycleCapacityRemain int64     `json:"cycle_capacity_remain,omitempty"`
-	CycleCapacityUsed   int64     `json:"cycle_capacity_used,omitempty"`
-	CreditUpdatedAt     time.Time `json:"credit_updated_at,omitempty"`
-	Disabled            bool      `json:"disabled"`
-	Reason              string    `json:"reason,omitempty"`
-	Until               time.Time `json:"until,omitempty"`
-	CoolKind            CoolKind  `json:"cool_kind"`
-	SuccessCount        int64     `json:"success_count,omitempty"`
+	Credits             int64                    `json:"credits"`
+	CapacitySize        int64                    `json:"capacity_size,omitempty"`
+	CapacityRemain      int64                    `json:"capacity_remain,omitempty"`
+	CapacityUsed        int64                    `json:"capacity_used,omitempty"`
+	CycleCapacitySize   int64                    `json:"cycle_capacity_size,omitempty"`
+	CycleCapacityRemain int64                    `json:"cycle_capacity_remain,omitempty"`
+	CycleCapacityUsed   int64                    `json:"cycle_capacity_used,omitempty"`
+	CreditUpdatedAt     time.Time                `json:"credit_updated_at,omitempty"`
+	Disabled            bool                     `json:"disabled"`
+	Reason              string                   `json:"reason,omitempty"`
+	Until               time.Time                `json:"until,omitempty"`
+	CoolKind            CoolKind                 `json:"cool_kind"`
+	ModelCooldowns      map[string]modelCooldown `json:"model_cooldowns,omitempty"`
+	SuccessCount        int64                    `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
 	ErrTotal    int64     `json:"err_total,omitempty"`
@@ -469,23 +537,38 @@ func (p *Pool) upsertLocked(a *auth.Auth) {
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。
 func (p *Pool) Pick() *auth.Auth {
-	return p.PickExcluding(nil)
+	return p.PickForModelExcluding("", nil)
 }
 
 // PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
 // 挑选策略：healthy 账号中按三因子权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
 // 意图是打散热点，避免永远打同一个账号。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	return p.pick(tried)
+	return p.PickForModelExcluding("", tried)
 }
 
-// pick 在 healthy 候选集中按三因子权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
+// PickForModel 按指定模型挑选账号。模型级限流只影响该模型，账号级状态仍对所有模型生效。
+func (p *Pool) PickForModel(model string) *auth.Auth {
+	return p.PickForModelExcluding(model, nil)
+}
+
+// PickForModelExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
+func (p *Pool) PickForModelExcluding(model string, tried map[string]bool) *auth.Auth {
+	return p.pickForModel(normalizeModel(model), tried)
+}
+
+// pick 保留给包内旧调用点，使用不带模型过滤的账号级选择。
+func (p *Pool) pick(tried map[string]bool) *auth.Auth {
+	return p.pickForModel("", tried)
+}
+
+// pickForModel 在 healthy 候选集中按三因子权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
 // 候选集是 top5 近似：先按三因子权重（weightOf）降序取前 5（credits 只是权重的一个因子，
 // 闲置补偿与成功率同样决定谁进短名单），再在 top5 内做防撞号过滤。
 // 并发防雪崩：跳过 lastUsed 距今 < minPickGap 的账号；Top5 全部刚被用过时扩展到
 // 完整健康候选集，仍无可选账号才退回全局 LRU，迫使高并发请求发散。
 // minPickGap=0（测试用）时过滤恒通过，退化为纯加权随机。
-func (p *Pool) pick(tried map[string]bool) *auth.Auth {
+func (p *Pool) pickForModel(model string, tried map[string]bool) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -495,7 +578,7 @@ func (p *Pool) pick(tried map[string]bool) *auth.Auth {
 		if tried != nil && tried[uid] {
 			continue
 		}
-		if !e.healthy(now) {
+		if !e.healthyForModel(model, now) {
 			continue
 		}
 		if p.inFlightFull(e) {
@@ -506,7 +589,7 @@ func (p *Pool) pick(tried map[string]bool) *auth.Auth {
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now)
+		return p.pickEarliestExpiryLocked(model, tried, now)
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
@@ -591,10 +674,10 @@ func (p *Pool) markUsedLocked(e *entry) {
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的普通软冷却/熔断账号中选截止最早的一个。
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
-// CoolRateLimit（上游明确给出恢复时间）也排除——恢复前重试必然再次限流；CoolSoft 与熔断号允许参与
-// （可能已恢复，失败成本仅一轮换）。
+// 账号级 CoolRateLimit 与当前模型的 modelCooldown 也排除——恢复前重试必然再次限流；
+// CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time) *auth.Auth {
+func (p *Pool) pickEarliestExpiryLocked(model string, tried map[string]bool, now time.Time) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -609,21 +692,24 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time) *a
 		if e.coolKind == CoolRateLimit && !e.until.IsZero() && now.Before(e.until) {
 			continue // 上游明确限流号在 reset 前不可用，禁止兜底重试
 		}
+		if e.modelCooldownActive(model, now) {
+			continue // 当前模型处于上游限流窗口，禁止对同一模型兜底重试
+		}
 		if p.inFlightFull(e) {
 			continue
 		}
-		exp := e.expiry(now)
+		exp := e.expiryForModel(model, now)
 		if exp.IsZero() {
 			continue
 		}
-		if best == nil || exp.Before(best.expiry(now)) {
+		if best == nil || exp.Before(best.expiryForModel(model, now)) {
 			best = e
 		}
 	}
 	if best == nil {
 		return nil
 	}
-	log.Printf("pool: fallback_earliest_expiry uid=%s until=%s kind=%s", best.a.UID, best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
+	log.Printf("pool: fallback_earliest_expiry uid=%s model=%s until=%s kind=%s", best.a.UID, model, best.expiryForModel(model, now).Format(time.RFC3339), best.fallbackKind(now))
 	p.markUsedLocked(best)
 	return best.a
 }
@@ -750,14 +836,14 @@ func (p *Pool) SetCreditDetail(uid string, detail CreditDetail) {
 	}
 }
 
-// Cooldown 冷却账号至 now+d（即时冷却：CoolSoft 普通 429 / CoolRateLimit 上游限流 / CoolHard 余额耗尽）。
+// Cooldown 冷却账号至 now+d（账号级即时冷却）。模型相关的限流请使用 CooldownModel。
 func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason string) {
 	p.CooldownUntil(uid, kind, time.Now().Add(d), reason)
 }
 
 // CooldownUntil 冷却账号到绝对时间点。
-// CoolRateLimit 用于上游返回的明确 reset 时间：它不参与全冷却兜底，且不喂熔断器，
-// 避免并发请求把一个可预期的限流误判成持续故障，导致恢复时间被熔断器继续推迟。
+// CoolRateLimit 是兼容旧调用点的账号级明确限流状态：它不参与全冷却兜底，且不喂熔断器。
+// 新的带模型请求应使用 CooldownModelUntil，将窗口隔离到具体模型。
 func (p *Pool) CooldownUntil(uid string, kind CoolKind, until time.Time, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -774,6 +860,52 @@ func (p *Pool) CooldownUntil(uid string, kind CoolKind, until time.Time, reason 
 		}
 		p.dirty.Store(true)
 	}
+}
+
+// CooldownModel 冷却指定账号的指定模型。模型级限流不会修改账号级冷却状态，
+// 因此同一账号的其他模型仍可参与选号。
+func (p *Pool) CooldownModel(uid, model string, d time.Duration, reason string) {
+	p.CooldownModelUntil(uid, model, time.Now().Add(d), reason)
+}
+
+// CooldownModelUntil 将指定账号的指定模型冷却到绝对时间点。
+// 并发响应只允许延长同一模型的截止时间，不会缩短已经观察到的上游 reset 窗口。
+// 该状态不喂账号级熔断器：6004 是可预测的模型配额窗口，不代表账号或其他模型故障。
+func (p *Pool) CooldownModelUntil(uid, model string, until time.Time, reason string) {
+	model = normalizeModel(model)
+	if model == "" {
+		// 缺少模型时无法安全隔离限流范围，退回旧的账号级语义，避免继续重试未知目标。
+		p.CooldownUntil(uid, CoolRateLimit, until, reason)
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	now := time.Now()
+	if until.IsZero() || !now.Before(until) {
+		if e.modelCooldowns != nil {
+			if _, exists := e.modelCooldowns[model]; exists {
+				delete(e.modelCooldowns, model)
+				if len(e.modelCooldowns) == 0 {
+					e.modelCooldowns = nil
+				}
+				p.dirty.Store(true)
+			}
+		}
+		return
+	}
+	if e.modelCooldowns == nil {
+		e.modelCooldowns = make(map[string]modelCooldown)
+	}
+	if current, exists := e.modelCooldowns[model]; exists && current.Until.After(until) && now.Before(current.Until) {
+		return
+	}
+	e.modelCooldowns[model] = modelCooldown{Until: until, Reason: reason}
+	p.dirty.Store(true)
 }
 
 // recordBreakerFailureLocked 累计一次熔断失败；达到阈值则按指数退避熔断。
@@ -822,7 +954,7 @@ func (p *Pool) Disable(uid, reason string) {
 	}
 }
 
-// Enable 手动恢复账号。清除禁用、即时冷却和熔断运行态，让账号可以立即参与选号。
+// Enable 手动恢复账号。清除禁用、账号级/模型级即时冷却和熔断运行态，让账号可以立即参与选号。
 // 积分余额不在这里修改，后续请求或积分刷新会继续使用当前余额。
 func (p *Pool) Enable(uid string) bool {
 	p.mu.Lock()
@@ -835,6 +967,7 @@ func (p *Pool) Enable(uid string) bool {
 	e.reason = ""
 	e.until = time.Time{}
 	e.coolKind = 0
+	e.modelCooldowns = nil
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
@@ -964,8 +1097,15 @@ func (p *Pool) AvailableUIDs() []string {
 }
 
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
-// 否则返回 nil。供会话粘性路由命中校验与直取使用。
+// 否则返回 nil。供不带模型上下文的调用点使用。
 func (p *Pool) PickByUID(uid string) *auth.Auth {
+	return p.PickByUIDForModel(uid, "")
+}
+
+// PickByUIDForModel 按指定模型直取账号。账号级状态和该模型的限流状态
+// 任一生效时都返回 nil，其他模型的限流不影响本次直取。
+func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
+	model = normalizeModel(model)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -973,7 +1113,7 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 		return nil
 	}
 	now := time.Now()
-	if !e.healthy(now) {
+	if !e.healthyForModel(model, now) {
 		return nil
 	}
 	if p.inFlightFull(e) {
@@ -1076,6 +1216,24 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		}
 		st.CoolKind = e.coolKind.String()
 	}
+	for model, cooldown := range e.modelCooldowns {
+		if cooldown.Until.IsZero() || !now.Before(cooldown.Until) {
+			continue
+		}
+		remaining := cooldown.Until.Sub(now)
+		remainingSec := int64((remaining + time.Second - 1) / time.Second)
+		if remainingSec < 1 {
+			remainingSec = 1
+		}
+		if st.ModelCooldowns == nil {
+			st.ModelCooldowns = make(map[string]ModelCooldownStatus)
+		}
+		st.ModelCooldowns[model] = ModelCooldownStatus{
+			Until:        cooldown.Until,
+			RemainingSec: remainingSec,
+			Reason:       cooldown.Reason,
+		}
+	}
 	return st
 }
 
@@ -1119,12 +1277,59 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			reason:              s.Reason,
 			until:               s.Until,
 			coolKind:            s.CoolKind,
+			modelCooldowns:      loadModelCooldowns(s.ModelCooldowns),
 			successCount:        s.SuccessCount,
 			errTotal:            errTotal,
 			lastErr:             s.LastErr,
 			lastSuccess:         s.LastSuccess,
 		}
 	}
+}
+
+// loadModelCooldowns copies and normalizes persisted model cooldowns. Expired
+// entries are discarded during load so a long-lived state file does not retain
+// obsolete model names forever.
+func loadModelCooldowns(saved map[string]modelCooldown) map[string]modelCooldown {
+	if len(saved) == 0 {
+		return nil
+	}
+	now := time.Now()
+	loaded := make(map[string]modelCooldown, len(saved))
+	for model, cooldown := range saved {
+		model = normalizeModel(model)
+		if model == "" || cooldown.Until.IsZero() || !now.Before(cooldown.Until) {
+			continue
+		}
+		if current, exists := loaded[model]; !exists || cooldown.Until.After(current.Until) {
+			loaded[model] = cooldown
+		}
+	}
+	if len(loaded) == 0 {
+		return nil
+	}
+	return loaded
+}
+
+// saveModelCooldowns copies only active model cooldowns into the persistent
+// representation. Expired windows recover automatically and are omitted on
+// the next flush.
+func saveModelCooldowns(cooldowns map[string]modelCooldown) map[string]modelCooldown {
+	if len(cooldowns) == 0 {
+		return nil
+	}
+	now := time.Now()
+	saved := make(map[string]modelCooldown, len(cooldowns))
+	for model, cooldown := range cooldowns {
+		model = normalizeModel(model)
+		if model == "" || cooldown.Until.IsZero() || !now.Before(cooldown.Until) {
+			continue
+		}
+		saved[model] = cooldown
+	}
+	if len(saved) == 0 {
+		return nil
+	}
+	return saved
 }
 
 // applySnapshotLocked 用 Redis 快照覆盖内存状态（已在择新判定后采用）。调用方必须已持有 p.mu。
@@ -1201,6 +1406,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			Reason:              e.reason,
 			Until:               e.until,
 			CoolKind:            e.coolKind,
+			ModelCooldowns:      saveModelCooldowns(e.modelCooldowns),
 			SuccessCount:        e.successCount,
 			ErrTotal:            e.errTotal,
 			LastSuccess:         e.lastSuccess,

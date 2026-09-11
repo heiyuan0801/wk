@@ -21,6 +21,15 @@ func withNoPickGap(t *testing.T) {
 	t.Cleanup(func() { minPickGap = old })
 }
 
+func modelTestPool(auths ...*auth.Auth) *Pool {
+	p := New("")
+	for _, a := range auths {
+		p.Add(a)
+		p.SetCredits(a.UID, 1000)
+	}
+	return p
+}
+
 func TestPickHighestCredits(t *testing.T) {
 	withNoPickGap(t)
 	// 三因子加权（credits 比例×10 + 闲置 + 成功率）：积分悬殊时高积分账号应被多数选中，
@@ -422,6 +431,85 @@ func TestExplicitRateLimitPersistsAcrossReload(t *testing.T) {
 	}
 	if got := p2.Pick(); got != nil {
 		t.Fatalf("reloaded rate-limited account must stay out of fallback, got %+v", got)
+	}
+}
+
+func TestModelRateLimitOnlyBlocksAffectedModel(t *testing.T) {
+	p := modelTestPool(
+		&auth.Auth{UID: "u1"},
+		&auth.Auth{UID: "u2"},
+	)
+	reset := time.Now().Add(time.Hour)
+	p.CooldownModelUntil("u1", "deepseek-v4.1-flash", reset, "code=6004; model=deepseek-v4.1-flash")
+
+	if got := p.PickByUIDForModel("u1", "deepseek-v4.1-flash"); got != nil {
+		t.Fatalf("limited model should not use u1, got %+v", got)
+	}
+	if got := p.PickByUIDForModel("u1", "deepseek-v4"); got == nil || got.UID != "u1" {
+		t.Fatalf("other model should still use u1, got %+v", got)
+	}
+	if got := p.PickForModel("deepseek-v4.1-flash"); got == nil || got.UID != "u2" {
+		t.Fatalf("limited model should rotate to u2, got %+v", got)
+	}
+
+	status, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("u1 status missing")
+	}
+	if status.Cooling {
+		t.Fatalf("model cooldown must not mark the whole account cooling: %+v", status)
+	}
+	limit, ok := status.ModelCooldowns["deepseek-v4.1-flash"]
+	if !ok || !limit.Until.Equal(reset) || limit.RemainingSec <= 0 {
+		t.Fatalf("model cooldown status missing or invalid: %+v", status)
+	}
+}
+
+func TestModelRateLimitExpiresAutomatically(t *testing.T) {
+	p := modelTestPool(&auth.Auth{UID: "u1"})
+	p.CooldownModel("u1", "model-a", 20*time.Millisecond, "code=6004")
+	if got := p.PickForModel("model-a"); got != nil {
+		t.Fatalf("model-a should be unavailable during cooldown, got %+v", got)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if got := p.PickForModel("model-a"); got == nil || got.UID != "u1" {
+		t.Fatalf("model-a should recover after reset, got %+v", got)
+	}
+}
+
+func TestModelRateLimitPersistsAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	reset := time.Now().Add(time.Hour)
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownModelUntil("u1", "model-a", reset, "code=6004; model=model-a")
+	p.Flush()
+
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	if got := p2.PickForModel("model-a"); got != nil {
+		t.Fatalf("reloaded model cooldown should block model-a, got %+v", got)
+	}
+	if got := p2.PickForModel("model-b"); got == nil || got.UID != "u1" {
+		t.Fatalf("reloaded model cooldown should not block model-b, got %+v", got)
+	}
+	status, ok := p2.Status("u1")
+	if !ok || len(status.ModelCooldowns) != 1 {
+		t.Fatalf("model cooldown was not restored: %+v ok=%v", status, ok)
+	}
+}
+
+func TestCreditRefreshDoesNotBypassModelRateLimit(t *testing.T) {
+	p := modelTestPool(&auth.Auth{UID: "u1"})
+	p.CooldownModelUntil("u1", "model-a", time.Now().Add(time.Hour), "code=6004")
+	p.SetCreditDetail("u1", CreditDetail{Remaining: 500})
+
+	if got := p.PickForModel("model-a"); got != nil {
+		t.Fatalf("credit refresh must not bypass model cooldown, got %+v", got)
+	}
+	if got := p.PickForModel("model-b"); got == nil || got.UID != "u1" {
+		t.Fatalf("credit refresh should leave other model available, got %+v", got)
 	}
 }
 

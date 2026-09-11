@@ -1,7 +1,9 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -90,17 +92,18 @@ func TestChatRateLimitUsesResetAndSkipsAccountUntilReset(t *testing.T) {
 	}
 
 	status, ok := p.Status("u1")
-	if !ok || !status.Cooling {
-		t.Fatalf("account should be cooling: %+v ok=%v", status, ok)
+	if !ok || status.Cooling {
+		t.Fatalf("model-only limit must not cool the whole account: %+v ok=%v", status, ok)
 	}
-	if status.CoolKind != "rate_limit" {
-		t.Fatalf("cool_kind=%q want rate_limit: %+v", status.CoolKind, status)
+	modelLimit, ok := status.ModelCooldowns["deepseek-v4.1-flash"]
+	if !ok {
+		t.Fatalf("model cooldown missing: %+v", status)
 	}
-	if delta := status.Until.Sub(reset); delta < -2*time.Second || delta > 2*time.Second {
-		t.Fatalf("until=%v expected near reset=%v (delta=%v)", status.Until, reset, delta)
+	if delta := modelLimit.Until.Sub(reset); delta < -2*time.Second || delta > 2*time.Second {
+		t.Fatalf("model until=%v expected near reset=%v (delta=%v)", modelLimit.Until, reset, delta)
 	}
-	if !strings.Contains(status.Reason, "6004") || !strings.Contains(status.Reason, "reset_at=") {
-		t.Fatalf("reason should expose reset metadata: %q", status.Reason)
+	if !strings.Contains(modelLimit.Reason, "6004") || !strings.Contains(modelLimit.Reason, "reset_at=") || !strings.Contains(modelLimit.Reason, "model=deepseek-v4.1-flash") {
+		t.Fatalf("model reason should expose reset metadata: %q", modelLimit.Reason)
 	}
 
 	// While the upstream window is active, a later request must fail locally
@@ -132,7 +135,187 @@ func TestChatRateLimitWithoutResetUsesStrictFallback(t *testing.T) {
 		t.Fatalf("6004 without reset must still avoid retries, calls=%d", calls)
 	}
 	status, _ := p.Status("u1")
-	if status.CoolKind != "rate_limit" || !strings.Contains(status.Reason, "reset time unavailable") {
-		t.Fatalf("strict fallback status=%+v", status)
+	modelLimit, ok := status.ModelCooldowns["deepseek-v4.1-flash"]
+	if status.Cooling || !ok || !strings.Contains(modelLimit.Reason, "reset time unavailable") {
+		t.Fatalf("strict model fallback status=%+v", status)
+	}
+}
+
+func TestChatRateLimitLeavesOtherModelAvailableOnSameAccount(t *testing.T) {
+	const limitedModel = "deepseek-v4.1-flash"
+	const otherModel = "deepseek-v4"
+	reset := time.Now().Add(2 * time.Hour).In(time.FixedZone("UTC+8", 8*60*60)).Truncate(time.Second)
+	body := fmt.Sprintf(`{"code":6004,"msg":"将在 %s UTC+8 重置"}`, reset.Format("2006-01-02 15:04:05"))
+	var calls = map[string]int{}
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 500, "unused", false })
+	up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		var request struct {
+			Model string `json:"model"`
+		}
+		if err := json.Unmarshal(raw, &request); err != nil {
+			return nil, err
+		}
+		calls[request.Model]++
+		if request.Model == limitedModel {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(sseOK)),
+		}, nil
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 3})
+
+	request := func(model string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		payload := fmt.Sprintf(`{"model":%q,"messages":[]}`, model)
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(payload)))
+		return rec
+	}
+	if rec := request(limitedModel); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("limited model code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls[limitedModel] != 1 {
+		t.Fatalf("limited model should reach upstream once, calls=%d", calls[limitedModel])
+	}
+	if rec := request(otherModel); rec.Code != http.StatusOK {
+		t.Fatalf("other model should use the same account, code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls[otherModel] != 1 {
+		t.Fatalf("other model should reach upstream once, calls=%d", calls[otherModel])
+	}
+	if rec := request(limitedModel); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("limited model should stay blocked locally, code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls[limitedModel] != 1 {
+		t.Fatalf("limited model was retried before reset, calls=%d", calls[limitedModel])
+	}
+}
+
+func TestGenericRateLimitUsesModelScopeWhenModelPresent(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 500, "unused", false })
+	up.HTTP.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":"too many requests"}`)),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(sseOK)),
+		}, nil
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 2, SoftCooldown: time.Hour})
+
+	request := func(model string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		payload := fmt.Sprintf(`{"model":%q,"messages":[]}`, model)
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(payload)))
+		return rec
+	}
+	if rec := request("model-a"); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("limited model code=%d body=%s", rec.Code, rec.Body)
+	}
+	if rec := request("model-b"); rec.Code != http.StatusOK {
+		t.Fatalf("other model code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls != 2 {
+		t.Fatalf("expected one upstream call per model, calls=%d", calls)
+	}
+	status, _ := p.Status("u1")
+	if status.Cooling || len(status.ModelCooldowns) != 1 {
+		t.Fatalf("generic 429 should leave account available and record one model limit: %+v", status)
+	}
+}
+
+func TestRateLimitUsesCanonicalModelIDForAliases(t *testing.T) {
+	reset := time.Now().Add(time.Hour).In(time.FixedZone("UTC+8", 8*60*60)).Truncate(time.Second)
+	body := fmt.Sprintf(`{"code":6004,"msg":"将在 %s UTC+8 重置"}`, reset.Format("2006-01-02 15:04:05"))
+	var calls int
+	var upstreamModels []string
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 500, "unused", false })
+	up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		var request struct {
+			Model string `json:"model"`
+		}
+		if err := json.Unmarshal(raw, &request); err != nil {
+			return nil, err
+		}
+		upstreamModels = append(upstreamModels, request.Model)
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 2})
+	request := func(model string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		payload := fmt.Sprintf(`{"model":%q,"messages":[]}`, model)
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(payload)))
+		return rec
+	}
+	if rec := request("kimi-k3-1"); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("alias request code=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(upstreamModels) != 1 || upstreamModels[0] != "kimi-k3" {
+		t.Fatalf("upstream should receive canonical model, got %v", upstreamModels)
+	}
+	if rec := request("kimi-k3"); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("canonical request code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls != 1 {
+		t.Fatalf("alias and canonical requests should share one cooldown, calls=%d", calls)
+	}
+	status, _ := p.Status("u1")
+	if _, ok := status.ModelCooldowns["kimi-k3"]; !ok {
+		t.Fatalf("canonical model cooldown missing: %+v", status)
+	}
+	if _, ok := status.ModelCooldowns["kimi-k3-1"]; ok {
+		t.Fatalf("alias key should not create a separate cooldown: %+v", status)
+	}
+}
+
+func TestResponsesRateLimitUsesModelScope(t *testing.T) {
+	reset := time.Now().Add(time.Hour).In(time.FixedZone("UTC+8", 8*60*60)).Truncate(time.Second)
+	body := fmt.Sprintf(`{"code":6004,"msg":"将在 %s UTC+8 重置"}`, reset.Format("2006-01-02 15:04:05"))
+	var calls int
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls++
+		return http.StatusServiceUnavailable, body, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 2})
+	if rec := doResponsesRequest(h, `{"model":"deepseek-v4.1-flash","input":"hello"}`); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("responses code=%d body=%s", rec.Code, rec.Body)
+	}
+	status, _ := p.Status("u1")
+	if status.Cooling || len(status.ModelCooldowns) != 1 {
+		t.Fatalf("Responses rate limit should be model-scoped: %+v", status)
+	}
+	if calls != 1 {
+		t.Fatalf("Responses should not retry the limited model, calls=%d", calls)
 	}
 }

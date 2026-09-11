@@ -332,20 +332,30 @@ function App() {
       title: '状态',
       render: (_, record) => {
         const rateLimited = record.cool_kind === 'rate_limit';
+        const modelLimits = Object.entries(record.model_cooldowns || {});
         const until = record.cooling && record.until ? new Date(record.until) : null;
-        const title = record.cooling || record.disabled
+        const modelLimitText = modelLimits.map(([model, limit]) => {
+          const modelUntil = limit?.until ? new Date(limit.until) : null;
+          const recovery = modelUntil && !Number.isNaN(modelUntil.getTime()) && modelUntil.getFullYear() > 1
+            ? `恢复：${modelUntil.toLocaleString()}`
+            : (Number(limit?.remaining_sec) > 0 ? `${limit.remaining_sec} 秒后重试` : '等待上游恢复');
+          return `${model}：${limit?.reason || '上游限流'}（${recovery}）`;
+        });
+        const modelCooling = modelLimits.length > 0;
+        const title = record.cooling || record.disabled || modelCooling
           ? [
             record.reason,
             until && !Number.isNaN(until.getTime()) && until.getFullYear() > 1
               && `恢复：${until.toLocaleString()}`,
+            modelLimitText.length > 0 && `模型限流：\n${modelLimitText.join('\n')}`,
           ].filter(Boolean).join('\n')
           : '';
         return (
           <Tag
-            color={record.disabled ? 'red' : record.cooling ? 'orange' : 'green'}
+            color={record.disabled ? 'red' : record.cooling ? 'orange' : modelCooling ? 'gold' : 'green'}
             title={title || undefined}
           >
-            {record.disabled ? '禁用' : record.cooling ? (rateLimited ? '上游限流' : '冷却') : '可用'}
+            {record.disabled ? '禁用' : record.cooling ? (rateLimited ? '上游限流' : '冷却') : modelCooling ? '模型限流' : '可用'}
           </Tag>
         );
       },

@@ -1647,6 +1647,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	passthrough := h.requestPassthrough(r)
 	st := newChatStatWithOptions(time.Now(), body, peek.Stream, h.cfg.MetricsStore, h.cfg.RequestLogStore, h.cfg.CreditPolicy, passthrough, r.URL.Path)
 	defer st.done()
+	// The upstream client canonicalizes public aliases before sending the body.
+	// Use the same canonical ID for model-level routing/cooldowns so a limit
+	// learned from kimi-k3-1 also applies to the upstream kimi-k3 request.
+	routeModel := upstream.NormalizeModelID(st.model)
 
 	tried := map[string]bool{}
 	var lastErr error
@@ -1686,10 +1690,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		// 选号：粘性号优先（PickByUID 已校验 health + 在途未满），否则普通轮换。
+		// 选号：粘性号优先（同时校验账号级状态和当前模型限流），否则按当前模型轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUID(stickyUID)
+			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, routeModel)
 			if acct == nil {
 				// 粘性号当前不可用（冷却/占满）→ 解绑，本次回落普通轮换。
 				h.cfg.Session.Unbind(sessKey)
@@ -1697,7 +1701,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickExcluding(tried)
+			acct = h.cfg.Pool.PickForModelExcluding(routeModel, tried)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -1758,7 +1762,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			kind := upstream.Classify(status, bodyText)
 			setRequestError(st, kind.String(), bodyText)
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: bodyText}
-			h.applyErrorPolicy(acct.UID, kind, bodyText)
+			h.applyErrorPolicy(acct.UID, routeModel, kind, bodyText)
 			fail(acct.UID)
 			continue
 		}
@@ -1862,16 +1866,17 @@ func (h *Handler) requestPassthrough(r *http.Request) bool {
 //
 // 五条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - 普通 ErrSoftRate / ErrNotFound → Cooldown(CoolSoft)：即时软冷却（429/404）。
-//     上游 code=6004 或带 reset 时间的限流 → CoolRateLimit：精确冷却到 reset，期间不兜底重试。
+//   - ErrSoftRate：有模型上下文时只冷却该模型；无模型时退回账号级 CoolSoft/CoolRateLimit。
+//     上游 code=6004 或带 reset 时间的限流 → 精确冷却到 reset，期间不对该模型兜底重试。
+//   - ErrNotFound → Cooldown(CoolSoft)：即时账号级软冷却（404）。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
 //
-// 恢复出口：CoolSoft/CoolRateLimit/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
+// 恢复出口：账号级/模型级 CoolSoft、CoolRateLimit、CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
 // 成功（NoteSuccess）清 fails/熔断；签到解冻（ReenableIfCredits→reviveCoolingLocked）只清冷却，不动熔断。
-func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body string) {
+func (h *Handler) applyErrorPolicy(uid, model string, kind upstream.ErrKind, body string) {
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
@@ -1879,16 +1884,35 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body strin
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
 		now := time.Now()
+		model = strings.TrimSpace(model)
+		if model == "-" {
+			model = ""
+		}
 		if isExplicitRateLimit(body) {
 			if resetAt, ok := rateLimitResetAt(body, now); ok {
-				h.cfg.Pool.CooldownUntil(uid, pool.CoolRateLimit, resetAt, rateLimitReason(body, resetAt))
+				reason := rateLimitReason(body, resetAt)
+				if model != "" {
+					h.cfg.Pool.CooldownModelUntil(uid, model, resetAt, reasonWithModel(reason, model))
+				} else {
+					h.cfg.Pool.CooldownUntil(uid, pool.CoolRateLimit, resetAt, reason)
+				}
 			} else {
 				// code=6004 without a parseable timestamp remains strict: do not
 				// keep hammering the account while the upstream window is unknown.
-				h.cfg.Pool.Cooldown(uid, pool.CoolRateLimit, h.cfg.SoftCooldown, rateLimitFallbackReason(body))
+				reason := rateLimitFallbackReason(body)
+				if model != "" {
+					h.cfg.Pool.CooldownModel(uid, model, h.cfg.SoftCooldown, reasonWithModel(reason, model))
+				} else {
+					h.cfg.Pool.Cooldown(uid, pool.CoolRateLimit, h.cfg.SoftCooldown, reason)
+				}
 			}
 		} else {
-			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
+			reason := "429 rate limit"
+			if model != "" {
+				h.cfg.Pool.CooldownModel(uid, model, h.cfg.SoftCooldown, reasonWithModel(reason, model))
+			} else {
+				h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, reason)
+			}
 		}
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")

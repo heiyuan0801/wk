@@ -116,7 +116,7 @@ Disabled ←────┘ (session 死亡，永久)
 | 错误类型 | 冷却策略 | 恢复方式 |
 |---|---|---|
 | **402 + 余额关键词** | 冷却到**次日 04:00** | 签到任务（09:00/21:00）自动恢复 |
-| **429 限流** | 普通 429 使用 60s 短冷却；上游 `code=6004`/携带 reset 时间时冷却到上游指定时间 | 到期自动恢复；明确限流账号在 reset 前不参与兜底 |
+| **429 限流** | 有请求模型时只冷却该模型；普通 429 使用 60s 短冷却，上游 `code=6004`/携带 reset 时间时冷却到上游指定时间；缺少模型时才使用账号级冷却 | 到期自动恢复；明确限流模型在 reset 前不参与该模型的兜底 |
 | **401 + session 死亡** | **永久禁用** | 人工重新登录 |
 | **404 上游偶发** | 60s 短冷却（不累计错误计数） | 到期自动恢复 |
 | **5xx 上游故障** | 喂熔断计数（`pool.breaker_threshold` 触发指数退避熔断） | 熔断到期自动恢复 / 成功清零 |
@@ -124,7 +124,7 @@ Disabled ←────┘ (session 死亡，永久)
 
 ### 挑选策略
 
-1. **状态过滤**：Disabled / Cooling / 熔断 / 在途占满 不选
+1. **状态过滤**：Disabled / 账号级 Cooling / 当前模型 Cooling / 熔断 / 在途占满 不选
 2. **Top-5 候选**：按三因子权重降序取前 5（credits 只是权重的一个因子，闲置补偿与成功率同样决定谁进短名单）
 3. **三因子加权随机**：权重 = credits 比例 ×10 + 闲置补偿 + 成功率 ×3（credits 全 0 仍按闲置+成功率加权）
 4. **防惊群**：跳过 100ms 内刚被选中的账号（除非 top5 全部刚被用过，退回 LRU）
@@ -138,6 +138,10 @@ Disabled ←────┘ (session 死亡，永久)
 - **在途租约**：单账号并发上限 `pool.max_in_flight`（0 = 不限），`Pick` 跳过占满账号。
 - **会话粘性路由**：同一 `metadata.conversation_id`/`conversation_id`/`metadata.user_id` 尽量绑定同一账号，TTL 滚动续期；请求失败自动解绑回落轮换，请求成功后会话绑定**跟随最终成功号**。
 - **全冷却兜底**：无 healthy 账号时从普通软冷却账号选最早到期者顶班；禁用、余额耗尽和上游明确限流账号在恢复前永不参与。
+
+上游返回 `code=6004` 或带明确 reset 时间的限流时，状态保存在账号的
+`model_cooldowns` 中。该字段按模型记录恢复时间；账号仍可为其他模型提供服务，
+`/status` 的账号级 `cooling` 不会因为单个模型限流而变为 `true`。
 
 ### Redis（Upstash）镜像
 
@@ -194,7 +198,7 @@ stdout 同时保留一行便于排查的表格日志：
 | `POST /v1/chat/completions` | Bearer | OpenAI 兼容聊天补全（流式/非流式） |
 | `POST /v1/responses` | Bearer | Responses API 适配（流式/非流式、工具调用、`previous_response_id`） |
 | `GET /v1/models` | Bearer | 模型列表（动态拉取 + 静态兜底） |
-| `GET /status` | Bearer | 账号状态汇总（total/healthy/cooling/disabled + 每账号详情） |
+| `GET /status` | Bearer | 账号状态汇总（total/healthy/cooling/disabled + 每账号详情；详情含模型级 `model_cooldowns`） |
 | `GET /requests?limit=50` | Bearer | 最近请求日志（最多 200 条，不含提示词和响应正文） |
 | `POST /admin/credits/refresh` | 前端会话/Bearer | 异步刷新所有账号的上游积分明细，不执行签到 |
 | `POST /admin/account/{uid}/enable` | 前端会话/Bearer | 手动启用账号并清除禁用/冷却状态 |
