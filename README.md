@@ -123,6 +123,37 @@ curl -sN http://localhost:7863/v1/chat/completions \
 
 **注意**：`cooldown.hard_credit` / `cooldown.err_threshold` / `cooldown.err_cooldown` 三个历史键已退役。硬冷却固定为**次日 04:00**（本地时区，`CooldownUntilTomorrow4AM`），连续错误语义并入熔断器（`pool.breaker_threshold` 触发指数退避）。旧配置中的这些键因 JSON 未知字段被自然忽略，不报错。
 
+## 并发与性能
+
+`pool.max_in_flight` 默认是 **每个账号 3 个在途请求**。例如 5 个健康账号对应最多约 15 个同时转发的聊天请求；100 个健康账号对应约 300 个。流式请求会占用名额直到响应结束。模型冷却、禁用和上游限流会降低可用容量；`0` 表示不限制本地账号名额，不表示上游无配额。当前不排队，名额耗尽时返回 503。
+
+`GET /status?model=deepseek-v4.1-flash` 的 `concurrency` 字段提供：
+
+- `max_in_flight_per_account`：每账号配置上限。
+- `configured_slots` / `available_slots`：指定模型健康账号的总名额 / 剩余名额；不含冷却兜底尝试。
+- `in_flight`：全池所有模型当前在途请求数。
+- `unlimited`：是否配置了无限制；此时两个 slots 字段为 0，应结合本字段解释。
+
+正常情况下，成功吞吐量还受平均响应时间限制：`请求/秒 ≈ 可用并发名额 ÷ 平均响应秒数`，并且不能超过上游 RPM/TPM/账号配额。不要仅为增大数字就调高每账号上限。
+
+本地性能优化包括：账号选择和名额占用合并为原子操作；SQLite 将统计、积分和请求日志合并到一个持久事务；SSE 使用按需增长的 4 KiB 初始缓冲；上游连接池保留更多空闲连接并采用标准 HTTP/2、拨号和 TLS 配置。请求 ID 仍原样透传。
+
+可运行不调用真实上游、不消耗账号额度的回环压测：
+
+```bash
+WK_LOADTEST=1 go test ./cmd/server -run '^TestProxyLoad$' -count=1 -v -timeout=120s
+
+# 持续 30 秒、300 个客户端并发
+WK_LOADTEST=1 WK_LOAD_CONCURRENCY=300 WK_LOAD_DURATION=30s \
+  go test ./cmd/server -run '^TestProxyLoad$' -count=1 -v -timeout=120s
+
+# 模拟 5 个账号、每个响应耗时 2 秒
+WK_LOADTEST=1 WK_LOAD_ACCOUNTS=5 WK_LOAD_CONCURRENCY=15 WK_LOAD_DELAY=2s \
+  go test ./cmd/server -run '^TestProxyLoad$' -count=1 -v -timeout=120s
+```
+
+默认使用 100 个模拟账号、每账号 3 个名额、1 KiB 文本请求、100 ms 上游 SSE 响应，并启用实际 SQLite 日志/积分写入。`WK_LOAD_PER_ACCOUNT` 可改变模拟账号名额，`WK_LOAD_STREAM=false` 可测非流式聚合。输出的 `LOADTEST` JSON 包含成功 RPS、延迟分位数、HTTP 状态分布、实际最大上游并发和持久化计数。内存值是压测客户端、模拟上游和代理共同进程的 Go 堆峰值，不是生产服务器 RSS。它不包含公网 TLS、Redis、账号刷新、磁盘池快照、大图片或真实模型生成成本，也不是生产容量保证。
+
 ## 账号轮换与冷却策略
 
 ### 状态机

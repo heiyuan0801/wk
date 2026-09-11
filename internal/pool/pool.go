@@ -423,9 +423,9 @@ func (p *Pool) RestoreFromSnapshot() {
 // 必须在成功 Pick 后调用；调用方负责 defer Release。
 func (p *Pool) Acquire(uid string) bool {
 	p.mu.RLock()
+	defer p.mu.RUnlock()
 	e, ok := p.byUID[uid]
 	limit := p.maxInFlight
-	p.mu.RUnlock()
 	if !ok {
 		return false
 	}
@@ -572,6 +572,23 @@ func (p *Pool) pick(tried map[string]bool) *auth.Auth {
 func (p *Pool) pickForModel(model string, tried map[string]bool) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.pickForModelLocked(model, tried)
+}
+
+// PickAndAcquireForModel reserves the selected account before releasing the
+// pool lock. Competing requests cannot consume its slot between Pick and Acquire.
+// The caller must Release every non-nil result.
+func (p *Pool) PickAndAcquireForModel(model string, tried map[string]bool) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	a := p.pickForModelLocked(normalizeModel(model), tried)
+	if a != nil {
+		p.byUID[a.UID].inFlight.Add(1)
+	}
+	return a
+}
+
+func (p *Pool) pickForModelLocked(model string, tried map[string]bool) *auth.Auth {
 	now := time.Now()
 
 	var cands []*entry
@@ -1106,9 +1123,23 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 // PickByUIDForModel 按指定模型直取账号。账号级状态和该模型的限流状态
 // 任一生效时都返回 nil，其他模型的限流不影响本次直取。
 func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
-	model = normalizeModel(model)
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.pickByUIDForModelLocked(uid, normalizeModel(model))
+}
+
+// PickAndAcquireByUIDForModel atomically reserves a sticky account's slot.
+func (p *Pool) PickAndAcquireByUIDForModel(uid, model string) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	a := p.pickByUIDForModelLocked(uid, normalizeModel(model))
+	if a != nil {
+		p.byUID[a.UID].inFlight.Add(1)
+	}
+	return a
+}
+
+func (p *Pool) pickByUIDForModelLocked(uid, model string) *auth.Auth {
 	e, ok := p.byUID[uid]
 	if !ok {
 		return nil

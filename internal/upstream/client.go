@@ -145,11 +145,11 @@ type Client struct {
 
 // New 生产默认值。配置连接池减少 TLS 握手。
 func New() *Client {
-	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-	}
+	// Keep the standard dial/TLS timeouts and HTTP/2 negotiation. A larger idle
+	// pool avoids repeating handshakes after concurrent streaming bursts.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConns = 256
+	tr.MaxIdleConnsPerHost = 128
 	return &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		SanitizeFingerprints: true,

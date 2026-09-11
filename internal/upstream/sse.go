@@ -24,7 +24,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 // AggregateWithID aggregates an upstream stream and uses fallbackID only when
 // WorkBuddy did not include an identifier in any SSE frame.
 func AggregateWithID(r io.Reader, fallbackID string) (map[string]any, error) {
-	br := bufio.NewReaderSize(r, 64*1024)
+	br := bufio.NewReader(r)
 	var (
 		id, model        string
 		created          float64
@@ -614,7 +614,7 @@ func streamNormalizedWithID(w http.ResponseWriter, r io.Reader, fallbackID strin
 		return nil
 	}
 
-	br := bufio.NewReaderSize(r, 64*1024)
+	br := bufio.NewReader(r)
 	validFrames := 0
 readLoop:
 	for {

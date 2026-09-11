@@ -54,6 +54,7 @@ type Config struct {
 	ResponseStore   ResponseStore
 	MetricsStore    MetricsStore
 	RequestLogStore RequestLogStore
+	CompletionStore CompletionStore // optional atomic writer replacing separate metric/log writes
 	CreditPolicy    CreditPolicy
 	Passthrough     bool
 }
@@ -789,6 +790,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		"cooling":         cooling,
 		"disabled":        disabled,
 		"in_flight_full":  inFlightFull,
+		"concurrency":     h.cfg.Pool.CapacityForModel(upstream.NormalizeModelID(r.URL.Query().Get("model"))),
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
 		"metrics":         h.metricsSnapshot(),
@@ -1944,6 +1946,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	passthrough := h.requestPassthrough(r)
 	st := newChatStatWithOptions(time.Now(), body, peek.Stream, h.cfg.MetricsStore, h.cfg.RequestLogStore, h.cfg.CreditPolicy, passthrough, r.URL.Path)
+	st.completionStore = h.cfg.CompletionStore
 	defer st.done()
 	// The upstream client canonicalizes public aliases before sending the body.
 	// Use the same canonical ID for model-level routing/cooldowns so a limit
@@ -1992,7 +1995,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 选号：粘性号优先（同时校验账号级状态和当前模型限流），否则按当前模型轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, routeModel)
+			acct = h.cfg.Pool.PickAndAcquireByUIDForModel(stickyUID, routeModel)
 			if acct == nil {
 				// 粘性号当前不可用（冷却/占满）→ 解绑，本次回落普通轮换。
 				h.cfg.Session.Unbind(sessKey)
@@ -2000,7 +2003,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickForModelExcluding(routeModel, tried)
+			acct = h.cfg.Pool.PickAndAcquireForModel(routeModel, tried)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -2009,16 +2012,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.uid = acct.UID
 		tried[acct.UID] = true
 
-		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
-		if !h.cfg.Pool.Acquire(acct.UID) {
-			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
-			// 满载粘性号再浪费一次 PickByUID 往返（语义与 fail()/PickByUID-nil 的解绑一致）。
-			if stickyUID != "" && acct.UID == stickyUID {
-				h.cfg.Session.Unbind(sessKey)
-				stickyUID = ""
-			}
-			continue // 最后一个名额被并发抢走 → 换号
-		}
+		// Selection and reservation are atomic; retries are reserved for actual
+		// upstream failures rather than races over the last account slot.
 		heldUID = acct.UID
 
 		// token 临近过期 → 先 refresh（失败冷却换号）

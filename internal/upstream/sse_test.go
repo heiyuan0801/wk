@@ -7,6 +7,28 @@ import (
 	"testing"
 )
 
+func TestLargeSSEFrameSurvivesSmallInitialBuffers(t *testing.T) {
+	content := strings.Repeat("long-frame-", 32768)
+	raw, _ := json.Marshal(map[string]any{"id": "WB/unchanged", "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": content}}}})
+	sse := "data: " + string(raw) + "\n\ndata: [DONE]\n\n"
+	w := httptest.NewRecorder()
+	if err := Stream(w, strings.NewReader(sse)); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(w.Body.String(), "[DONE]") != 1 {
+		t.Fatal("invalid stream terminator")
+	}
+	result, err := Aggregate(strings.NewReader(w.Body.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	choices := result["choices"].([]any)
+	message := choices[0].(map[string]any)["message"].(map[string]any)
+	if message["content"] != content || result["id"] != "WB/unchanged" {
+		t.Fatal("large frame or upstream ID changed")
+	}
+}
+
 func TestPrepareBodyForcesStream(t *testing.T) {
 	out := PrepareBodyOpt([]byte(`{"model":"glm-5.2","messages":[]}`), true)
 	var m map[string]any

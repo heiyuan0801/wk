@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"os"
 	"strconv"
@@ -77,6 +78,12 @@ type CreditMetricsStore interface {
 	AddCredit(consumed float64, source string) error
 }
 
+// CompletionStore records one completed request and all of its counters atomically.
+// ttfbObserved preserves sub-millisecond observations in the sample count.
+type CompletionStore interface {
+	RecordCompletion(RequestLog, bool) error
+}
+
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
 	id                    string
@@ -102,6 +109,7 @@ type chatStat struct {
 	creditPolicy          CreditPolicy
 	metricsStore          MetricsStore
 	requestLogStore       RequestLogStore
+	completionStore       CompletionStore
 
 	logged bool
 }
@@ -180,14 +188,14 @@ func (s *chatStat) done() {
 		requestMetrics.ttfbSamples.Add(1)
 	}
 	requestMetrics.lastRequestUnix.Store(time.Now().Unix())
-	if s.metricsStore != nil {
+	if s.completionStore == nil && s.metricsStore != nil {
 		_ = s.metricsStore.AddMetrics(1, boolInt(success), boolInt(!success), int64(s.inputTokens), int64(outputTokens), int64(s.totalTokens), int64(s.cacheRead), int64(s.cacheWrite), int64(s.toolCalls), s.ttfb.Milliseconds(), boolInt(s.ttfb > 0), elapsed.Milliseconds(), time.Now().Unix())
 		if creditStore, ok := s.metricsStore.(CreditMetricsStore); ok && s.creditSource != "unknown" {
 			_ = creditStore.AddCredit(s.creditsConsumed, s.creditSource)
 		}
 	}
-	if s.requestLogStore != nil {
-		_ = s.requestLogStore.RecordRequest(RequestLog{
+	if s.completionStore != nil || s.requestLogStore != nil {
+		record := RequestLog{
 			ID:                    s.id,
 			CreatedAt:             s.start.Unix(),
 			Route:                 defaultString(s.route, "/v1/chat/completions"),
@@ -209,7 +217,16 @@ func (s *chatStat) done() {
 			Passthrough:           s.passthrough,
 			ErrorCode:             s.errorCode,
 			ErrorMessage:          s.errorMessage,
-		})
+		}
+		var err error
+		if s.completionStore != nil {
+			err = s.completionStore.RecordCompletion(record, s.ttfb > 0)
+		} else {
+			err = s.requestLogStore.RecordRequest(record)
+		}
+		if err != nil {
+			log.Printf("request persistence failed: %v", err)
+		}
 	}
 	logChatRow(s.ttfb, elapsed, s.model, s.mode, s.uid, status, s.toks, creditLog{value: s.creditsConsumed, source: s.creditSource, errorCode: s.errorCode})
 }
@@ -302,7 +319,9 @@ type chatStatsReader struct {
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
 func newChatStatsReaderSince(r io.Reader, since time.Time) *chatStatsReader {
-	return &chatStatsReader{br: bufio.NewReaderSize(r, 64*1024), start: since, toolCallIDs: make(map[string]struct{})}
+	// ReadString grows for long frames; a 4 KiB initial buffer avoids reserving
+	// 64 KiB for each mostly-small token stream.
+	return &chatStatsReader{br: bufio.NewReader(r), start: since, toolCallIDs: make(map[string]struct{})}
 }
 
 // TTFB 返回首个 data 帧到达耗时；无帧时为 0。

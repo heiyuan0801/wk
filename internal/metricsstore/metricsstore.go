@@ -217,7 +217,16 @@ func migrateRequestLogs(ctx context.Context, db *sql.DB) error {
 func (s *Store) Add(delta Snapshot) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	current, err := s.snapshotLocked()
+	return addDelta(s.db, delta)
+}
+
+type metricsExecutor interface {
+	QueryRow(query string, args ...any) *sql.Row
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func addDelta(db metricsExecutor, delta Snapshot) error {
+	current, err := readSnapshot(db)
 	if err != nil {
 		return err
 	}
@@ -244,7 +253,7 @@ func (s *Store) Add(delta Snapshot) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO metrics(id, data, updated_at) VALUES(1, ?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at`, string(raw), time.Now().Unix())
+	_, err = db.Exec(`INSERT INTO metrics(id, data, updated_at) VALUES(1, ?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at`, string(raw), time.Now().Unix())
 	return err
 }
 
@@ -265,7 +274,38 @@ func (s *Store) AddCredit(consumed float64, source string) error {
 func (s *Store) RecordRequest(record RequestRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`INSERT OR REPLACE INTO request_logs(
+	err := insertRequest(s.db, record, s.requestWrites+1)
+	if err == nil {
+		s.requestWrites++
+	}
+	return err
+}
+
+// RecordCompletion commits usage, credits and the request log together. One
+// durable transaction replaces up to three separate commits per HTTP request;
+// failures roll back both the counters and the log, without an async loss window.
+func (s *Store) RecordCompletion(delta Snapshot, record RequestRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = addDelta(tx, delta); err != nil {
+		return err
+	}
+	if err = insertRequest(tx, record, s.requestWrites+1); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err == nil {
+		s.requestWrites++
+	}
+	return err
+}
+
+func insertRequest(db metricsExecutor, record RequestRecord, writes int) error {
+	_, err := db.Exec(`INSERT INTO request_logs(
 		id, created_at, route, model, mode, status, account_uid, requested_output_tokens,
 		input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
 		tool_calls, ttfb_millis, latency_millis, credits_consumed, credit_source,
@@ -277,9 +317,8 @@ func (s *Store) RecordRequest(record RequestRecord) error {
 		boolInt(record.Passthrough), record.ErrorCode, record.ErrorMessage,
 	)
 	if err == nil {
-		s.requestWrites++
-		if s.requestWrites%100 == 0 {
-			_, err = s.db.Exec(`DELETE FROM request_logs WHERE rowid IN (
+		if writes%100 == 0 {
+			_, err = db.Exec(`DELETE FROM request_logs WHERE rowid IN (
 				SELECT rowid FROM request_logs ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?
 			)`, maxRequestLogs)
 		}
@@ -323,8 +362,12 @@ func (s *Store) Snapshot() (Snapshot, error) {
 }
 
 func (s *Store) snapshotLocked() (Snapshot, error) {
+	return readSnapshot(s.db)
+}
+
+func readSnapshot(db metricsExecutor) (Snapshot, error) {
 	var raw string
-	err := s.db.QueryRow(`SELECT data FROM metrics WHERE id=1`).Scan(&raw)
+	err := db.QueryRow(`SELECT data FROM metrics WHERE id=1`).Scan(&raw)
 	if err == sql.ErrNoRows {
 		return Snapshot{}, nil
 	}

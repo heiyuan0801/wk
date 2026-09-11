@@ -19,7 +19,13 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Race tests
-        run: go test -race ./internal/server ./internal/metricsstore ./internal/pool ./internal/session
+        run: go test -race ./...
+      - name: Loopback load smoke test
+        env:
+          WK_LOADTEST: '1'
+          WK_LOAD_CONCURRENCY: '10'
+          WK_LOAD_DURATION: '1s'
+        run: go test ./cmd/server -run '^TestProxyLoad$' -count=1 -timeout=60s
 
   docker:
     runs-on: ubuntu-latest

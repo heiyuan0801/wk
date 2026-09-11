@@ -33,7 +33,36 @@ func (m metricsAdapter) AddCredit(consumed float64, source string) error {
 }
 
 func (m metricsAdapter) RecordRequest(record server.RequestLog) error {
-	return m.store.RecordRequest(metricsstore.RequestRecord{
+	return m.store.RecordRequest(requestRecord(record))
+}
+
+func (m metricsAdapter) RecordCompletion(record server.RequestLog, ttfbObserved bool) error {
+	delta := metricsstore.Snapshot{Requests: 1, InputTokens: record.InputTokens, OutputTokens: record.OutputTokens,
+		TotalTokens: record.TotalTokens, CacheRead: record.CacheReadTokens, CacheWrite: record.CacheWriteTokens,
+		ToolCalls: record.ToolCalls, TTFBMillis: record.TTFBMillis, LatencyMillis: record.LatencyMillis, LastRequestUnix: time.Now().Unix()}
+	if record.Status >= 200 && record.Status < 300 {
+		delta.Successes = 1
+	} else {
+		delta.Failures = 1
+	}
+	if ttfbObserved {
+		delta.TTFBSamples = 1
+	}
+	if record.CreditsConsumed > 0 && record.CreditSource != "unknown" {
+		delta.CreditsConsumed = record.CreditsConsumed
+		delta.CreditRequests = 1
+		if record.CreditSource == "upstream" {
+			delta.CreditsUpstream = record.CreditsConsumed
+		}
+		if record.CreditSource == "estimated" {
+			delta.CreditsEstimated = record.CreditsConsumed
+		}
+	}
+	return m.store.RecordCompletion(delta, requestRecord(record))
+}
+
+func requestRecord(record server.RequestLog) metricsstore.RequestRecord {
+	return metricsstore.RequestRecord{
 		ID:                    record.ID,
 		CreatedAt:             record.CreatedAt,
 		Route:                 record.Route,
@@ -55,7 +84,7 @@ func (m metricsAdapter) RecordRequest(record server.RequestLog) error {
 		Passthrough:           record.Passthrough,
 		ErrorCode:             record.ErrorCode,
 		ErrorMessage:          record.ErrorMessage,
-	})
+	}
 }
 
 func (m metricsAdapter) RecentRequests(limit int) ([]server.RequestLog, error) {
@@ -146,10 +175,12 @@ func main() {
 	}
 	var persistentMetrics server.MetricsStore
 	var requestLogs server.RequestLogStore
+	var completions server.CompletionStore
 	if metricsDB != nil {
 		adapter := metricsAdapter{store: metricsDB}
 		persistentMetrics = adapter
 		requestLogs = adapter
+		completions = adapter
 	}
 	var responseStore server.ResponseStore
 	if persistedResponses, ok := store.(server.ResponseStore); ok {
@@ -220,6 +251,7 @@ func main() {
 		ResponseStore:    responseStore,
 		MetricsStore:     persistentMetrics,
 		RequestLogStore:  requestLogs,
+		CompletionStore:  completions,
 		CreditPolicy: server.CreditPolicy{
 			InputPer1K:       cfg.Billing.InputCreditsPer1KTokens,
 			OutputPer1K:      cfg.Billing.OutputCreditsPer1KTokens,

@@ -140,6 +140,15 @@ func TestChatStatsReaderBytesPassthrough(t *testing.T) {
 	}
 }
 
+func TestChatStatsReaderPreservesLargeFrame(t *testing.T) {
+	sse := `data: {"id":"WB/large","choices":[{"delta":{"content":"` + strings.Repeat("x", 256<<10) + `"}}]}` + "\n\ndata: [DONE]\n\n"
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	got, err := io.ReadAll(r)
+	if err != nil || string(got) != sse || r.ResponseID() != "WB/large" {
+		t.Fatal("large frame corrupted", err)
+	}
+}
+
 func TestParseModelFromBody(t *testing.T) {
 	if got := parseModelFromBody([]byte(`{"model":"deepseek-v4-flash","stream":true}`)); got != "deepseek-v4-flash" {
 		t.Errorf("got %q", got)
