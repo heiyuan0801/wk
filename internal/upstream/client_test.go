@@ -25,6 +25,8 @@ func TestClassify(t *testing.T) {
 		{200, `{"code":10001,"msg":"积分不足，请充值"}`, ErrHardCredit},
 		{400, `{"code":1,"msg":"额度用尽"}`, ErrHardCredit},
 		{429, ``, ErrSoftRate},
+		{503, `{"code":6004,"msg":"您的使用量已超出频率限制，将在 2026-09-11 17:58:44 UTC+8 重置"}`, ErrSoftRate},
+		{503, `all accounts unavailable (cooling/disabled): upstream soft_rate (http 429): {"code":6004,"msg":"将在 2026-09-11 17:58:44 UTC+8 重置"}`, ErrSoftRate},
 		{401, `Offline user session not found`, ErrSessionDead},
 		{401, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
 		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},

@@ -113,6 +113,43 @@ func TestPickExpiredCooldownReturnsToHealthy(t *testing.T) {
 	}
 }
 
+func TestPickSkipsExplicitRateLimitCooldown(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 100)
+	p.CooldownUntil("u1", CoolRateLimit, time.Now().Add(time.Hour), "429 rate limit code=6004")
+	if got := p.Pick(); got != nil {
+		t.Fatalf("explicit upstream rate limit must not be used as fallback, got %+v", got)
+	}
+}
+
+func TestExplicitRateLimitCooldownExpiresAutomatically(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 100)
+	p.CooldownUntil("u1", CoolRateLimit, time.Now().Add(20*time.Millisecond), "429 rate limit code=6004")
+	time.Sleep(30 * time.Millisecond)
+	if got := p.Pick(); got == nil || got.UID != "u1" {
+		t.Fatalf("rate-limited account should become eligible after reset, got %+v", got)
+	}
+}
+
+func TestCreditRefreshDoesNotBypassActiveRateLimit(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	reset := time.Now().Add(time.Hour)
+	p.CooldownUntil("u1", CoolRateLimit, reset, "429 rate limit code=6004")
+	p.SetCreditDetail("u1", CreditDetail{Remaining: 500})
+
+	st, ok := p.Status("u1")
+	if !ok || !st.Cooling || st.CoolKind != "rate_limit" {
+		t.Fatalf("credit refresh must preserve active rate limit: %+v ok=%v", st, ok)
+	}
+	if st.Credits != 500 {
+		t.Fatalf("credit refresh should still update credits, got %d", st.Credits)
+	}
+}
+
 func TestPickNilWhenAllDisabled(t *testing.T) {
 	// 全禁用 → 兜底不参与（禁用账号永不参与兜底）→ 返回 nil。
 	p := New("")
@@ -362,6 +399,29 @@ func TestCooldownPersists(t *testing.T) {
 	st, ok := p2.Status("u1")
 	if !ok || !st.Cooling || st.Reason != "余额不足" {
 		t.Fatalf("cooldown lost after reload: %+v ok=%v", st, ok)
+	}
+}
+
+func TestExplicitRateLimitPersistsAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	reset := time.Now().Add(time.Hour)
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownUntil("u1", CoolRateLimit, reset, "429 rate limit code=6004")
+	p.Flush()
+
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	st, ok := p2.Status("u1")
+	if !ok || !st.Cooling || st.CoolKind != "rate_limit" {
+		t.Fatalf("rate-limit state lost after reload: %+v ok=%v", st, ok)
+	}
+	if delta := st.Until.Sub(reset); delta < -time.Second || delta > time.Second {
+		t.Fatalf("reset deadline changed after reload: got=%v want=%v", st.Until, reset)
+	}
+	if got := p2.Pick(); got != nil {
+		t.Fatalf("reloaded rate-limited account must stay out of fallback, got %+v", got)
 	}
 }
 

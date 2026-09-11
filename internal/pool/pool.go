@@ -2,7 +2,7 @@
 //
 // 每个账号只有三个正交状态维度：
 //  1. 健康维度（唯一权威）：healthy = !disabled && !until 生效 && !breakerUntil 生效
-//     - until：按错误类型的即时冷却（CoolSoft 429 / CoolHard 余额耗尽）
+//     - until：按错误类型的即时冷却（CoolSoft 普通 429 / CoolRateLimit 上游明确恢复时间 / CoolHard 余额耗尽）
 //     - breakerUntil：连续失败（fails）累计触发熔断的指数退避截止
 //  2. 并发维度：inFlight（在途租约，运行态）
 //  3. 统计维度：successCount / errTotal（累计，供成功率权重）/ lastUsed / lastSuccess / lastErr
@@ -29,8 +29,9 @@ import (
 type CoolKind int
 
 const (
-	CoolHard CoolKind = iota // 余额不足 → 冷却到次日 04:00（等签到恢复）
-	CoolSoft                 // 429 → 短冷却
+	CoolHard      CoolKind = iota // 余额不足 → 冷却到次日 04:00（等签到恢复）
+	CoolSoft                      // 429 → 短冷却
+	CoolRateLimit                 // 上游 6004/明确恢复时间的限流 → 到指定时间，期间不参与兜底
 )
 
 func (k CoolKind) String() string {
@@ -39,6 +40,8 @@ func (k CoolKind) String() string {
 		return "hard_credit"
 	case CoolSoft:
 		return "soft_rate"
+	case CoolRateLimit:
+		return "rate_limit"
 	}
 	return "unknown"
 }
@@ -99,7 +102,7 @@ type entry struct {
 	lastErr             time.Time // 最近一次错误时间
 	lastSuccess         time.Time // 最近一次成功时间
 	coolKind            CoolKind
-	until               time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+	until               time.Time // 冷却截止（即时冷却：CoolSoft / CoolRateLimit / CoolHard）
 	disabled            bool
 	reason              string
 	lastUsed            time.Time // 最近被选中时刻（防并发撞号）
@@ -586,9 +589,10 @@ func (p *Pool) markUsedLocked(e *entry) {
 	e.lastUsed = usedAt
 }
 
-// pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
+// pickEarliestExpiryLocked 全冷却兜底：在非禁用的普通软冷却/熔断账号中选截止最早的一个。
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
-// CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
+// CoolRateLimit（上游明确给出恢复时间）也排除——恢复前重试必然再次限流；CoolSoft 与熔断号允许参与
+// （可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
 func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time) *auth.Auth {
 	var best *entry
@@ -601,6 +605,9 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time) *a
 		}
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+		}
+		if e.coolKind == CoolRateLimit && !e.until.IsZero() && now.Before(e.until) {
+			continue // 上游明确限流号在 reset 前不可用，禁止兜底重试
 		}
 		if p.inFlightFull(e) {
 			continue
@@ -743,16 +750,28 @@ func (p *Pool) SetCreditDetail(uid string, detail CreditDetail) {
 	}
 }
 
-// Cooldown 冷却账号至 now+d（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）。
-// 冷却入口同时是熔断器的失败信号：喂入 fails，达到阈值按指数退避熔断（与 until 正交）。
+// Cooldown 冷却账号至 now+d（即时冷却：CoolSoft 普通 429 / CoolRateLimit 上游限流 / CoolHard 余额耗尽）。
 func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason string) {
+	p.CooldownUntil(uid, kind, time.Now().Add(d), reason)
+}
+
+// CooldownUntil 冷却账号到绝对时间点。
+// CoolRateLimit 用于上游返回的明确 reset 时间：它不参与全冷却兜底，且不喂熔断器，
+// 避免并发请求把一个可预期的限流误判成持续故障，导致恢复时间被熔断器继续推迟。
+func (p *Pool) CooldownUntil(uid string, kind CoolKind, until time.Time, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		e.until = time.Now().Add(d)
+		// 并发响应可能携带不同 reset 时间，限流状态只允许延长，不允许被较早的响应缩短。
+		if kind == CoolRateLimit && !e.until.IsZero() && e.until.After(until) && time.Now().Before(e.until) {
+			until = e.until
+		}
+		e.until = until
 		e.coolKind = kind
 		e.reason = reason
-		p.recordBreakerFailureLocked(e) // 冷却入口也是熔断器的失败信号
+		if kind != CoolRateLimit {
+			p.recordBreakerFailureLocked(e) // 普通冷却入口也是熔断器的失败信号
+		}
 		p.dirty.Store(true)
 	}
 }
@@ -852,10 +871,15 @@ func (p *Pool) reviveCoolingLocked(e *entry, credits int64) {
 }
 
 func (p *Pool) updateCreditsLocked(e *entry, credits int64) {
+	e.credits = credits
 	if credits > 0 && !e.disabled {
+		// Billing refresh only proves that the account has credits. It must not
+		// bypass an active upstream rate-limit window; only its reset deadline
+		// (or an explicit manual Enable) may release that state.
+		if e.coolKind == CoolRateLimit && !e.until.IsZero() && time.Now().Before(e.until) {
+			return
+		}
 		p.reviveCoolingLocked(e, credits)
-	} else {
-		e.credits = credits
 	}
 }
 

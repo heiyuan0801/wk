@@ -1754,10 +1754,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if status >= 400 {
 			st.status = status
-			kind := upstream.Classify(status, string(respBody))
-			setRequestError(st, kind.String(), string(respBody))
-			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-			h.applyErrorPolicy(acct.UID, kind)
+			bodyText := string(respBody)
+			kind := upstream.Classify(status, bodyText)
+			setRequestError(st, kind.String(), bodyText)
+			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: bodyText}
+			h.applyErrorPolicy(acct.UID, kind, bodyText)
 			fail(acct.UID)
 			continue
 		}
@@ -1861,22 +1862,34 @@ func (h *Handler) requestPassthrough(r *http.Request) bool {
 //
 // 五条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate / ErrNotFound → Cooldown(CoolSoft)：即时软冷却（429/404）。
+//   - 普通 ErrSoftRate / ErrNotFound → Cooldown(CoolSoft)：即时软冷却（429/404）。
+//     上游 code=6004 或带 reset 时间的限流 → CoolRateLimit：精确冷却到 reset，期间不兜底重试。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
 //
-// 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
+// 恢复出口：CoolSoft/CoolRateLimit/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
 // 成功（NoteSuccess）清 fails/熔断；签到解冻（ReenableIfCredits→reviveCoolingLocked）只清冷却，不动熔断。
-func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind) {
+func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body string) {
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
+		now := time.Now()
+		if isExplicitRateLimit(body) {
+			if resetAt, ok := rateLimitResetAt(body, now); ok {
+				h.cfg.Pool.CooldownUntil(uid, pool.CoolRateLimit, resetAt, rateLimitReason(body, resetAt))
+			} else {
+				// code=6004 without a parseable timestamp remains strict: do not
+				// keep hammering the account while the upstream window is unknown.
+				h.cfg.Pool.Cooldown(uid, pool.CoolRateLimit, h.cfg.SoftCooldown, rateLimitFallbackReason(body))
+			}
+		} else {
+			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
+		}
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
 	case upstream.ErrNotFound:

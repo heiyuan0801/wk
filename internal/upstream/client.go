@@ -86,7 +86,9 @@ func Classify(status int, body string) ErrKind {
 			return ErrSessionDead
 		}
 	}
-	if status == http.StatusTooManyRequests {
+	// code=6004 is the upstream's deterministic rate-limit response. Some
+	// gateway paths wrap the original 429 as HTTP 503, so inspect the body too.
+	if status == http.StatusTooManyRequests || isRateLimit6004(body) {
 		return ErrSoftRate
 	}
 	if status == http.StatusNotFound {
@@ -100,6 +102,21 @@ func Classify(status int, body string) ErrKind {
 	}
 	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。
 	return ErrNone
+}
+
+func isRateLimit6004(body string) bool {
+	var envelope struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(body), &envelope); err == nil && envelope.Code == 6004 {
+		return true
+	}
+	// Preserve classification when an outer error message prefixes the
+	// original JSON, or when the upstream returns a non-JSON diagnostic.
+	lower := strings.ToLower(body)
+	return strings.Contains(body, "6004") &&
+		(strings.Contains(body, "使用量已超出频率限制") ||
+			strings.Contains(lower, "rate limit") || strings.Contains(lower, "soft_rate"))
 }
 
 // apiEnvelope 上游统一信封。

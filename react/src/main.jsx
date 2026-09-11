@@ -330,11 +330,25 @@ function App() {
     },
     {
       title: '状态',
-      render: (_, record) => (
-        <Tag color={record.disabled ? 'red' : record.cooling ? 'orange' : 'green'}>
-          {record.disabled ? '禁用' : record.cooling ? '冷却' : '可用'}
-        </Tag>
-      ),
+      render: (_, record) => {
+        const rateLimited = record.cool_kind === 'rate_limit';
+        const until = record.cooling && record.until ? new Date(record.until) : null;
+        const title = record.cooling || record.disabled
+          ? [
+            record.reason,
+            until && !Number.isNaN(until.getTime()) && until.getFullYear() > 1
+              && `恢复：${until.toLocaleString()}`,
+          ].filter(Boolean).join('\n')
+          : '';
+        return (
+          <Tag
+            color={record.disabled ? 'red' : record.cooling ? 'orange' : 'green'}
+            title={title || undefined}
+          >
+            {record.disabled ? '禁用' : record.cooling ? (rateLimited ? '上游限流' : '冷却') : '可用'}
+          </Tag>
+        );
+      },
     },
     {
       title: '操作',
