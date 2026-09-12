@@ -17,6 +17,37 @@ button, input, textarea, select { font: inherit; }
 
 .ant-layout { background: #f5f7fb !important; }
 
+/* Keep navigation independent from the content scroll position. */
+.app-sider {
+  position: fixed !important;
+  inset-block: 0;
+  inset-inline-start: 0;
+  z-index: 100;
+  height: 100vh;
+  overflow: auto;
+}
+
+.app-main-layout {
+  min-height: 100vh;
+  margin-inline-start: 240px;
+}
+
+.app-main-layout > .ant-layout-header {
+  position: sticky;
+  top: 0;
+  z-index: 90;
+}
+
+.login-poll-status {
+  line-height: 32px;
+  color: #667085 !important;
+}
+
+.api-key-card {
+  box-shadow: none !important;
+  background: #f8faff !important;
+}
+
 .ant-layout-sider {
   background: #ffffff !important;
   border-right: 1px solid #e8edf4;
@@ -199,6 +230,10 @@ button, input, textarea, select { font: inherit; }
 
 .ant-card,
 .ant-table-wrapper { contain: layout paint; }
+
+@media (max-width: 991px) {
+  .app-main-layout { margin-inline-start: 0; }
+}
 
 @media (max-width: 640px) {
   .ant-layout-content { padding: 18px !important; }

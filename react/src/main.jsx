@@ -6,7 +6,7 @@ import {
 } from 'antd';
 import {
   ApiOutlined, DashboardOutlined, FileSearchOutlined, KeyOutlined, ReloadOutlined, SendOutlined,
-  DeleteOutlined, SettingOutlined, StopOutlined, ToolOutlined, UnlockOutlined,
+  DeleteOutlined, SettingOutlined, StopOutlined, ToolOutlined, UnlockOutlined, UserOutlined,
 } from '@ant-design/icons';
 import 'antd/dist/reset.css';
 import './theme.css';
@@ -45,6 +45,8 @@ function Sparkline({ values, color = '#356ae6', ariaLabel = '趋势图' }) {
 function App() {
   const [form] = Form.useForm();
   const [apiKey, setApiKey] = useState(initialAPIKey);
+  const [apiKeyOpen, setApiKeyOpen] = useState(false);
+  const [apiKeyDraft, setApiKeyDraft] = useState(initialAPIKey);
   const [locked, setLocked] = useState(false);
   const [password, setPassword] = useState('');
   const [activeSection, setActiveSection] = useState('dashboard');
@@ -71,6 +73,7 @@ function App() {
   const [loginURL, setLoginURL] = useState('');
   const [loginPendingRegion, setLoginPendingRegion] = useState('');
   const [loginPendingPortal, setLoginPendingPortal] = useState('codebuddy');
+  const [loginPollStatus, setLoginPollStatus] = useState('');
   const loginRegionTouched = useRef(false);
   const refreshController = useRef(null);
   const refreshSerial = useRef(0);
@@ -172,6 +175,26 @@ function App() {
     } catch (error) {
       message.error(error.message);
     }
+  };
+
+  const saveAPIKey = () => {
+    const next = apiKeyDraft.trim();
+    setApiKey(next);
+    if (next) sessionStorage.setItem('wb2api-api-key', next);
+    else {
+      sessionStorage.removeItem('wb2api-api-key');
+      localStorage.removeItem('wb2api-api-key');
+    }
+    setApiKeyOpen(false);
+    message.success(next ? 'API Key 已保存' : 'API Key 已清除');
+  };
+
+  const resetAPIKey = () => {
+    setApiKeyDraft('');
+    setApiKey('');
+    sessionStorage.removeItem('wb2api-api-key');
+    localStorage.removeItem('wb2api-api-key');
+    message.success('API Key 已重置');
   };
 
   const saveConfig = async values => {
@@ -508,9 +531,10 @@ function App() {
     ['缓存创建', metrics.cache_write_tokens, '#13c2c2'],
     ['工具调用', metrics.tool_calls, '#ffc53d'], ['积分消耗', metrics.credits_consumed, '#fa8c16', fmtCredits],
   ];
-  const activeTab = activeSection === 'dashboard' ? 'pool' : activeSection === 'settings' ? 'admin' : activeSection;
+  const activeTab = activeSection === 'accounts' ? 'pool' : activeSection === 'settings' ? 'admin' : activeSection;
   const pageCopy = {
     dashboard: ['运营概览', '账号池、请求量和 token 用量实时汇总，数据每 30 秒自动更新。'],
+    accounts: ['账号状态', '查看账号区域、积分、冷却和健康状态，并执行启用或禁用操作。'],
     models: ['模型与请求', '查看当前可用的上游模型。'],
     playground: ['请求测试', '发送 Responses API 请求并查看标准化的 output_text。'],
     requests: ['请求日志', '查看每次请求的端点、模式、token、耗时、积分和错误详情。'],
@@ -521,6 +545,7 @@ function App() {
   const pollRegion = loginPendingRegion || loginRegion;
   const menuItems = [
     { key: 'dashboard', icon: <DashboardOutlined />, label: '仪表盘' },
+    { key: 'accounts', icon: <UserOutlined />, label: '账号状态' },
     { key: 'models', icon: <ApiOutlined />, label: '模型目录' },
     { key: 'playground', icon: <SendOutlined />, label: '请求测试' },
     { key: 'requests', icon: <FileSearchOutlined />, label: '请求日志' },
@@ -661,17 +686,28 @@ function App() {
                 } catch (error) { message.error(error.message); }
               }}>生成 OAuth 登录链接</Button>
               <Button icon={<ToolOutlined />} onClick={async () => {
+                setLoginPollStatus('正在查询授权结果…');
                 try {
                   const query = `?region=${encodeURIComponent(pollRegion)}&portal=${encodeURIComponent(pollRegion === 'global' ? 'global' : loginPendingPortal)}`;
                   const result = await api(`/admin/account/poll${query}`, { method: 'POST' });
-                  if (result.warning) message.warning(result.warning);
-                  else message.success(`${result.region === 'global' ? '海外版' : '中国区'}账号已添加`);
+                  if (result.warning) {
+                    setLoginPollStatus(result.warning);
+                    message.warning(result.warning);
+                  } else {
+                    const label = `${result.region === 'global' ? '海外版' : '中国区'}账号已添加`;
+                    setLoginPollStatus(label);
+                    message.success(label);
+                  }
                   setLoginURL('');
                   setLoginPendingRegion('');
                   setLoginPendingPortal('codebuddy');
                   await refresh();
-                } catch (error) { message.error(error.message); }
+                } catch (error) {
+                  setLoginPollStatus(`轮询失败：${error.message}`);
+                  message.error(error.message);
+                }
               }}>轮询授权结果</Button>
+              {loginPollStatus && <Text type="secondary" className="login-poll-status" aria-live="polite">{loginPollStatus}</Text>}
             </Space>
             {loginURL && (
               <div style={{ marginTop: 12, wordBreak: 'break-all' }}>
@@ -690,22 +726,19 @@ function App() {
 
   return (
     <ConfigProvider theme={{ token: { colorPrimary: '#356ae6', borderRadius: 8, colorBgContainer: '#ffffff', colorBgLayout: '#f5f7fb', colorText: '#172033', colorTextSecondary: '#667085', colorTextHeading: '#172033', colorBorder: '#e7ebf1' } }}>
-      <Layout style={{ minHeight: '100vh' }}>
-        <Sider breakpoint="lg" collapsedWidth="0">
+      <Layout className="app-shell" style={{ minHeight: '100vh' }}>
+        <Sider className="app-sider" width={240} breakpoint="lg" collapsedWidth="0">
           <div style={{ color: '#172033', fontSize: 18, fontWeight: 700, padding: '22px 20px' }}>WorkBuddy<span style={{ color: '#356ae6' }}>2API</span></div>
           <Menu theme="light" mode="inline" selectedKeys={[activeSection]} items={menuItems} onClick={({ key }) => setActiveSection(key)} />
         </Sider>
-        <Layout>
+        <Layout className="app-main-layout">
           <Header style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 26px' }}>
             <Space><Text strong style={{ color: '#172033' }}>服务控制台</Text><Tag color={data.healthy ? 'green' : 'orange'}>{data.healthy ? '服务可用' : '账号池检查中'}</Tag></Space>
             <Space>
               <Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
               <Button icon={<KeyOutlined />} onClick={() => {
-                const key = window.prompt('API Key', apiKey);
-                if (key !== null) {
-                  setApiKey(key);
-                  sessionStorage.setItem('wb2api-api-key', key);
-                }
+                setApiKeyDraft(apiKey);
+                setApiKeyOpen(true);
               }}>API Key</Button>
             </Space>
           </Header>
@@ -774,13 +807,42 @@ function App() {
                 </Card>
               </>
             )}
-            {tabItems.find(item => item.key === activeTab)?.children}
+            {activeSection !== 'dashboard' && tabItems.find(item => item.key === activeTab)?.children}
           </Content>
         </Layout>
         <Modal open={locked} title="控制台验证" onOk={unlock} onCancel={() => {}} okText="解锁" cancelButtonProps={{ style: { display: 'none' } }}>
           <Alert message="请输入前端访问密码，或填写 API Key" type="info" showIcon style={{ marginBottom: 14 }} />
           <Input.Password prefix={<KeyOutlined />} value={password} onChange={event => setPassword(event.target.value)} onPressEnter={unlock} placeholder="输入访问密码" />
           <Input prefix={<ApiOutlined />} value={apiKey} onChange={event => setApiKey(event.target.value)} onPressEnter={unlock} placeholder="输入 API Key" style={{ marginTop: 10 }} />
+        </Modal>
+        <Modal
+          open={apiKeyOpen}
+          title={<Space><KeyOutlined />API 密钥</Space>}
+          onCancel={() => setApiKeyOpen(false)}
+          footer={null}
+          destroyOnClose
+        >
+          <Card size="small" className="api-key-card">
+            <Space direction="vertical" size={12} style={{ width: '100%' }}>
+              <div>
+                <Text strong>控制台访问密钥</Text>
+                <br />
+                <Text type="secondary">密钥只保存在当前浏览器会话中，用于访问管理接口。</Text>
+              </div>
+              <Input.Password
+                value={apiKeyDraft}
+                onChange={event => setApiKeyDraft(event.target.value)}
+                onPressEnter={saveAPIKey}
+                placeholder="输入 API Key"
+                autoFocus
+              />
+              <Space wrap>
+                <Button type="primary" icon={<KeyOutlined />} onClick={saveAPIKey}>保存密钥</Button>
+                <Button danger icon={<ReloadOutlined />} onClick={resetAPIKey}>重置密钥</Button>
+              </Space>
+              <Alert type="info" showIcon message="重置只会清除本浏览器保存的密钥，不会修改服务器上的 API Key。" />
+            </Space>
+          </Card>
         </Modal>
       </Layout>
     </ConfigProvider>
