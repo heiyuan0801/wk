@@ -135,6 +135,8 @@ curl -sN http://localhost:7863/v1/chat/completions \
 
 也可以直接调用登录辅助程序：`./login url global` 获取海外版授权链接，浏览器完成授权后执行 `./login poll global`。中国区仍可使用原来的 `./login url` / `./login poll` 用法。中国区登录入口默认是 CodeBuddy.cn，也可以设置 `WB2A_LOGIN_PORTAL=workbuddy` 让授权链接直接打开 WorkBuddy.cn；控制台“账号授权”中也可以自由选择这两个入口。两种区域使用独立的临时 state 文件，交替登录不会互相覆盖。
 
+上游请求会按账号域名选择官方客户端标识：国内账号使用 `.cn` 域名，海外账号使用 `.ai` 域名；缺少历史 domain 字段的账号分别回退到 `www.workbuddy.cn` / `www.workbuddy.ai`。请求头使用 WorkBuddy Electron 客户端格式（`WorkBuddy/5.5.2 CLI/2.137.1`），并携带 `X-Product: SaaS`、`X-Domain`、`Origin` 和 `Referer`。
+
 **注意**：`cooldown.hard_credit` / `cooldown.err_threshold` / `cooldown.err_cooldown` 三个历史键已退役。硬冷却固定为**次日 04:00**（本地时区，`CooldownUntilTomorrow4AM`），连续错误语义并入熔断器（`pool.breaker_threshold` 触发指数退避）。旧配置中的这些键因 JSON 未知字段被自然忽略，不报错。
 
 ## 并发与性能

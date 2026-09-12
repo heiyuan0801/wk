@@ -24,7 +24,7 @@ const (
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererWorkCN = "https://www.workbuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
-	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
+	clientUA            = "WorkBuddy/5.5.2 CLI/2.137.1"
 	legacyStateFile     = "/tmp/wb2api-login-state.json"
 	maxResponseBytes    = 1 << 20
 )

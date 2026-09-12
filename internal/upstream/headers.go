@@ -4,18 +4,29 @@ package upstream
 
 import (
 	"net/http"
+	"strings"
 
 	"workbuddy2api/internal/auth"
 )
 
 const (
-	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2 WorkBuddy"
-	originRefererCN     = "https://www.codebuddy.cn"
+	// Match the Electron client family observed in WorkBuddy 5.5.2 traffic.
+	clientUA            = "WorkBuddy/5.5.2 CLI/2.137.1"
+	originRefererCN     = "https://www.workbuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 )
 
 func originRefererFor(a *auth.Auth) string {
-	if a != nil && a.Region() == "global" {
+	domain := a.RequestDomain()
+	if domain != "" {
+		if strings.HasSuffix(domain, ".ai") {
+			return "https://" + domain
+		}
+		if strings.HasSuffix(domain, ".cn") {
+			return "https://" + domain
+		}
+	}
+	if a != nil && a.Region() == auth.RegionGlobal {
 		return originRefererGlobal
 	}
 	return originRefererCN
@@ -53,16 +64,17 @@ func ChatHeaders(req *http.Request, a *auth.Auth) {
 		req.Header.Set("X-No-Enterprise-Id", "1")
 	}
 	// 安全红线：绝不在 chat 请求里携带 X-Refresh-Token。
-	if credentials.Domain != "" {
-		req.Header.Set("X-Domain", credentials.Domain)
-	} else {
-		req.Header.Set("X-No-Department-Info", "1")
-	}
+	req.Header.Set("X-Domain", a.RequestDomain())
 	req.Header.Set("X-Product", "SaaS")
 }
 
 // BillingHeaders billing 接口请求头。
 func BillingHeaders(req *http.Request, a *auth.Auth) {
+	origin := originRefererFor(a)
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", origin+"/")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("X-Product", "SaaS")
 	req.Header.Set("User-Agent", clientUA)
 	credentials := a.Snapshot()
 	req.Header.Set("Authorization", "Bearer "+credentials.AccessToken)
@@ -75,9 +87,7 @@ func BillingHeaders(req *http.Request, a *auth.Auth) {
 		req.Header.Set("X-Enterprise-Id", credentials.EnterpriseID)
 		req.Header.Set("X-Tenant-Id", credentials.EnterpriseID)
 	}
-	if credentials.Domain != "" {
-		req.Header.Set("X-Domain", credentials.Domain)
-	}
+	req.Header.Set("X-Domain", a.RequestDomain())
 }
 
 // RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。

@@ -38,7 +38,7 @@ func TestParseMissingToken(t *testing.T) {
 }
 
 func TestGlobalRegion(t *testing.T) {
-	for _, d := range []string{"workbuddy.ai", "www.workbuddy.ai", "api.workbuddy.ai", "WorkBuddy.AI", "codebuddy.ai", "api.codebuddy.ai", "https://www.workbuddy.ai/"} {
+	for _, d := range []string{"workbuddy.ai", "www.workbuddy.ai", "api.workbuddy.ai", "WorkBuddy.AI", "codebuddy.ai", "api.codebuddy.ai", "https://www.workbuddy.ai/", "gateway.example.ai"} {
 		sa := &Auth{Domain: d}
 		if sa.Region() != "global" {
 			t.Errorf("domain %q want global, got %s", d, sa.Region())
@@ -49,6 +49,15 @@ func TestGlobalRegion(t *testing.T) {
 		if sa.Region() != "cn" {
 			t.Errorf("domain %q want cn, got %s", d, sa.Region())
 		}
+	}
+}
+
+func TestRequestDomainDefaultsToRegionSuffix(t *testing.T) {
+	if got := (&Auth{}).RequestDomain(); got != DefaultDomainCN {
+		t.Fatalf("empty domain=%q want %q", got, DefaultDomainCN)
+	}
+	if got := (&Auth{Domain: "https://api.workbuddy.ai/"}).RequestDomain(); got != "api.workbuddy.ai" {
+		t.Fatalf("normalized domain=%q", got)
 	}
 }
 

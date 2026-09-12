@@ -81,12 +81,16 @@ const (
 	RegionCN     = "cn"
 	RegionGlobal = "global"
 	RegionAll    = "all"
+	// DefaultDomainCN and DefaultDomainAI are the canonical WorkBuddy hosts
+	// used when an older auth file does not contain a domain value.
+	DefaultDomainCN = "www.workbuddy.cn"
+	DefaultDomainAI = "www.workbuddy.ai"
 )
 
 // globalSuffixes 判定全球区（global）账号的域名后缀；子域（如 www./api.）
 // 也属于全球区。国际版部分接口会返回 codebuddy.ai，需与 workbuddy.ai
 // 一并识别；中国区使用的是 .cn 后缀，不会产生歧义。
-var globalSuffixes = []string{".workbuddy.ai", ".codebuddy.ai"}
+var globalSuffixes = []string{".ai"}
 
 func normalizedDomain(raw string) string {
 	raw = strings.TrimSpace(raw)
@@ -117,6 +121,22 @@ func (a *Auth) Region() string {
 		}
 	}
 	return RegionCN
+}
+
+// RequestDomain returns the normalized upstream domain for request headers.
+// Existing domains are preserved so codebuddy.cn accounts keep their portal;
+// missing legacy domains receive a canonical .cn/.ai WorkBuddy host.
+func (a *Auth) RequestDomain() string {
+	if a == nil {
+		return DefaultDomainCN
+	}
+	if d := normalizedDomain(a.Snapshot().Domain); d != "" {
+		return d
+	}
+	if a.Region() == RegionGlobal {
+		return DefaultDomainAI
+	}
+	return DefaultDomainCN
 }
 
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
