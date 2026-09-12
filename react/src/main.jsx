@@ -145,6 +145,13 @@ function App() {
   const [loginURL, setLoginURL] = useState('');
   const [loginPendingRegion, setLoginPendingRegion] = useState('');
   const [loginPolling, setLoginPolling] = useState(false);
+  // 短信直登状态：手机号 → 发码 → 验证码 → 落盘。
+  const [smsMobile, setSmsMobile] = useState('');
+  const [smsCode, setSmsCode] = useState('');
+  const [smsSession, setSmsSession] = useState('');
+  const [smsSending, setSmsSending] = useState(false);
+  const [smsVerifying, setSmsVerifying] = useState(false);
+  const [smsCountdown, setSmsCountdown] = useState(0);
   const loginRegionTouched = useRef(false);
   const loginPollAbort = useRef(false);
   const refreshController = useRef(null);
@@ -211,6 +218,13 @@ function App() {
       keepalive: (config.keepalive_hours || []).join(','),
     });
   }, [config, form]);
+
+  // 短信验证码重发倒计时：上游 60 秒内会拒绝重复发码。
+  useEffect(() => {
+    if (smsCountdown <= 0) return undefined;
+    const timer = setTimeout(() => setSmsCountdown(value => value - 1), 1000);
+    return () => clearTimeout(timer);
+  }, [smsCountdown]);
 
   useEffect(() => () => {
     refreshController.current?.abort();
@@ -491,6 +505,63 @@ function App() {
       setLoginURL('');
       setLoginPendingRegion('');
       await refresh();
+    }
+  };
+
+  // runSMSSend 发送短信验证码：成功后会拿到 session_id，验码时回传。
+  const runSMSSend = async () => {
+    const mobile = smsMobile.trim();
+    if (!mobile) { message.warning('请先填写手机号'); return; }
+    setSmsSending(true);
+    try {
+      const result = await api('/admin/account/sms/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mobile, region: 'cn' }),
+      });
+      setSmsSession(result.session_id || '');
+      setSmsCode('');
+      // 上游 60 秒内不允许重发；倒计时避免用户反复点击。
+      setSmsCountdown(Number(result.expires_in) > 0 ? 60 : 60);
+      message.success(result.status === 'unexpired'
+        ? `该号码已有未过期验证码，请直接输入${
+          result.expires_in ? `（${Math.ceil(result.expires_in / 60)} 分钟内有效）` : ''}`
+        : '验证码已发送，请查收短信');
+    } catch (error) {
+      message.error(error.message);
+    } finally {
+      setSmsSending(false);
+    }
+  };
+
+  // runSMSVerify 提交验证码：后端会走完 OneID → Keycloak → Console 全部步骤并落盘。
+  const runSMSVerify = async () => {
+    if (!smsSession) { message.warning('请先发送验证码'); return; }
+    const code = smsCode.trim();
+    if (!code) { message.warning('请填写收到的验证码'); return; }
+    setSmsVerifying(true);
+    try {
+      const result = await api('/admin/account/sms/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: smsSession, code }),
+      });
+      if (result.warning) message.warning(result.warning);
+      else message.success(`账号 ${result.nickname || result.uid?.slice(0, 12)} 已添加`);
+      setSmsSession('');
+      setSmsCode('');
+      setSmsMobile('');
+      setSmsCountdown(0);
+      await refresh();
+    } catch (error) {
+      message.error(error.message);
+      // 会话已被消费（410）时必须重新发码，不能拿旧 session_id 重试。
+      if (/会话|重新发送验证码/.test(error.message || '')) {
+        setSmsSession('');
+        setSmsCountdown(0);
+      }
+    } finally {
+      setSmsVerifying(false);
     }
   };
 
@@ -978,6 +1049,59 @@ function App() {
             <Paragraph type="secondary" style={{ margin: '12px 0 0' }}>
               中国区与海外版账号可以同时使用；登录后系统会按账号区域自动选择对应的模型、聊天和积分接口。
             </Paragraph>
+
+            <Card
+              type="inner"
+              title="短信直登（中国区）"
+              style={{ marginTop: 16 }}
+              extra={<Tag color="orange">免开浏览器</Tag>}
+            >
+              <Paragraph type="secondary" style={{ marginTop: 0 }}>
+                填写手机号后点「发送验证码」，收到短信填入验证码即可直接添加账号，
+                无需打开浏览器点授权。仅支持中国区；海外版请用上面的 OAuth 链接。
+              </Paragraph>
+              <Space wrap>
+                <Input
+                  value={smsMobile}
+                  onChange={event => setSmsMobile(event.target.value)}
+                  placeholder="手机号，如 +8613800138000 或 +852 64087495"
+                  style={{ width: 300 }}
+                  prefix={<KeyOutlined />}
+                  allowClear
+                />
+                <Button
+                  icon={<SendOutlined />}
+                  loading={smsSending}
+                  disabled={smsCountdown > 0}
+                  onClick={runSMSSend}
+                >
+                  {smsCountdown > 0 ? `${smsCountdown} 秒后可重发` : '发送验证码'}
+                </Button>
+              </Space>
+              <Space wrap style={{ marginTop: 12 }}>
+                <Input
+                  value={smsCode}
+                  onChange={event => setSmsCode(event.target.value)}
+                  onPressEnter={runSMSVerify}
+                  placeholder="6 位短信验证码"
+                  style={{ width: 200 }}
+                  disabled={!smsSession}
+                  allowClear
+                />
+                <Button
+                  type="primary"
+                  icon={<CheckCircleOutlined />}
+                  loading={smsVerifying}
+                  disabled={!smsSession}
+                  onClick={runSMSVerify}
+                >
+                  验证并添加账号
+                </Button>
+                {smsSession && (
+                  <Text type="secondary">验证码已发送，请查收；会话 10 分钟内有效</Text>
+                )}
+              </Space>
+            </Card>
           </Card>
         </Space>
       ),

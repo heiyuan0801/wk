@@ -27,6 +27,7 @@ import (
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/session"
+	"workbuddy2api/internal/smslogin"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -45,8 +46,10 @@ type Config struct {
 	// CheckinAccount / KeepaliveAccount 按单账号执行签到/保活，供控制台手动触发。
 	CheckinAccount   func(uid string) scheduler.AccountResult
 	KeepaliveAccount func(uid string) scheduler.AccountResult
-	UpdateSchedule   func(checkinHours, keepaliveHours []int)
-	MaxRotate        int // 单请求最多换号次数，默认 3
+	// SMSLogin 短信直登（中国区）。nil = 关闭该入口，控制台回退到 OAuth 链接。
+	SMSLogin       *smslogin.Manager
+	UpdateSchedule func(checkinHours, keepaliveHours []int)
+	MaxRotate      int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -146,6 +149,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/credits/refresh", h.withFrontend(h.refreshCredits))
 	h.mux.HandleFunc("POST /admin/account/url", h.withFrontend(h.accountURL))
 	h.mux.HandleFunc("POST /admin/account/poll", h.withFrontend(h.accountPoll))
+	// 短信直登：发码 + 验码落盘，省掉浏览器授权。
+	h.mux.HandleFunc("POST /admin/account/sms/send", h.withFrontend(h.accountSMSSend))
+	h.mux.HandleFunc("POST /admin/account/sms/verify", h.withFrontend(h.accountSMSVerify))
 	h.mux.HandleFunc("POST /admin/account/{uid}/enable", h.withFrontend(h.enableAccount))
 	h.mux.HandleFunc("POST /admin/account/{uid}/disable", h.withFrontend(h.disableAccount))
 	h.mux.HandleFunc("POST /admin/account/{uid}/clear-cooldown", h.withFrontend(h.clearCooldownAccount))
@@ -578,25 +584,63 @@ func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
 		// host is necessary because account.Region() drives every later request.
 		result.Domain = "www.workbuddy.ai"
 	}
-	if filepath.Base(result.UID) != result.UID || strings.ContainsAny(result.UID, `/\`) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "授权返回的 UID 无效"})
+	response, status, err := h.persistAccount(accountCredential{
+		UID:          result.UID,
+		Nickname:     result.Nickname,
+		EnterpriseID: result.EnterpriseID,
+		Domain:       result.Domain,
+		AccessToken:  result.AccessToken,
+		RefreshToken: result.RefreshToken,
+		ExpiresIn:    result.ExpiresIn,
+	}, region)
+	if err != nil {
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
+	}
+	writeJSON(w, status, response)
+}
+
+// accountCredential 是新增账号的落盘输入，OAuth 与短信直登共用。
+type accountCredential struct {
+	UID          string
+	Nickname     string
+	EnterpriseID string
+	Domain       string
+	AccessToken  string
+	RefreshToken string
+	ExpiresIn    int64
+}
+
+// persistAccount 把一份新凭证写入 auths/、热加载进账号池，并按需把配置提升为
+// 混合区域。返回控制台响应体与 HTTP 状态码；err 非 nil 时 status 为其对应码。
+//
+// region 是本次登录所属区域，仅用于决定是否要把 config.region 提升为 all。
+func (h *Handler) persistAccount(cred accountCredential, region string) (map[string]any, int, error) {
+	if filepath.Base(cred.UID) != cred.UID || strings.ContainsAny(cred.UID, `/\`) {
+		return nil, http.StatusBadRequest, errors.New("授权返回的 UID 无效")
 	}
 	if err := os.MkdirAll(h.cfg.AuthDir, 0700); err != nil {
-		writeJSON(w, 500, map[string]string{"error": err.Error()})
-		return
+		return nil, 500, err
 	}
 	expiresAt := int64(0)
-	if result.ExpiresIn > 0 {
-		expiresAt = time.Now().Unix() + result.ExpiresIn
+	if cred.ExpiresIn > 0 {
+		expiresAt = time.Now().Unix() + cred.ExpiresIn
 	}
-	doc := map[string]any{"auth": map[string]any{"accessToken": result.AccessToken, "refreshToken": result.RefreshToken, "expiresAt": expiresAt, "domain": result.Domain}, "account": map[string]any{"uid": result.UID, "enterpriseId": result.EnterpriseID, "nickname": result.Nickname}}
+	doc := map[string]any{
+		"auth": map[string]any{
+			"accessToken": cred.AccessToken, "refreshToken": cred.RefreshToken,
+			"expiresAt": expiresAt, "domain": cred.Domain,
+		},
+		"account": map[string]any{
+			"uid": cred.UID, "enterpriseId": cred.EnterpriseID, "nickname": cred.Nickname,
+		},
+	}
 	raw, _ := json.MarshalIndent(doc, "", "  ")
-	path := filepath.Join(h.cfg.AuthDir, "workbuddy-"+result.UID+".json")
+	path := filepath.Join(h.cfg.AuthDir, "workbuddy-"+cred.UID+".json")
 	if err := writeFileAtomic(path, append(raw, '\n'), 0600); err != nil {
-		writeJSON(w, 500, map[string]string{"error": err.Error()})
-		return
+		return nil, 500, err
 	}
+
 	loadedMixed := false
 	if h.cfg.Pool != nil {
 		if loaded, loadErr := auth.LoadDir(h.cfg.AuthDir, auth.RegionAll); loadErr == nil {
@@ -607,19 +651,19 @@ func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
 			loadedMixed = len(regions) > 1
 			h.cfg.Pool.SyncToDir(loaded)
 		} else {
-			log.Printf("account poll: reload auths failed: %v", loadErr)
+			log.Printf("account add: reload auths failed: %v", loadErr)
 		}
 		h.cfg.Pool.Add(&auth.Auth{
-			AccessToken: result.AccessToken, RefreshToken: result.RefreshToken, ExpiresAt: expiresAt,
-			Domain: result.Domain, UID: result.UID, EnterpriseID: result.EnterpriseID,
-			Nickname: result.Nickname, FilePath: path,
+			AccessToken: cred.AccessToken, RefreshToken: cred.RefreshToken, ExpiresAt: expiresAt,
+			Domain: cred.Domain, UID: cred.UID, EnterpriseID: cred.EnterpriseID,
+			Nickname: cred.Nickname, FilePath: path,
 		})
 	}
 	// A newly added account may expose a different regional model catalogue.
 	// Force the next /models request to fetch with the expanded pool.
 	invalidateDynamicModelsCache()
 
-	response := map[string]any{"ok": true, "uid": result.UID, "nickname": result.Nickname, "region": region}
+	response := map[string]any{"ok": true, "uid": cred.UID, "nickname": cred.Nickname, "region": region}
 	var configErr error
 	if loadedMixed {
 		configErr = h.promoteMixedRegion()
@@ -631,7 +675,94 @@ func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
 		// so an unwritable config mount does not hide the restart persistence fix.
 		response["warning"] = "账号已添加，但混合区域配置未能保存：" + configErr.Error()
 	}
-	writeJSON(w, http.StatusOK, response)
+	return response, http.StatusOK, nil
+}
+
+// accountSMSSend 短信直登第一步：向指定手机号下发 OneID 短信验证码。
+// 返回 session_id，验码时凭它取回本次登录的中间状态。
+func (h *Handler) accountSMSSend(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.SMSLogin == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "短信登录未启用"})
+		return
+	}
+	var req struct {
+		Mobile string `json:"mobile"`
+		Region string `json:"region"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
+		return
+	}
+	region, err := normalizeLoginRegion(req.Region)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	// 手机号与验证码属于敏感输入，失败原因要回给用户，但绝不写进日志。
+	res, err := h.cfg.SMSLogin.Send(r.Context(), req.Mobile, region)
+	if err != nil {
+		writeJSON(w, smsLoginStatus(err), map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "session_id": res.SessionID, "mobile": res.Mobile,
+		"status": res.Status, "expires_in": res.ExpiresIn, "region": region,
+	})
+}
+
+// accountSMSVerify 短信直登第二步：校验验证码，走完全部上游步骤并把账号落盘。
+func (h *Handler) accountSMSVerify(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.SMSLogin == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "短信登录未启用"})
+		return
+	}
+	var req struct {
+		SessionID string `json:"session_id"`
+		Code      string `json:"code"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
+		return
+	}
+	creds, err := h.cfg.SMSLogin.Verify(r.Context(), req.SessionID, req.Code)
+	if err != nil {
+		writeJSON(w, smsLoginStatus(err), map[string]string{"error": err.Error()})
+		return
+	}
+	response, status, err := h.persistAccount(accountCredential{
+		UID:          creds.UID,
+		Nickname:     creds.Nickname,
+		EnterpriseID: creds.EnterpriseID,
+		Domain:       creds.Domain,
+		AccessToken:  creds.AccessToken,
+		RefreshToken: creds.RefreshToken,
+		ExpiresIn:    creds.ExpiresIn,
+	}, creds.Region)
+	if err != nil {
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, status, response)
+}
+
+// smsLoginStatus 把登录失败映射到 HTTP 状态码：会话失效用 410，其余上游/参数
+// 问题用 502 或 400，便于控制台区分"重发验证码"与"直接报错"。
+func smsLoginStatus(err error) int {
+	switch {
+	case errors.Is(err, smslogin.ErrSessionNotFound):
+		return http.StatusGone
+	case errors.Is(err, smslogin.ErrGlobalUnsupported):
+		return http.StatusBadRequest
+	}
+	var ue *smslogin.Error
+	if errors.As(err, &ue) {
+		switch ue.Step {
+		case "发送验证码", "校验验证码", "读取账号":
+			return http.StatusBadRequest
+		}
+		return http.StatusBadGateway
+	}
+	return http.StatusBadRequest
 }
 
 // promoteMixedRegionIfNeeded keeps both CN and global credentials available

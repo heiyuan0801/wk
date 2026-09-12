@@ -19,6 +19,7 @@ import (
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
 	"workbuddy2api/internal/session"
+	"workbuddy2api/internal/smslogin"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -261,14 +262,16 @@ func main() {
 		CreditRefreshNow: sch.RunCreditRefreshNow,
 		CheckinAccount:   sch.CheckinAccount,
 		KeepaliveAccount: sch.KeepaliveAccount,
-		UpdateSchedule:   sch.UpdateSchedule,
-		Session:          sessRouter,
-		StickyCount:      sessCount,
-		RedisMode:        redisMode,
-		ResponseStore:    responseStore,
-		MetricsStore:     persistentMetrics,
-		RequestLogStore:  requestLogs,
-		CompletionStore:  completions,
+		// 短信直登只走中国区 codebuddy.cn 的 OneID/Keycloak；海外版继续用 OAuth 链接。
+		SMSLogin:        smslogin.NewManager(smslogin.DefaultEndpoints(), 10*time.Minute),
+		UpdateSchedule:  sch.UpdateSchedule,
+		Session:         sessRouter,
+		StickyCount:     sessCount,
+		RedisMode:       redisMode,
+		ResponseStore:   responseStore,
+		MetricsStore:    persistentMetrics,
+		RequestLogStore: requestLogs,
+		CompletionStore: completions,
 		CreditPolicy: server.CreditPolicy{
 			InputPer1K:       cfg.Billing.InputCreditsPer1KTokens,
 			OutputPer1K:      cfg.Billing.OutputCreditsPer1KTokens,
