@@ -440,10 +440,23 @@ func (s *session) oneIDSend(ctx context.Context, ep Endpoints) (status string, e
 		return "", 0, "", stepErr("发送验证码", "OneID 拒绝了本次请求", s.redactErr(err))
 	}
 	status = firstNonEmpty(resp.Status, resp.Data.Status)
-	if status == "need_captcha" || len(resp.Captcha) > 0 || len(resp.Data.Captcha) > 0 {
-		return "", 0, "", stepErr("发送验证码", "该号码需要图形验证码，请稍后重试或改用浏览器授权登录", nil)
+	// 判定验证码必须看 status，或 captcha 是否为**非空对象**。
+	// 注意 captcha 字段常为字面量 null，其 json.RawMessage 长度为 4，
+	// 用 len(...) > 0 判空会把所有正常响应误判成"需要图形验证码"。
+	if status == "need_captcha" || hasCaptcha(resp.Captcha) || hasCaptcha(resp.Data.Captcha) {
+		return "", 0, "", stepErr("发送验证码", "该号码被上游要求图形验证码，请改用浏览器授权登录", nil)
 	}
 	return status, firstNonZero(resp.ExpiresIn, resp.Data.ExpiresIn), firstNonEmpty(resp.StateToken, resp.Data.StateToken), nil
+}
+
+// hasCaptcha 报告 captcha 字段是否携带真实内容。上游在不需要验证码时返回
+// 字面量 null（RawMessage = "null"），只有出现对象才算真的要求过验证码。
+func hasCaptcha(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return false
+	}
+	return !bytes.Equal(trimmed, []byte("null"))
 }
 
 // oneIDVerify 第 3 步：校验短信验证码，换取新的 state_token。

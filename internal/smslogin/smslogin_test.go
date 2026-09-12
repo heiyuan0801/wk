@@ -33,6 +33,8 @@ type fakeUpstream struct {
 	forceSSO bool
 	// OneID 账号数量，>1 用于验证多账号拒绝分支。
 	accountCount int
+	// needCaptcha 模拟上游要求图形验证码。
+	needCaptcha bool
 }
 
 func newFakeUpstream() *fakeUpstream {
@@ -94,7 +96,13 @@ func newFakeUpstream() *fakeUpstream {
 				writeJSONRaw(w, 400, `{"errCode":"E0010001","errMessage":"请求参数不合法"}`)
 				return
 			}
-			writeJSONRaw(w, 200, `{"status":"unexpired","state_token":"tok-send","expires_in":300}`)
+			// 真实上游在不要求验证码时回的是字面量 "captcha":null —— 必须原样复刻，
+			// 否则 len(RawMessage) > 0 的误判不会被测试发现。
+			if f.needCaptcha {
+				writeJSONRaw(w, 200, `{"captcha":{"cloudType":"Tencent","appId":"x"},"expires_in":60,"status":"need_captcha"}`)
+				return
+			}
+			writeJSONRaw(w, 200, `{"captcha":null,"expires_in":300,"status":"unexpired","state_token":"tok-send"}`)
 		case "/v1/auth/sms/code/verify":
 			var req struct {
 				StateToken string `json:"state_token"`
@@ -523,6 +531,59 @@ func TestBrokerLoginURLIsRefetched(t *testing.T) {
 	}
 	if authCalls != 2 {
 		t.Fatalf("keycloak login page fetched %d times, want 2", authCalls)
+	}
+}
+
+// TestSendAcceptsNullCaptcha 上游在不需要图形验证码时回的是 `"captcha":null`。
+// json.RawMessage 对 null 的长度是 4，早期实现用 len(...) > 0 判空，把所有正常
+// 发码响应都误判成"需要图形验证码"，导致功能整体不可用。此用例锁住该回归。
+func TestSendAcceptsNullCaptcha(t *testing.T) {
+	f := newFakeUpstream()
+	defer f.close()
+	m := NewManager(f.endpoints(), 0)
+
+	send, err := m.Send(context.Background(), "+852 64087495", "cn")
+	if err != nil {
+		t.Fatalf("null captcha must not be treated as a challenge: %v", err)
+	}
+	if send.SessionID == "" {
+		t.Fatal("send should return a session id")
+	}
+	// 拿到会话后必须能继续走完验码。
+	if _, err := m.Verify(context.Background(), send.SessionID, "123456"); err != nil {
+		t.Fatalf("verify after null captcha: %v", err)
+	}
+}
+
+// TestSendRejectsRealCaptcha 真要求验证码时仍须明确失败，并提示改用浏览器授权。
+func TestSendRejectsRealCaptcha(t *testing.T) {
+	f := newFakeUpstream()
+	f.needCaptcha = true
+	defer f.close()
+	m := NewManager(f.endpoints(), 0)
+
+	_, err := m.Send(context.Background(), "+852 64087495", "cn")
+	if err == nil {
+		t.Fatal("captcha challenge must fail")
+	}
+	if !strings.Contains(err.Error(), "图形验证码") {
+		t.Fatalf("error should mention the captcha: %v", err)
+	}
+}
+
+// TestHasCaptcha 直接覆盖判空语义：null 与空值都不算验证码，对象才算。
+func TestHasCaptcha(t *testing.T) {
+	cases := map[string]bool{
+		"":                        false,
+		"null":                    false,
+		"  null  ":                false,
+		`{"appId":"x"}`:           true,
+		`{"cloudType":"Tencent"}`: true,
+	}
+	for raw, want := range cases {
+		if got := hasCaptcha([]byte(raw)); got != want {
+			t.Errorf("hasCaptcha(%q)=%v want %v", raw, got, want)
+		}
 	}
 }
 
