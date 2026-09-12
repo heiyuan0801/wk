@@ -83,6 +83,13 @@ type Backend interface {
 	Close() error
 }
 
+// RequestCreditTimeMatcher is an optional fallback for upstream billing
+// records whose request ID is not the same identifier exposed by chat. It
+// matches an un reconciled log by account, model, and request timestamp.
+type RequestCreditTimeMatcher interface {
+	ReconcileRequestCreditByTime(string, string, time.Time, float64) error
+}
+
 const maxRequestLogs = 10000
 
 func Open(path string) (*Store, error) {
@@ -366,6 +373,34 @@ func (s *Store) ReconcileRequestCredit(id string, credit float64) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// ReconcileRequestCreditByTime reconciles a billing record when the upstream
+// chat and billing services emitted different request ID formats.
+func (s *Store) ReconcileRequestCreditByTime(accountUID, model string, requestAt time.Time, credit float64) error {
+	if accountUID == "" || requestAt.IsZero() || credit < 0 {
+		return nil
+	}
+	target := requestAt.Unix()
+	s.mu.Lock()
+	var id string
+	query := `SELECT id FROM request_logs WHERE account_uid=? AND created_at BETWEEN ? AND ? AND credit_source IN ('unknown','estimated')`
+	args := []any{accountUID, target - 15, target + 15}
+	if model != "" {
+		query += ` AND model=?`
+		args = append(args, model)
+	}
+	query += ` ORDER BY ABS(created_at-?) ASC, log_id DESC LIMIT 1`
+	args = append(args, target)
+	if err := s.db.QueryRow(query, args...).Scan(&id); err != nil {
+		s.mu.Unlock()
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		return err
+	}
+	s.mu.Unlock()
+	return s.ReconcileRequestCredit(id, credit)
 }
 
 func insertRequest(db metricsExecutor, record RequestRecord, writes int) error {

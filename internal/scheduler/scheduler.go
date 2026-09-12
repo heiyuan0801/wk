@@ -129,6 +129,12 @@ func (s *Scheduler) RunRequestCreditRefreshNow() {
 	if len(logs) == 0 {
 		return
 	}
+	knownIDs := make(map[string]struct{}, len(logs))
+	for _, record := range logs {
+		if record.ID != "" {
+			knownIDs[record.ID] = struct{}{}
+		}
+	}
 	start := time.Now().Add(-48 * time.Hour)
 	end := time.Now().Add(2 * time.Hour)
 	for _, st := range s.cfg.Pool.List() {
@@ -150,9 +156,23 @@ func (s *Scheduler) RunRequestCreditRefreshNow() {
 				if row.RequestID == "" {
 					continue
 				}
+				matchedByID := false
 				for _, id := range requestIDCandidates(row.RequestID) {
+					if _, ok := knownIDs[id]; ok {
+						matchedByID = true
+					}
 					if err := s.cfg.RequestCredits.ReconcileRequestCredit(id, row.Credit); err != nil {
 						log.Printf("reconcile request credit %s: %v", id, err)
+					}
+				}
+				if !matchedByID {
+					if matcher, ok := s.cfg.RequestCredits.(metricsstore.RequestCreditTimeMatcher); ok {
+						requestAt, err := time.ParseInLocation("2006-01-02 15:04:05", row.RequestTime, time.Local)
+						if err == nil {
+							if err := matcher.ReconcileRequestCreditByTime(st.UID, row.Model, requestAt, row.Credit); err != nil {
+								log.Printf("reconcile request credit by time %s: %v", st.UID, err)
+							}
+						}
 					}
 				}
 			}

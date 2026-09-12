@@ -274,6 +274,35 @@ func (s *PostgresStore) ReconcileRequestCredit(id string, credit float64) error 
 	return tx.Commit()
 }
 
+// ReconcileRequestCreditByTime reconciles a billing record when the upstream
+// chat and billing services emitted different request ID formats.
+func (s *PostgresStore) ReconcileRequestCreditByTime(accountUID, model string, requestAt time.Time, credit float64) error {
+	if accountUID == "" || requestAt.IsZero() || credit < 0 {
+		return nil
+	}
+	target := requestAt.Unix()
+	s.mu.RLock()
+	query := `SELECT id FROM request_logs WHERE account_uid=$1 AND created_at BETWEEN $2 AND $3 AND credit_source IN ('unknown','estimated')`
+	args := []any{accountUID, target - 15, target + 15}
+	if model != "" {
+		query += ` AND model=$4 ORDER BY ABS(created_at-$5) ASC, log_id DESC LIMIT 1`
+		args = append(args, model, target)
+	} else {
+		query += ` ORDER BY ABS(created_at-$4) ASC, log_id DESC LIMIT 1`
+		args = append(args, target)
+	}
+	var id string
+	if err := s.db.QueryRow(query, args...).Scan(&id); err != nil {
+		s.mu.RUnlock()
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		return err
+	}
+	s.mu.RUnlock()
+	return s.ReconcileRequestCredit(id, credit)
+}
+
 func insertRequestPostgres(db postgresExecutor, record RequestRecord, writes int) error {
 	_, err := db.Exec(`INSERT INTO request_logs(
 		id, created_at, route, model, mode, status, account_uid, account_region, requested_output_tokens,
