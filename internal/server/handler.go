@@ -2010,6 +2010,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		st.uid = acct.UID
+		st.region = acct.Region()
 		tried[acct.UID] = true
 
 		// Selection and reservation are atomic; retries are reserved for actual

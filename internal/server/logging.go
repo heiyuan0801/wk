@@ -51,6 +51,7 @@ type RequestLog struct {
 	Mode                  string  `json:"mode"`
 	Status                int     `json:"status"`
 	AccountUID            string  `json:"account_uid,omitempty"`
+	AccountRegion         string  `json:"account_region,omitempty"`
 	RequestedOutputTokens int64   `json:"requested_output_tokens"`
 	InputTokens           int64   `json:"input_tokens"`
 	OutputTokens          int64   `json:"output_tokens"`
@@ -92,6 +93,7 @@ type chatStat struct {
 	model                 string
 	mode                  string // "stream" | "sync"
 	uid                   string // 完整 uid，展示时只取前 8 位
+	region                string // cn 或 global
 	ttfb                  time.Duration
 	toks                  int // <0 表示 usage 缺失 → 显示 "-"
 	inputTokens           int
@@ -223,6 +225,7 @@ func (s *chatStat) done() {
 			Mode:                  s.mode,
 			Status:                status,
 			AccountUID:            s.uid,
+			AccountRegion:         s.region,
 			RequestedOutputTokens: int64(s.requestedOutputTokens),
 			InputTokens:           int64(s.inputTokens),
 			OutputTokens:          int64(outputTokens),

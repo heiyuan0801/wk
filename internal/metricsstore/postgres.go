@@ -84,6 +84,7 @@ func initPostgresSchema(ctx context.Context, db *sql.DB) error {
 		mode TEXT NOT NULL,
 		status INTEGER NOT NULL,
 		account_uid TEXT NOT NULL DEFAULT '',
+		account_region TEXT NOT NULL DEFAULT '',
 		requested_output_tokens BIGINT NOT NULL DEFAULT 0,
 		input_tokens BIGINT NOT NULL DEFAULT 0,
 		output_tokens BIGINT NOT NULL DEFAULT 0,
@@ -103,6 +104,9 @@ func initPostgresSchema(ctx context.Context, db *sql.DB) error {
 	}
 	if _, err := db.ExecContext(ctx, `ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS error_message TEXT NOT NULL DEFAULT ''`); err != nil {
 		return fmt.Errorf("migrate postgres request_logs: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS account_region TEXT NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("migrate postgres request_logs region: %w", err)
 	}
 	if _, err := db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS request_logs_created_at_idx ON request_logs(created_at DESC, log_id DESC)`); err != nil {
 		return fmt.Errorf("create postgres request_logs index: %w", err)
@@ -272,12 +276,12 @@ func (s *PostgresStore) ReconcileRequestCredit(id string, credit float64) error 
 
 func insertRequestPostgres(db postgresExecutor, record RequestRecord, writes int) error {
 	_, err := db.Exec(`INSERT INTO request_logs(
-		id, created_at, route, model, mode, status, account_uid, requested_output_tokens,
+		id, created_at, route, model, mode, status, account_uid, account_region, requested_output_tokens,
 		input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
 		tool_calls, ttfb_millis, latency_millis, credits_consumed, credit_source,
 		passthrough, error_code, error_message
 	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
-		record.ID, record.CreatedAt, record.Route, record.Model, record.Mode, record.Status, record.AccountUID, record.RequestedOutputTokens,
+		record.ID, record.CreatedAt, record.Route, record.Model, record.Mode, record.Status, record.AccountUID, record.AccountRegion, record.RequestedOutputTokens,
 		record.InputTokens, record.OutputTokens, record.TotalTokens, record.CacheReadTokens, record.CacheWriteTokens,
 		record.ToolCalls, record.TTFBMillis, record.LatencyMillis, record.CreditsConsumed, record.CreditSource,
 		record.Passthrough, record.ErrorCode, record.ErrorMessage)
@@ -295,7 +299,7 @@ func (s *PostgresStore) RecentRequests(limit int) ([]RequestRecord, error) {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`SELECT id, created_at, route, model, mode, status, account_uid, requested_output_tokens,
+	rows, err := s.db.Query(`SELECT id, created_at, route, model, mode, status, account_uid, account_region, requested_output_tokens,
 		input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
 		tool_calls, ttfb_millis, latency_millis, credits_consumed, credit_source, passthrough, error_code, error_message
 		FROM request_logs ORDER BY created_at DESC, log_id DESC LIMIT $1`, limit)
@@ -306,7 +310,7 @@ func (s *PostgresStore) RecentRequests(limit int) ([]RequestRecord, error) {
 	var out []RequestRecord
 	for rows.Next() {
 		var record RequestRecord
-		if err := rows.Scan(&record.ID, &record.CreatedAt, &record.Route, &record.Model, &record.Mode, &record.Status, &record.AccountUID, &record.RequestedOutputTokens,
+		if err := rows.Scan(&record.ID, &record.CreatedAt, &record.Route, &record.Model, &record.Mode, &record.Status, &record.AccountUID, &record.AccountRegion, &record.RequestedOutputTokens,
 			&record.InputTokens, &record.OutputTokens, &record.TotalTokens, &record.CacheReadTokens, &record.CacheWriteTokens,
 			&record.ToolCalls, &record.TTFBMillis, &record.LatencyMillis, &record.CreditsConsumed, &record.CreditSource, &record.Passthrough, &record.ErrorCode, &record.ErrorMessage); err != nil {
 			return nil, err

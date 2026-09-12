@@ -45,6 +45,7 @@ type RequestRecord struct {
 	Mode                  string  `json:"mode"`
 	Status                int     `json:"status"`
 	AccountUID            string  `json:"account_uid,omitempty"`
+	AccountRegion         string  `json:"account_region,omitempty"`
 	RequestedOutputTokens int64   `json:"requested_output_tokens"`
 	InputTokens           int64   `json:"input_tokens"`
 	OutputTokens          int64   `json:"output_tokens"`
@@ -115,6 +116,7 @@ func Open(path string) (*Store, error) {
 		mode TEXT NOT NULL,
 		status INTEGER NOT NULL,
 		account_uid TEXT NOT NULL DEFAULT '',
+		account_region TEXT NOT NULL DEFAULT '',
 		requested_output_tokens INTEGER NOT NULL DEFAULT 0,
 		input_tokens INTEGER NOT NULL DEFAULT 0,
 		output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -136,6 +138,10 @@ func Open(path string) (*Store, error) {
 	// Keep existing installations compatible when request_logs was created by
 	// an earlier version without the human-readable error detail column.
 	if _, err := db.Exec(`ALTER TABLE request_logs ADD COLUMN error_message TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(`ALTER TABLE request_logs ADD COLUMN account_region TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		db.Close()
 		return nil, err
 	}
@@ -198,6 +204,7 @@ func migrateRequestLogs(ctx context.Context, db *sql.DB) error {
 		mode TEXT NOT NULL,
 		status INTEGER NOT NULL,
 		account_uid TEXT NOT NULL DEFAULT '',
+		account_region TEXT NOT NULL DEFAULT '',
 		requested_output_tokens INTEGER NOT NULL DEFAULT 0,
 		input_tokens INTEGER NOT NULL DEFAULT 0,
 		output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -215,8 +222,8 @@ func migrateRequestLogs(ctx context.Context, db *sql.DB) error {
 	)`); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO request_logs(id, created_at, route, model, mode, status, account_uid, requested_output_tokens, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tool_calls, ttfb_millis, latency_millis, credits_consumed, credit_source, passthrough, error_code, error_message)
-		SELECT id, created_at, route, model, mode, status, account_uid, requested_output_tokens, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tool_calls, ttfb_millis, latency_millis, credits_consumed, credit_source, passthrough, error_code, error_message FROM request_logs_legacy`); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO request_logs(id, created_at, route, model, mode, status, account_uid, account_region, requested_output_tokens, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tool_calls, ttfb_millis, latency_millis, credits_consumed, credit_source, passthrough, error_code, error_message)
+		SELECT id, created_at, route, model, mode, status, account_uid, '', requested_output_tokens, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tool_calls, ttfb_millis, latency_millis, credits_consumed, credit_source, passthrough, error_code, error_message FROM request_logs_legacy`); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `DROP TABLE request_logs_legacy`); err != nil {
@@ -363,12 +370,12 @@ func (s *Store) ReconcileRequestCredit(id string, credit float64) error {
 
 func insertRequest(db metricsExecutor, record RequestRecord, writes int) error {
 	_, err := db.Exec(`INSERT INTO request_logs(
-		id, created_at, route, model, mode, status, account_uid, requested_output_tokens,
+		id, created_at, route, model, mode, status, account_uid, account_region, requested_output_tokens,
 		input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
 		tool_calls, ttfb_millis, latency_millis, credits_consumed, credit_source,
 		passthrough, error_code, error_message
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		record.ID, record.CreatedAt, record.Route, record.Model, record.Mode, record.Status, record.AccountUID, record.RequestedOutputTokens,
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		record.ID, record.CreatedAt, record.Route, record.Model, record.Mode, record.Status, record.AccountUID, record.AccountRegion, record.RequestedOutputTokens,
 		record.InputTokens, record.OutputTokens, record.TotalTokens, record.CacheReadTokens, record.CacheWriteTokens,
 		record.ToolCalls, record.TTFBMillis, record.LatencyMillis, record.CreditsConsumed, record.CreditSource,
 		boolInt(record.Passthrough), record.ErrorCode, record.ErrorMessage,
@@ -389,7 +396,7 @@ func (s *Store) RecentRequests(limit int) ([]RequestRecord, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT id, created_at, route, model, mode, status, account_uid, requested_output_tokens,
+	rows, err := s.db.Query(`SELECT id, created_at, route, model, mode, status, account_uid, account_region, requested_output_tokens,
 		input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
 		tool_calls, ttfb_millis, latency_millis, credits_consumed, credit_source, passthrough, error_code, error_message
 		FROM request_logs ORDER BY created_at DESC, rowid DESC LIMIT ?`, limit)
@@ -401,7 +408,7 @@ func (s *Store) RecentRequests(limit int) ([]RequestRecord, error) {
 	for rows.Next() {
 		var record RequestRecord
 		var passthrough int
-		if err := rows.Scan(&record.ID, &record.CreatedAt, &record.Route, &record.Model, &record.Mode, &record.Status, &record.AccountUID, &record.RequestedOutputTokens,
+		if err := rows.Scan(&record.ID, &record.CreatedAt, &record.Route, &record.Model, &record.Mode, &record.Status, &record.AccountUID, &record.AccountRegion, &record.RequestedOutputTokens,
 			&record.InputTokens, &record.OutputTokens, &record.TotalTokens, &record.CacheReadTokens, &record.CacheWriteTokens,
 			&record.ToolCalls, &record.TTFBMillis, &record.LatencyMillis, &record.CreditsConsumed, &record.CreditSource, &passthrough, &record.ErrorCode, &record.ErrorMessage); err != nil {
 			return nil, err

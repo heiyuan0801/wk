@@ -448,6 +448,7 @@ function App() {
     { title: '首 token', dataIndex: 'ttfb_millis', render: value => value ? `${value}ms` : '-' },
     { title: '耗时', dataIndex: 'latency_millis', render: value => value ? `${(value / 1000).toFixed(2)}s` : '-' },
     { title: '账号', dataIndex: 'account_uid', render: value => value ? <Text code>{value.slice(0, 12)}</Text> : '-' },
+    { title: '版本', dataIndex: 'account_region', render: value => <Tag color={value === 'global' ? 'gold' : value === 'cn' ? 'blue' : 'default'}>{value === 'global' ? '海外版' : value === 'cn' ? '国内版' : '未知'}</Tag> },
     {
       title: '错误',
       render: (_, record) => record.error_code || record.error_message
