@@ -1,0 +1,97 @@
+package server
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+// TestExtractCreditUsageBareCreditField 固定一个真实回归：
+// WorkBuddy 上游在 usage 里返回裸字段 "credit"（值为已四舍五入到 0.01 的本次费用），
+// 而不是 credits_consumed / creditConsumed 之类的长名。
+// 修复前该字段被忽略，导致所有请求都记为 credit_source=unknown、credits=0。
+func TestExtractCreditUsageBareCreditField(t *testing.T) {
+	// 实抓样本：长输入冷缓存，usage.credit = 0.04
+	raw := `{"usage":{"prompt_tokens":3011,"prompt_cache_hit_tokens":0,
+		"prompt_cache_miss_tokens":3011,"completion_tokens":5,"credit":0.04}}`
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := extractCreditUsage(resp)
+	if !ok {
+		t.Fatal("usage.credit 未被识别（ok=false）")
+	}
+	if got != 0.04 {
+		t.Errorf("credit = %v, want 0.04", got)
+	}
+}
+
+// TestExtractCreditUsageZeroIsValid 记录一个语义决定：
+// credit=0 是**合法观测**（费用小于 0.005 被舍入到 0），不是"字段缺失"。
+// 因此必须返回 ok=true；否则调用方会把它当作 unknown 并用本地费率估算，
+// 从而把"确实免费的小请求"错算成有费用。
+func TestExtractCreditUsageZeroIsValid(t *testing.T) {
+	raw := `{"usage":{"prompt_tokens":11,"completion_tokens":81,"credit":0}}`
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := extractCreditUsage(resp)
+	if !ok {
+		t.Fatal("credit=0 应被识别为合法观测（ok=true）")
+	}
+	if got != 0 {
+		t.Errorf("credit = %v, want 0", got)
+	}
+}
+
+// TestExtractCreditUsageAbsentField 保证"真的没这个字段"时仍返回 false，
+// 这样调用方才回退到本地费率估算。
+func TestExtractCreditUsageAbsentField(t *testing.T) {
+	raw := `{"usage":{"prompt_tokens":11,"completion_tokens":81}}`
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := extractCreditUsage(resp); ok {
+		t.Error("无 credit 字段时应返回 ok=false")
+	}
+}
+
+// TestExtractCreditUsageStreamChunk 流式路径的末帧同样携带 credit，
+// 且是嵌套在 chunk 顶层 usage 下（与 chatStatsReader.parseSSELine 的入口一致）。
+func TestExtractCreditUsageStreamChunk(t *testing.T) {
+	raw := `{"id":"x","choices":[],"usage":{"prompt_tokens":3011,
+		"prompt_cache_hit_tokens":2816,"prompt_cache_miss_tokens":195,
+		"completion_tokens":5,"credit":0}}`
+	var chunk map[string]any
+	if err := json.Unmarshal([]byte(raw), &chunk); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := extractCreditUsage(chunk)
+	if !ok {
+		t.Fatal("流式末帧的 usage.credit 未被识别")
+	}
+	if got != 0 {
+		t.Errorf("credit = %v, want 0", got)
+	}
+}
+
+// TestCreditPolicyEstimateMatchesUpstreamFormula 交叉验证本地估算公式与实测口径一致。
+// 实测表明计费式为 p_in*miss + p_cr*hit + p_out*out，
+// 而 CreditPolicy.Estimate 收到的是 (inputTokens, outputTokens, cacheRead)，
+// 其中 inputTokens 为总输入（= miss + hit）。因此 estimate 用
+// inputTokens-cacheRead 还原 miss 是**正确**的（无需引入 cacheWrite 项）。
+func TestCreditPolicyEstimateMatchesUpstreamFormula(t *testing.T) {
+	p := CreditPolicy{InputPer1K: 0.014236, OutputPer1K: 0.057009, CachedInputPer1K: 0.000285}
+	// 实抓：prompt=3011 hit=2816 miss=195 out=5 -> credit 0.00（舍入后）
+	got, ok := p.Estimate(3011, 5, 2816)
+	if !ok {
+		t.Fatal("Estimate 应可用")
+	}
+	// 预期 = (0.014236*195 + 0.000285*2816 + 0.057009*5)/1000 ≈ 0.00386
+	want := 0.00386
+	if diff := got - want; diff > 1e-4 || diff < -1e-4 {
+		t.Errorf("Estimate = %.6f, want ≈ %.6f", got, want)
+	}
+}

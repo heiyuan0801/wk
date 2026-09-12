@@ -9,10 +9,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/metricsstore"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
@@ -249,6 +251,10 @@ func main() {
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
 	})
 
+	// SMSLogin 与 AutoEnroll 必须共享同一个管理器：代理池冷却是全局状态，
+	// 各建一份会让手动发码和自动加号在 30 分钟内撞同一个出口 IP。
+	smsManager := newSMSLoginManager(cfg)
+
 	h := server.NewHandler(server.Config{
 		Pool:             p,
 		Upstream:         up,
@@ -263,7 +269,11 @@ func main() {
 		CheckinAccount:   sch.CheckinAccount,
 		KeepaliveAccount: sch.KeepaliveAccount,
 		// 短信直登只走中国区 codebuddy.cn 的 OneID/Keycloak；海外版继续用 OAuth 链接。
-		SMSLogin:        smslogin.NewManager(smslogin.DefaultEndpoints(), 10*time.Minute),
+		SMSLogin: smsManager,
+		// 豪猪自动加号（可选）：取号→直登→落盘全自动。与手动发码共用代理池；
+		// AutoEnroll 在 NewHandler 内部组装（persist 回调指向 handler）。
+		HaozhumaClient:  newHaozhumaClient(cfg),
+		HaozhumaSid:     strings.TrimSpace(cfg.SMS.Haozhuma.Sid),
 		UpdateSchedule:  sch.UpdateSchedule,
 		Session:         sessRouter,
 		StickyCount:     sessCount,
@@ -311,4 +321,65 @@ func main() {
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")
+}
+
+// newSMSLoginManager 组装短信直登管理器。
+//
+// 未配置 sms.two_captcha_key 时不装 solver：遇到 need_captcha 会保持原有行为
+// （提示改用浏览器授权），而不是因为缺密钥就整体不可用。
+func newSMSLoginManager(cfg *Config) *smslogin.Manager {
+	m := smslogin.NewManager(smslogin.DefaultEndpoints(), 10*time.Minute)
+	if solver := smslogin.NewTwoCaptchaSolver(cfg.SMS.TwoCaptchaKey); solver != nil {
+		m.SetSolver(solver)
+		log.Printf("sms login: 2captcha enabled for human verification challenges")
+	}
+	// 登录代理只影响短信直登链路，号池的日常 API 调用不走它。
+	// file 优先：Webshare 这类静态名单每次登录换一条；url 是单出口（1024proxy 粘性或一条静态）。
+	if file := strings.TrimSpace(cfg.SMS.Proxy.File); file != "" {
+		pool, err := smslogin.LoadPoolDialer(file, cfg.SMSProxyCooldownDur)
+		if err != nil {
+			log.Fatalf("sms login: 加载代理名单 %s: %v", file, err)
+		}
+		m.SetProxyDialer(pool)
+		log.Printf("sms login: proxy pool enabled (%d endpoints, cooldown=%s)", pool.Len(), cfg.SMSProxyCooldownDur)
+	} else if url := strings.TrimSpace(cfg.SMS.Proxy.URL); url != "" {
+		d := smslogin.NewResolverProxyDialerWithRegion(url, cfg.SMS.Proxy.Region, cfg.SMS.Proxy.StickyMinutes)
+		d.InjectSID = cfg.SMS.Proxy.InjectSID
+		m.SetProxyDialer(d)
+		log.Printf("sms login: outbound proxy enabled (inject_sid=%v region=%s sticky=%dm)",
+			d.InjectSID, strings.ToUpper(strings.TrimSpace(cfg.SMS.Proxy.Region)), stickyMinutesOrDefault(cfg.SMS.Proxy.StickyMinutes))
+	}
+	return m
+}
+
+func stickyMinutesOrDefault(v int) int {
+	if v > 0 {
+		return v
+	}
+	return 30
+}
+
+// newHaozhumaClient 建豪猪客户端。未配置账号或项目 ID 时返回 nil（端点关闭）。
+// persist/find 回调由 server.NewHandler 内部注入（依赖 handler 自身状态）。
+func newHaozhumaClient(cfg *Config) *haozhuma.Client {
+	hz := cfg.SMS.Haozhuma
+	sid := strings.TrimSpace(hz.Sid)
+	if sid == "" {
+		return nil
+	}
+	if token := strings.TrimSpace(hz.Token); token != "" {
+		log.Printf("auto-enroll: haozhuma token configured (sid=%s)", sid)
+		return haozhuma.New(token)
+	}
+	user := strings.TrimSpace(hz.User)
+	if user == "" || hz.Pass == "" {
+		return nil
+	}
+	c, err := haozhuma.Login(user, hz.Pass)
+	if err != nil {
+		log.Printf("auto-enroll: 豪猪登录失败，自动加号关闭: %v", err)
+		return nil
+	}
+	log.Printf("auto-enroll: haozhuma login ok (sid=%s)", sid)
+	return c
 }

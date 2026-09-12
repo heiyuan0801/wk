@@ -7,10 +7,11 @@ import {
 import {
   ApiOutlined, CheckCircleOutlined, DashboardOutlined, FileSearchOutlined, KeyOutlined,
   ReloadOutlined, SendOutlined, DeleteOutlined, SettingOutlined, StopOutlined,
-  ThunderboltOutlined, ToolOutlined, UnlockOutlined,
+  ThunderboltOutlined, ToolOutlined, UnlockOutlined, SafetyOutlined,
 } from '@ant-design/icons';
 import 'antd/dist/reset.css';
 import './theme.css';
+import { orderCaptchaOptions, runTencentCaptcha } from './captcha';
 
 const { Header, Sider, Content } = Layout;
 const { Title, Text, Paragraph } = Typography;
@@ -153,6 +154,10 @@ function Console() {
   const [smsMobile, setSmsMobile] = useState('');
   const [smsCode, setSmsCode] = useState('');
   const [smsSession, setSmsSession] = useState('');
+  // smsCaptcha 非空表示这次发码被人机校验拦下：必须先过码才会真的发短信。
+  // 形状为 { options: [{appId, cloudType}], reason, auto_attempted }。
+  const [smsCaptcha, setSmsCaptcha] = useState(null);
+  const [smsCaptchaBusy, setSmsCaptchaBusy] = useState(false);
   const [smsSending, setSmsSending] = useState(false);
   const [smsVerifying, setSmsVerifying] = useState(false);
   const [smsCountdown, setSmsCountdown] = useState(0);
@@ -167,7 +172,19 @@ function Console() {
   const api = async (path, options = {}) => {
     const response = await fetch(path, { ...options, headers: { ...headers, ...(options.headers || {}) } });
     const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw Error(body?.error?.message || body?.error || `${response.status}`);
+    if (!response.ok) {
+      // 把后端的结构化错误字段带出来：retryable 决定是否保留当前短信会话，
+      // existing/disabled 用于"该手机号已在号池中"的确认弹窗。
+      const error = Error(body?.error?.message || body?.error || `${response.status}`);
+      error.status = response.status;
+      error.retryable = body?.retryable === true;
+      error.reason = body?.reason || '';
+      error.existing = body?.existing === true;
+      error.existingUid = body?.uid || '';
+      error.existingNickname = body?.nickname || '';
+      error.existingDisabled = body?.disabled === true;
+      throw error;
+    }
     return body;
   };
 
@@ -513,28 +530,113 @@ function Console() {
   };
 
   // runSMSSend 发送短信验证码：成功后会拿到 session_id，验码时回传。
-  const runSMSSend = async () => {
+  // 同一个按钮同时承担"重发"：上游对 unexpired 的号码不会重复发短信，
+  // 只会换发新的 state_token，所以重发是安全的。
+  const runSMSSend = async (options = {}) => {
     const mobile = smsMobile.trim();
     if (!mobile) { message.warning('请先填写手机号'); return; }
+    const isResend = options.resend === true && !!smsSession;
     setSmsSending(true);
     try {
       const result = await api('/admin/account/sms/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mobile, region: 'cn' }),
+        body: JSON.stringify({ mobile, region: 'cn', force: options.force === true }),
       });
       setSmsSession(result.session_id || '');
       setSmsCode('');
-      // 上游 60 秒内不允许重发；倒计时避免用户反复点击。
-      setSmsCountdown(Number(result.expires_in) > 0 ? 60 : 60);
-      message.success(result.status === 'unexpired'
-        ? `该号码已有未过期验证码，请直接输入${
-          result.expires_in ? `（${Math.ceil(result.expires_in / 60)} 分钟内有效）` : ''}`
-        : '验证码已发送，请查收短信');
+      // 被要求人机校验：还没有真正发码，先把验证码交给用户过。
+      if (result.captcha) {
+        setSmsCaptcha(result.captcha);
+        setSmsCountdown(0);
+        message.warning(result.captcha.reason || '该号码需要人机校验，请完成验证');
+        return;
+      }
+      setSmsCaptcha(null);
+      // 上游约 60 秒内不接受重复发码；用 expires_in 驱动倒计时更贴近真实窗口。
+      const wait = Number(result.expires_in) > 0 ? Math.min(Number(result.expires_in), 60) : 60;
+      setSmsCountdown(wait);
+      if (result.status === 'unexpired') {
+        // 未过期说明短信已经发过了，不会再来一条新的。
+        message.success(isResend
+          ? '已刷新会话，请使用已收到的那条验证码'
+          : `该号码已有未过期验证码，请直接输入${result.expires_in ? `（约 ${Math.ceil(result.expires_in / 60)} 分钟内有效）` : ''}`);
+      } else {
+        message.success(isResend ? '验证码已重新发送，请查收短信' : '验证码已发送，请查收短信');
+      }
     } catch (error) {
-      message.error(error.message);
+      if (error.status === 409 && error.existing) {
+        // 该号码已在号池中。后端在发短信之前就拦下了，所以这里还能让用户反悔，
+        // 不至于白消耗一条短信。
+        const label = error.existingNickname || error.existingUid?.slice(0, 12) || '该账号';
+        modal.confirm({
+          title: '该手机号已在号池中',
+          content: error.existingDisabled
+            ? `账号 ${label} 已存在，且当前处于禁用状态。重新登录会更新凭证，但不会自动启用——需要你在账号列表里手动启用后才会接流量。仍要重新登录吗？`
+            : `账号 ${label} 已存在。继续登录会刷新它的凭证（积分与冷却状态保持不变），不会新增账号。仍要继续吗？`,
+          okText: '继续登录',
+          cancelText: '取消',
+          onOk: () => runSMSSend({ resend: isResend, force: true }),
+        });
+      } else if (error.reason === 'too_frequent') {
+        // 频控：旧验证码仍然有效，不必清空会话。
+        message.warning(`${error.message}（已发出的验证码仍然有效）`);
+        setSmsCountdown(30);
+      } else {
+        message.error(error.message);
+      }
     } finally {
       setSmsSending(false);
+    }
+  };
+
+  // submitCaptcha 把用户完成的验证码票据回传后端，由后端继续发码。
+  //
+  // 上游会给出多个方案（实测 teg + tencent）。从非 codebuddy.cn 域名发起时，
+  // teg 那条会被腾讯以 403 拒绝（SDK 回调带 trerror_* 错误票据），而 tencent
+  // 正常。因此这里在某个方案启动失败时自动顺延到下一个，用户不必自己判断
+  // 该点哪个——按钮仍然都列出来，供需要时手动选择。
+  const submitCaptcha = async (option, options = {}) => {
+    if (!smsSession) { message.warning('会话已失效，请重新发送验证码'); return; }
+    setSmsCaptchaBusy(true);
+    try {
+      const { ticket, randStr, cloudType } = await runTencentCaptcha(option.appId, option.cloudType);
+      const result = await api('/admin/account/sms/captcha', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: smsSession, ticket, rand_str: randStr, cloud_type: cloudType,
+        }),
+      });
+      // 票据过期时后端会再给一次挑战，此时保留会话让用户重试即可。
+      if (result.captcha) {
+        setSmsCaptcha(result.captcha);
+        message.warning(result.captcha.reason || '验证码已过期，请重新完成校验');
+        return;
+      }
+      setSmsCaptcha(null);
+      setSmsCode('');
+      const wait = Number(result.expires_in) > 0 ? Math.min(Number(result.expires_in), 60) : 60;
+      setSmsCountdown(wait);
+      message.success(result.status === 'unexpired'
+        ? '校验通过，短信已发送，请查收'
+        : '校验通过，验证码已发送，请查收');
+    } catch (error) {
+      // 用户主动关掉验证码弹窗不该报错，只提示一下即可。
+      if (error.cancelled) {
+        message.info(error.message);
+        return;
+      }
+      // 该方案启动失败（如 teg 在我们域名下被拒）时自动试下一个方案。
+      const rest = (smsCaptcha?.options || []).filter(o => o.appId !== option.appId);
+      if (!options.lastResort && rest.length) {
+        message.info(`${error.message}，正在尝试其他验证方式…`);
+        await submitCaptcha(rest[0], { lastResort: rest.length === 1 });
+        return;
+      }
+      message.error(error.message);
+    } finally {
+      setSmsCaptchaBusy(false);
     }
   };
 
@@ -550,18 +652,34 @@ function Console() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: smsSession, code }),
       });
+      // notice 用于"该账号已存在"这类需要用户知晓但不阻断流程的提示；
+      // warning 是配置未能持久化等真问题，优先级更高。
       if (result.warning) message.warning(result.warning);
+      else if (result.notice) message.info(result.notice);
+      else if (result.existed) message.success(`账号 ${result.nickname || result.uid?.slice(0, 12)} 的凭证已更新`);
       else message.success(`账号 ${result.nickname || result.uid?.slice(0, 12)} 已添加`);
       setSmsSession('');
       setSmsCode('');
       setSmsMobile('');
+      setSmsCaptcha(null);
       setSmsCountdown(0);
       await refresh();
     } catch (error) {
       message.error(error.message);
-      // 会话已被消费（410）时必须重新发码，不能拿旧 session_id 重试。
-      if (/会话|重新发送验证码/.test(error.message || '')) {
+      // 还没过码就点了验码：把用户导回验证码步骤，会话仍然可用。
+      if (error.reason === 'captcha_pending') {
+        setSmsCaptcha(prev => prev || { options: [], reason: '请先完成人机校验' });
+        return;
+      }
+      // 验证码填错/频控时上游的 state_token 依然有效，保留会话让用户直接重填，
+      // 不必浪费一条短信。只有会话真的失效（410）才清空并要求重新发码。
+      const keepSession = error.retryable === true && error.status !== 410;
+      if (keepSession) {
+        setSmsCode('');
+        if (error.reason === 'too_frequent') setSmsCountdown(5);
+      } else {
         setSmsSession('');
+        setSmsCaptcha(null);
         setSmsCountdown(0);
       }
     } finally {
@@ -1063,6 +1181,7 @@ function Console() {
               <Paragraph type="secondary" style={{ marginTop: 0 }}>
                 填写手机号后点「发送验证码」，收到短信填入验证码即可直接添加账号，
                 无需打开浏览器点授权。仅支持中国区；海外版请用上面的 OAuth 链接。
+                若号码被人机校验拦下，已配置打码平台密钥时会自动过码，否则请改用浏览器授权。
               </Paragraph>
               <Space wrap>
                 <Input
@@ -1072,16 +1191,68 @@ function Console() {
                   style={{ width: 300 }}
                   prefix={<KeyOutlined />}
                   allowClear
+                  disabled={!!smsSession}
                 />
                 <Button
                   icon={<SendOutlined />}
                   loading={smsSending}
                   disabled={smsCountdown > 0}
-                  onClick={runSMSSend}
+                  onClick={() => runSMSSend({ resend: !!smsSession })}
                 >
-                  {smsCountdown > 0 ? `${smsCountdown} 秒后可重发` : '发送验证码'}
+                  {smsCountdown > 0
+                    ? `${smsCountdown} 秒后可重发`
+                    : (smsSession ? '重新发送验证码' : '发送验证码')}
                 </Button>
+                {smsSession && (
+                  <Button
+                    type="link"
+                    onClick={() => { setSmsSession(''); setSmsCode(''); setSmsCaptcha(null); setSmsCountdown(0); }}
+                  >
+                    换手机号
+                  </Button>
+                )}
               </Space>
+              {smsCaptcha && (
+                <Alert
+                  style={{ marginTop: 12 }}
+                  type="warning"
+                  showIcon
+                  message="该号码需要人机校验"
+                  description={(
+                    <Space direction="vertical" size={8}>
+                      <Text type="secondary">
+                        {smsCaptcha.reason || '请完成验证码后继续，通过后会自动发送短信。'}
+                      </Text>
+                      {/* 上游会给出多种校验方案（teg / tencent）。已知 tencent 可用，
+                          因此把它排在前面，避免用户先点到一个注定失败的按钮；
+                          teg 仍保留作为后备。 */}
+                      <Space wrap>
+                        {orderCaptchaOptions(smsCaptcha.options).map(option => (
+                          <Button
+                            key={`${option.cloudType}-${option.appId}`}
+                            type="primary"
+                            size="small"
+                            icon={<SafetyOutlined />}
+                            loading={smsCaptchaBusy}
+                            onClick={() => submitCaptcha(option)}
+                          >
+                            {option.cloudType === 'tencent' ? '开始验证（腾讯）' : `开始验证（${option.cloudType}）`}
+                          </Button>
+                        ))}
+                        {!(smsCaptcha.options || []).length && (
+                          <Button
+                            type="primary" size="small" icon={<SafetyOutlined />}
+                            loading={smsCaptchaBusy}
+                            onClick={() => submitCaptcha({ appId: '', cloudType: '' })}
+                          >
+                            重新获取验证码
+                          </Button>
+                        )}
+                      </Space>
+                    </Space>
+                  )}
+                />
+              )}
               <Space wrap style={{ marginTop: 12 }}>
                 <Input
                   value={smsCode}
@@ -1089,21 +1260,23 @@ function Console() {
                   onPressEnter={runSMSVerify}
                   placeholder="6 位短信验证码"
                   style={{ width: 200 }}
-                  disabled={!smsSession}
+                  disabled={!smsSession || !!smsCaptcha}
                   allowClear
                 />
                 <Button
                   type="primary"
                   icon={<CheckCircleOutlined />}
                   loading={smsVerifying}
-                  disabled={!smsSession}
+                  disabled={!smsSession || !!smsCaptcha}
                   onClick={runSMSVerify}
                 >
                   验证并添加账号
                 </Button>
-                {smsSession && (
-                  <Text type="secondary">验证码已发送，请查收；会话 10 分钟内有效</Text>
-                )}
+                {smsCaptcha
+                  ? <Text type="secondary">请先完成上方的人机校验</Text>
+                  : smsSession
+                    ? <Text type="secondary">验证码已发送，请查收；会话 10 分钟内有效</Text>
+                    : <Text type="secondary">填错验证码不会作废会话，可直接重填</Text>}
               </Space>
             </Card>
           </Card>

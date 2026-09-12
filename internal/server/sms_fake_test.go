@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"workbuddy2api/internal/smslogin"
@@ -18,11 +19,35 @@ type fakeSMSUpstream struct {
 	console *httptest.Server
 	cli     *httptest.Server
 	oneID   *httptest.Server
+
+	// mu 保护下面两个字段：handler 测试会并发打请求。
+	mu sync.Mutex
+	// sentToken 是最近一次 send 签发的 token。真实上游每次 send 换发新 token，
+	// 重发会让旧 token 立刻失效。
+	sentToken string
+	// verified 记录已通过验码的 token，accounts 只认这些。
+	verified map[string]bool
+	// sendSeq 保证每次 send 的 token 都不同。
+	sendSeq int
+	// needCaptcha 模拟上游要求人机校验（实测 captcha 是数组）。
+	needCaptcha bool
+	// captchaOnlyTeg 模拟上游只给 teg（2captcha 不支持的类型）。
+	captchaOnlyTeg bool
+
+	// captchaVerification 记录最近一次回灌的 captchaVerification。
+	captchaVerification map[string]any
+}
+
+// LastCaptchaVerification 返回最近一次收到的 captchaVerification，供断言形状。
+func (f *fakeSMSUpstream) LastCaptchaVerification() map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.captchaVerification
 }
 
 func newFakeSMSUpstream(t *testing.T) *fakeSMSUpstream {
 	t.Helper()
-	f := &fakeSMSUpstream{}
+	f := &fakeSMSUpstream{verified: map[string]bool{}}
 
 	f.cli = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -53,27 +78,66 @@ func newFakeSMSUpstream(t *testing.T) *fakeSMSUpstream {
 			var req struct {
 				ClientCode string `json:"client_code"`
 				Mobile     string `json:"mobile"`
+				// 过码后回灌的字段，形状为对象 {ticket, randStr, cloudType}。
+				CaptchaVerification map[string]any `json:"captchaVerification"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			if req.ClientCode != "codebuddy" || !strings.Contains(req.Mobile, " ") {
 				smsRaw(w, 400, `{"errCode":"E0010343","errMessage":"参数错误"}`)
 				return
 			}
-			smsRaw(w, 200, `{"status":"unexpired","state_token":"tok-sms-send","expires_in":300}`)
+			// 要求人机校验：没有 captchaVerification 就先给挑战（实测是数组）。
+			if f.needCaptcha && req.CaptchaVerification == nil {
+				body := `{"captcha":[{"appId":"2053989439","cloudType":"teg"},{"appId":"197561220","cloudType":"tencent"}],"expires_in":0,"status":"need_captcha","state_token":""}`
+				if f.captchaOnlyTeg {
+					body = `{"captcha":[{"appId":"2053989439","cloudType":"teg"}],"expires_in":0,"status":"need_captcha","state_token":""}`
+				}
+				smsRaw(w, 200, body)
+				return
+			}
+			// 记下回灌内容，供断言"人工票据确实被送到上游"。
+			f.mu.Lock()
+			f.captchaVerification = req.CaptchaVerification
+			f.mu.Unlock()
+			// 每次 send 换发新 token，旧 token 随之失效。
+			f.mu.Lock()
+			f.sendSeq++
+			f.sentToken = fmt.Sprintf("tok-sms-send-%d", f.sendSeq)
+			token := f.sentToken
+			f.verified = map[string]bool{}
+			f.mu.Unlock()
+			// 与真实上游一致：不需要验证码时 captcha 是字面量 null。
+			smsRaw(w, 200, fmt.Sprintf(`{"captcha":null,"expires_in":300,"status":"unexpired","state_token":%q}`, token))
 		case "/v1/auth/sms/code/verify":
 			var req struct {
 				StateToken string `json:"state_token"`
 				Code       string `json:"code"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
-			if req.Code != "123456" {
+			f.mu.Lock()
+			live := req.StateToken != "" && req.StateToken == f.sentToken
+			f.mu.Unlock()
+			if !live {
 				// 真实 OneID 会把 token 回显进错误消息。
 				smsRaw(w, 400, fmt.Sprintf(`{"errCode":"E0010072","errMessage":"无效的token%s"}`, req.StateToken))
 				return
 			}
-			smsRaw(w, 200, `{"state_token":"tok-sms-verify"}`)
+			if req.Code != "123456" {
+				// 真实上游：验证码错误不会作废 state_token，可直接重填。
+				smsRaw(w, 400, `{"errCode":"E0010028","errMessage":"验证码错误，请重新填写"}`)
+				return
+			}
+			next := req.StateToken + "-verified"
+			f.mu.Lock()
+			f.verified[next] = true
+			f.mu.Unlock()
+			smsRaw(w, 200, fmt.Sprintf(`{"state_token":%q}`, next))
 		case "/v1/auth/accounts":
-			if r.URL.Query().Get("state_token") != "tok-sms-verify" {
+			tok := r.URL.Query().Get("state_token")
+			f.mu.Lock()
+			ok := f.verified[tok]
+			f.mu.Unlock()
+			if !ok {
 				smsRaw(w, 400, `{"errCode":"E0010072","errMessage":"无效的token"}`)
 				return
 			}
@@ -86,14 +150,16 @@ func newFakeSMSUpstream(t *testing.T) *fakeSMSUpstream {
 	f.console = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/auth/realms/copilot/protocol/openid-connect/auth":
-			http.SetCookie(w, &http.Cookie{Name: "AUTH_SESSION_ID", Value: "s1", Path: "/auth/realms/copilot"})
+			w.Header().Add("Set-Cookie", `AUTH_SESSION_ID=s1; Version=1; Path="/auth/realms/copilot"; HttpOnly`)
 			w.Header().Set("Content-Type", "text/html")
 			_, _ = fmt.Fprintf(w, `<a data-idp="oneid" href="%s/auth/realms/copilot/broker/oneid/login?client_id=console&amp;tab_id=t1&amp;session_code=sc1">OneID</a>`, f.console.URL)
 		case "/auth/realms/copilot/broker/oneid/login":
-			smsEnvelope(w, map[string]any{
+			raw, _ := json.Marshal(map[string]any{
+				"code":         0,
 				"state":        "broker-state-1",
 				"redirect_uri": f.console.URL + "/auth/realms/copilot/broker/oneid/endpoint",
 			})
+			smsRaw(w, 200, string(raw))
 		case "/auth/realms/copilot/broker/oneid/endpoint":
 			if r.URL.Query().Get("code") != "oneid-code-1" {
 				smsRaw(w, 400, `{"code":400,"msg":"bad code"}`)
@@ -115,13 +181,20 @@ func newFakeSMSUpstream(t *testing.T) *fakeSMSUpstream {
 			smsRaw(w, 200, `[{"nickname":"64087495","pluginEnabled":true}]`)
 		case "/console/login/enterprise":
 			smsEnvelope(w, map[string]any{"accessToken": "console-at-1", "tokenType": "Bearer"})
+		case "/v2/plugin/auth/token":
+			smsEnvelope(w, map[string]any{
+				"accessToken": "sms-at-1", "refreshToken": "sms-rt-1",
+				"expiresIn": 5184000, "domain": "www.codebuddy.cn",
+			})
 		case "/console/auth/login":
-			if r.Header.Get("Authorization") != "Bearer console-at-1" {
-				w.Header().Set("Location", "/login?platform=CLI&state=cli-state-1")
+			// 实测真实行为：带 Authorization Bearer 得 302 Location=/ 假成功；
+			// 不带 Bearer（纯 APISIX session）才真正写上，Location 是 /login?...。
+			if r.Header.Get("Authorization") != "" {
+				w.Header().Set("Location", "/")
 				w.WriteHeader(302)
 				return
 			}
-			w.Header().Set("Location", "/")
+			w.Header().Set("Location", "/login?platform=CLI&state=cli-state-1")
 			w.WriteHeader(302)
 		default:
 			smsRaw(w, 404, `{"code":404,"msg":"not found"}`)

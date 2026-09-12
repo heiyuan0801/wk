@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8" /><title>trerror detection test</title></head>
+<body>
+<div id="out">running…</div>
+<script type="module">
+// 回归测试：腾讯在失败时仍回调 ret=0，并给出一张 trerror_* 的"错误票据"。
+// 实测 appId=2053989439(teg) 从非受信域名发起时就是这种情况
+// （cap_union_prehandle 403 -> errorCode 1006）。若只看 ret 与 ticket 是否存在，
+// 这张垃圾票据会被当成成功提交给上游。
+import { runTencentCaptcha } from '/assets/captcha-probe.js';
+
+const out = [];
+window.__results = out;
+
+// 用一个假的 TencentCaptcha 替换真实 SDK，直接喂各种回调形状。
+function stub(callbackResult) {
+  window.TencentCaptcha = function (appId, cb) {
+    this.show = () => setTimeout(() => cb(callbackResult), 0);
+    this.destroy = () => {};
+  };
+}
+
+const cases = [
+  {
+    name: 'teg 403 实际形状：ret=0 但带 trerror 票据',
+    res: { appid: '2053989439', ret: 0, randstr: '@abc', ticket: 'trerror_1006_2053989439_1789198920', errorCode: 1006, errorMessage: 'get_captcha_config_request_error' },
+    expect: 'reject',
+  },
+  {
+    name: '只有 trerror 票据、无 errorCode',
+    res: { ret: 0, randstr: '@abc', ticket: 'trerror_1006_x' },
+    expect: 'reject',
+  },
+  {
+    name: 'errorCode 存在但 ticket 正常',
+    res: { ret: 0, randstr: '@abc', ticket: 'tr03_real', errorCode: 1006 },
+    expect: 'reject',
+  },
+  {
+    name: '正常通过',
+    res: { ret: 0, randstr: '@real_rand', ticket: 'tr03_real_ticket' },
+    expect: 'resolve',
+  },
+  {
+    name: '用户关闭弹窗 ret=2',
+    res: { ret: 2 },
+    expect: 'cancel',
+  },
+  {
+    name: 'ret=1 失败',
+    res: { ret: 1, ticket: 'x', randstr: 'y' },
+    expect: 'reject',
+  },
+  {
+    name: '回调为 null',
+    res: null,
+    expect: 'reject',
+  },
+];
+
+for (const c of cases) {
+  stub(c.res);
+  const rec = { name: c.name, expect: c.expect };
+  try {
+    const r = await runTencentCaptcha('197561220', 'tencent');
+    rec.actual = 'resolve';
+    rec.value = { ticket: r.ticket, randStr: r.randStr, cloudType: r.cloudType };
+  } catch (e) {
+    rec.actual = e.cancelled ? 'cancel' : 'reject';
+    rec.message = e.message;
+    rec.code = e.code ?? null;
+  }
+  rec.pass = rec.actual === c.expect;
+  // 正常通过时还要校验字段映射：SDK 给小写 randstr，回灌要用大写 randStr。
+  if (c.expect === 'resolve') {
+    rec.fieldMapOk = rec.value?.randStr === '@real_rand'
+      && rec.value?.ticket === 'tr03_real_ticket'
+      && rec.value?.cloudType === 'tencent';
+    rec.pass = rec.pass && rec.fieldMapOk;
+  }
+  out.push(rec);
+}
+
+out.push({ summary: 'all passed', value: out.every(r => r.pass) });
+document.getElementById('out').textContent = JSON.stringify(out, null, 1);
+</script>
+</body>
+</html>
