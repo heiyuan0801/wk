@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
-  Alert, Button, Card, ConfigProvider, Empty, Form, Input, Layout, Menu, Modal,
+  Alert, App as AntApp, Button, Card, ConfigProvider, Empty, Form, Input, Layout, Menu, Modal,
   Select, Space, Statistic, Switch, Table, Tag, Tooltip, Typography, message,
 } from 'antd';
 import {
@@ -115,7 +115,11 @@ function Sparkline({ values, color = '#356ae6', ariaLabel = '趋势图' }) {
   return <svg className="sparkline" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={ariaLabel}><polyline fill="none" stroke={color} strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" points={points} /></svg>;
 }
 
-function App() {
+function Console() {
+  // antd v5 的静态 message / Modal 依赖 react-dom 的 render，而 React 19 已移除它
+  // （react-dom 只导出 createRoot 于 react-dom/client）。静态调用因此静默失效，
+  // 表现为"点了按钮没有任何反馈"。必须改用 App 上下文提供的实例。
+  const { message, modal } = AntApp.useApp();
   const [form] = Form.useForm();
   const [apiKey, setApiKey] = useState(initialAPIKey);
   const [locked, setLocked] = useState(false);
@@ -459,7 +463,7 @@ function App() {
     }
     const uid = record.uid || '';
     const isDelete = action === 'delete';
-    Modal.confirm({
+    modal.confirm({
       title: isDelete ? '确认删除账号？' : '确认禁用账号？',
       content: isDelete
         ? `账号 ${uid.slice(0, 12)} 将从账号池和本地授权文件中删除，删除后需要重新登录才能恢复。`
@@ -1109,8 +1113,7 @@ function App() {
   ];
 
   return (
-    <ConfigProvider theme={{ token: { colorPrimary: '#356ae6', borderRadius: 8, colorBgContainer: '#ffffff', colorBgLayout: '#f5f7fb', colorText: '#172033', colorTextSecondary: '#667085', colorTextHeading: '#172033', colorBorder: '#e7ebf1' } }}>
-      <Layout style={{ minHeight: '100vh' }}>
+    <Layout style={{ minHeight: '100vh' }}>
         <Sider breakpoint="lg" collapsedWidth="0">
           <div style={{ color: '#172033', fontSize: 18, fontWeight: 700, padding: '22px 20px' }}>WorkBuddy<span style={{ color: '#356ae6' }}>2API</span></div>
           <Menu theme="light" mode="inline" selectedKeys={[activeSection]} items={menuItems} onClick={({ key }) => setActiveSection(key)} />
@@ -1184,9 +1187,20 @@ function App() {
           <Input.Password prefix={<KeyOutlined />} value={password} onChange={event => setPassword(event.target.value)} onPressEnter={unlock} placeholder="输入访问密码" />
           <Input prefix={<ApiOutlined />} value={apiKey} onChange={event => setApiKey(event.target.value)} onPressEnter={unlock} placeholder="输入 API Key" style={{ marginTop: 10 }} />
         </Modal>
-      </Layout>
+    </Layout>
+  );
+}
+
+// Root：ConfigProvider 内套 antd 的 App，让 Console 里的 useApp() 拿到
+// 真正可用的 message / modal 实例（React 19 下静态方法不可用），同时继承主题。
+function Root() {
+  return (
+    <ConfigProvider theme={{ token: { colorPrimary: '#356ae6', borderRadius: 8, colorBgContainer: '#ffffff', colorBgLayout: '#f5f7fb', colorText: '#172033', colorTextSecondary: '#667085', colorTextHeading: '#172033', colorBorder: '#e7ebf1' } }}>
+      <AntApp>
+        <Console />
+      </AntApp>
     </ConfigProvider>
   );
 }
 
-createRoot(document.getElementById('root')).render(<App />);
+createRoot(document.getElementById('root')).render(<Root />);
