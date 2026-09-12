@@ -461,7 +461,11 @@ func (c *Client) UserRequestUsage(a *auth.Auth, start, end time.Time, page, page
 	if err != nil {
 		return nil, 0, err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.billingBase(a)+"/billing/meter/get-user-request-usage", bytes.NewReader(raw))
+	usagePath := "/billing/meter/get-user-request-usage"
+	if a != nil && a.Region() == "global" {
+		usagePath = "/v2/billing/meter/get-user-request-usage"
+	}
+	req, err := http.NewRequest(http.MethodPost, c.billingBase(a)+usagePath, bytes.NewReader(raw))
 	if err != nil {
 		return nil, 0, err
 	}
