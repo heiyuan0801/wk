@@ -280,7 +280,7 @@ func insertRequestPostgres(db postgresExecutor, record RequestRecord, writes int
 		input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
 		tool_calls, ttfb_millis, latency_millis, credits_consumed, credit_source,
 		passthrough, error_code, error_message
-	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
+	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
 		record.ID, record.CreatedAt, record.Route, record.Model, record.Mode, record.Status, record.AccountUID, record.AccountRegion, record.RequestedOutputTokens,
 		record.InputTokens, record.OutputTokens, record.TotalTokens, record.CacheReadTokens, record.CacheWriteTokens,
 		record.ToolCalls, record.TTFBMillis, record.LatencyMillis, record.CreditsConsumed, record.CreditSource,
