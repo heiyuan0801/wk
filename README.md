@@ -88,6 +88,9 @@ curl -sN http://localhost:7863/v1/chat/completions \
     "checkin_hours": [9, 21],
     "keepalive_hours": [22]
   },
+  "request_logs": {
+    "retention_days": 30
+  },
   "upstream": {
     "timeout_seconds": 120
   },
@@ -222,10 +225,12 @@ Disabled ←────┘ (session 死亡，永久)
 ### 请求日志、token 与积分
 
 每个 Chat Completions 和 Responses 请求结束后都会写入配置的指标存储：默认是 `state_file` 同目录的
-`metrics.db`，配置 PostgreSQL DSN 后则写入 PostgreSQL。记录只包含模型、路由、状态、账号 UID、token、耗时、积分来源和错误码，
+`metrics.db`，配置 PostgreSQL DSN 后则写入 PostgreSQL。记录只包含模型、路由、状态、账号 UID、账号区域、token、耗时、积分来源和错误码，
 不会保存提示词或模型输出，但会保存最多 1,024 字符的错误详情。数据库保留最近 10,000 条，`GET /requests?limit=50`
 可查询最近记录，控制台也会展示同一份数据。
 控制台“请求日志”菜单支持按模型、端点、账号、错误、流式/同步/透传和成功状态筛选，并可展开查看缓存 token、工具调用与完整错误详情。
+
+系统设置中的“日志保留天数”控制自动清理请求明细，默认保留 30 天；设置为 `0` 可关闭按天清理，也可通过 `WB2A_REQUEST_LOG_RETENTION_DAYS` 设置。清理只删除请求明细，不影响累计 token、请求数和已对账积分。积分对账优先使用上游 billing 返回的 `RequestID`，并兼容聊天接口与 billing 接口之间的 `crb-`/`cmb-` ID 格式差异；无法直接对应时按账号、模型和请求时间做兜底匹配。
 
 stdout 同时保留一行便于排查的表格日志：
 

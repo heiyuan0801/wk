@@ -779,6 +779,31 @@ func TestStatusEndpoint(t *testing.T) {
 	}
 }
 
+func TestAdminConfigUpdatesRequestLogRetention(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"schedule":{"checkin_hours":[9],"keepalive_hours":[22]},"region":"all"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var updated int
+	h := NewHandler(Config{ConfigPath: path, UpdateLogRetention: func(days int) { updated = days }})
+	req := httptest.NewRequest("POST", "/admin/config", strings.NewReader(`{"checkin_hours":[8],"keepalive_hours":[23],"request_logs":{"retention_days":7}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || updated != 7 {
+		t.Fatalf("code=%d updated=%d body=%s", rec.Code, updated, rec.Body)
+	}
+	var saved map[string]any
+	raw, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(raw, &saved) != nil {
+		t.Fatalf("read saved config: err=%v", err)
+	}
+	logs, ok := saved["request_logs"].(map[string]any)
+	if !ok || logs["retention_days"] != float64(7) {
+		t.Fatalf("saved request_logs=%v", saved["request_logs"])
+	}
+}
+
 func TestAdminAccountActions(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "workbuddy-u1.json")

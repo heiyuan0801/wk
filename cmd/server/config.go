@@ -32,6 +32,11 @@ type Config struct {
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
 	} `json:"schedule"`
 
+	RequestLogs struct {
+		// RetentionDays controls automatic request-log deletion. Zero disables cleanup.
+		RetentionDays int `json:"retention_days"`
+	} `json:"request_logs"`
+
 	Upstream struct {
 		TimeoutSeconds int `json:"timeout_seconds"` // 默认 120
 	} `json:"upstream"`
@@ -101,6 +106,7 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "60s"
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.KeepaliveHours = []int{22}
+	c.RequestLogs.RetentionDays = 30
 	c.Upstream.TimeoutSeconds = 120
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Features.Passthrough = false
@@ -200,6 +206,11 @@ func applyEnv(c *Config) {
 			c.Features.Passthrough = b
 		}
 	}
+	if v := os.Getenv("WB2A_REQUEST_LOG_RETENTION_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.RequestLogs.RetentionDays = n
+		}
+	}
 	if v := os.Getenv("WB2A_INPUT_CREDITS_PER_1K"); v != "" {
 		if n, err := strconv.ParseFloat(v, 64); err == nil {
 			c.Billing.InputCreditsPer1KTokens = n
@@ -266,6 +277,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
+	}
+	if c.RequestLogs.RetentionDays < 0 || c.RequestLogs.RetentionDays > 3650 {
+		return fmt.Errorf("request_logs.retention_days must be between 0 and 3650")
 	}
 	c.Billing.InputCreditsPer1KTokens = validCreditRate(c.Billing.InputCreditsPer1KTokens)
 	c.Billing.OutputCreditsPer1KTokens = validCreditRate(c.Billing.OutputCreditsPer1KTokens)

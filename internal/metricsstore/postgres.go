@@ -349,6 +349,21 @@ func (s *PostgresStore) RecentRequests(limit int) ([]RequestRecord, error) {
 	return out, rows.Err()
 }
 
+// DeleteRequestLogsBefore removes request details older than cutoff while
+// leaving lifetime aggregate metrics untouched.
+func (s *PostgresStore) DeleteRequestLogsBefore(cutoff time.Time) (int64, error) {
+	if cutoff.IsZero() {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(`DELETE FROM request_logs WHERE created_at < $1`, cutoff.Unix())
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func (s *PostgresStore) Snapshot() (Snapshot, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

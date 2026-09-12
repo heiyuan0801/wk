@@ -31,18 +31,19 @@ import (
 
 // Config handler 依赖。
 type Config struct {
-	Pool             *pool.Pool
-	Upstream         *upstream.Client
-	APIKey           string // 空 = 不鉴权
-	FrontendPassword string // 前端控制台密码；空 = 不启用前端密码
-	ConfigPath       string // 配置文件路径，供控制台保存签到配置
-	AuthDir          string
-	Region           string
-	LoginBin         string // OAuth 登录辅助程序路径
-	CheckinNow       func()
-	CreditRefreshNow func()
-	UpdateSchedule   func(checkinHours, keepaliveHours []int)
-	MaxRotate        int // 单请求最多换号次数，默认 3
+	Pool               *pool.Pool
+	Upstream           *upstream.Client
+	APIKey             string // 空 = 不鉴权
+	FrontendPassword   string // 前端控制台密码；空 = 不启用前端密码
+	ConfigPath         string // 配置文件路径，供控制台保存签到配置
+	AuthDir            string
+	Region             string
+	LoginBin           string // OAuth 登录辅助程序路径
+	CheckinNow         func()
+	CreditRefreshNow   func()
+	UpdateSchedule     func(checkinHours, keepaliveHours []int)
+	UpdateLogRetention func(days int)
+	MaxRotate          int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -311,8 +312,12 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 			CheckinHours   []int `json:"checkin_hours"`
 			KeepaliveHours []int `json:"keepalive_hours"`
 		} `json:"schedule"`
-		Region string `json:"region"`
+		Region      string `json:"region"`
+		RequestLogs struct {
+			RetentionDays int `json:"retention_days"`
+		} `json:"request_logs"`
 	}
+	c.RequestLogs.RetentionDays = 30
 	if json.Unmarshal(raw, &c) != nil {
 		writeJSON(w, 500, map[string]string{"error": "invalid config"})
 		return
@@ -326,6 +331,9 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		CheckinHours   []int `json:"checkin_hours"`
 		KeepaliveHours []int `json:"keepalive_hours"`
+		RequestLogs    *struct {
+			RetentionDays *int `json:"retention_days"`
+		} `json:"request_logs"`
 	}
 	if json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req) != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
@@ -347,8 +355,23 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": "invalid config"})
 		return
 	}
+	retentionDays := 30
+	if existing, ok := doc["request_logs"].(map[string]any); ok {
+		if value, ok := existing["retention_days"].(float64); ok {
+			retentionDays = int(value)
+		}
+	}
+	if req.RequestLogs != nil && req.RequestLogs.RetentionDays != nil {
+		retentionDays = *req.RequestLogs.RetentionDays
+	}
+	if retentionDays < 0 || retentionDays > 3650 {
+		writeJSON(w, 400, map[string]string{"error": "request_logs.retention_days must be between 0 and 3650"})
+		return
+	}
 	schedule := map[string]any{"checkin_hours": checkinHours, "keepalive_hours": keepaliveHours}
 	doc["schedule"] = schedule
+	requestLogs := map[string]any{"retention_days": retentionDays}
+	doc["request_logs"] = requestLogs
 	out, _ := json.MarshalIndent(doc, "", "  ")
 	if err := writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600); err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
@@ -358,7 +381,10 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.UpdateSchedule != nil {
 		h.cfg.UpdateSchedule(checkinHours, keepaliveHours)
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "restart_required": restartRequired, "schedule": schedule})
+	if h.cfg.UpdateLogRetention != nil {
+		h.cfg.UpdateLogRetention(retentionDays)
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "restart_required": restartRequired, "schedule": schedule, "request_logs": requestLogs})
 }
 
 func normalizeScheduleHours(hours []int) ([]int, bool) {

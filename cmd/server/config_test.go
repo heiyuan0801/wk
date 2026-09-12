@@ -20,6 +20,27 @@ func TestDefault(t *testing.T) {
 	if c.Postgres.MaxOpenConns != 16 || c.Postgres.MaxIdleConns != 8 {
 		t.Errorf("postgres pool defaults=%+v", c.Postgres)
 	}
+	if c.RequestLogs.RetentionDays != 30 {
+		t.Errorf("request log retention=%d want 30", c.RequestLogs.RetentionDays)
+	}
+}
+
+func TestRequestLogRetentionValidation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.json")
+	if err := os.WriteFile(path, []byte(`{"request_logs":{"retention_days":7}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil || c.RequestLogs.RetentionDays != 7 {
+		t.Fatalf("retention=%d err=%v", c.RequestLogs.RetentionDays, err)
+	}
+	if err := os.WriteFile(path, []byte(`{"request_logs":{"retention_days":3651}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("want retention validation error")
+	}
 }
 
 func TestLoadFile(t *testing.T) {

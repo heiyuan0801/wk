@@ -18,11 +18,12 @@ import (
 
 // Config 调度器依赖。
 type Config struct {
-	Pool           *pool.Pool
-	Upstream       *upstream.Client
-	CheckinHours   []int // 默认 [9, 21]
-	KeepaliveHours []int // 默认 [22]
-	RequestCredits metricsstore.Backend
+	Pool                    *pool.Pool
+	Upstream                *upstream.Client
+	CheckinHours            []int // 默认 [9, 21]
+	KeepaliveHours          []int // 默认 [22]
+	RequestCredits          metricsstore.Backend
+	RequestLogRetentionDays int
 }
 
 // Scheduler 调度器。
@@ -87,6 +88,8 @@ func nextFire(now time.Time, hours []int) time.Time {
 func (s *Scheduler) Run(ctx context.Context) {
 	creditTicker := time.NewTicker(5 * time.Minute)
 	defer creditTicker.Stop()
+	cleanupTicker := time.NewTicker(time.Hour)
+	defer cleanupTicker.Stop()
 	for {
 		checkinHours, keepaliveHours := s.schedule()
 		all := append(append([]int{}, checkinHours...), keepaliveHours...)
@@ -110,7 +113,48 @@ func (s *Scheduler) Run(ctx context.Context) {
 			}
 		case <-creditTicker.C:
 			s.RunRequestCreditRefreshNow()
+		case <-cleanupTicker.C:
+			s.RunRequestLogCleanupNow()
 		}
+	}
+}
+
+// UpdateRequestLogRetention applies a new retention value without restarting.
+// A value of zero disables automatic deletion.
+func (s *Scheduler) UpdateRequestLogRetention(days int) {
+	if days < 0 || days > 3650 {
+		return
+	}
+	s.mu.Lock()
+	s.cfg.RequestLogRetentionDays = days
+	s.mu.Unlock()
+}
+
+func (s *Scheduler) requestLogRetentionDays() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg.RequestLogRetentionDays
+}
+
+// RunRequestLogCleanupNow deletes request details older than the configured
+// retention period. Aggregate metrics and already reconciled credit totals are
+// intentionally retained.
+func (s *Scheduler) RunRequestLogCleanupNow() {
+	days := s.requestLogRetentionDays()
+	if days <= 0 || s.cfg.RequestCredits == nil {
+		return
+	}
+	cleaner, ok := s.cfg.RequestCredits.(metricsstore.RequestLogCleaner)
+	if !ok {
+		return
+	}
+	deleted, err := cleaner.DeleteRequestLogsBefore(time.Now().Add(-time.Duration(days) * 24 * time.Hour))
+	if err != nil {
+		log.Printf("request log cleanup: %v", err)
+		return
+	}
+	if deleted > 0 {
+		log.Printf("request log cleanup: deleted %d records older than %d days", deleted, days)
 	}
 }
 

@@ -46,7 +46,7 @@ function App() {
   const [requestSearch, setRequestSearch] = useState('');
   const [requestModeFilter, setRequestModeFilter] = useState('all');
   const [requestStatusFilter, setRequestStatusFilter] = useState('all');
-  const [config, setConfig] = useState({ checkin_hours: [9, 21], keepalive_hours: [22], region: 'cn' });
+  const [config, setConfig] = useState({ checkin_hours: [9, 21], keepalive_hours: [22], request_logs: { retention_days: 30 }, region: 'cn' });
   const [loginRegion, setLoginRegion] = useState('cn');
   const [selectedModel, setSelectedModel] = useState('');
   const [promptText, setPromptText] = useState('你好，请简短介绍一下你自己。');
@@ -102,8 +102,13 @@ function App() {
     try {
       const currentConfig = await api('/admin/config', { signal: controller.signal });
       if (serial !== refreshSerial.current) return;
-      if (currentConfig.schedule || currentConfig.region) {
-        setConfig(current => ({ ...current, ...(currentConfig.schedule || {}), region: currentConfig.region || current.region || 'cn' }));
+      if (currentConfig.schedule || currentConfig.request_logs || currentConfig.region) {
+        setConfig(current => ({
+          ...current,
+          ...(currentConfig.schedule || {}),
+          request_logs: currentConfig.request_logs || current.request_logs || { retention_days: 30 },
+          region: currentConfig.region || current.region || 'cn',
+        }));
       }
       if (!loginRegionTouched.current && currentConfig.region === 'global') setLoginRegion('global');
     } catch (error) {
@@ -122,6 +127,7 @@ function App() {
     form.setFieldsValue({
       checkin: (config.checkin_hours || []).join(','),
       keepalive: (config.keepalive_hours || []).join(','),
+      retention: config.request_logs?.retention_days ?? 30,
     });
   }, [config, form]);
 
@@ -159,18 +165,20 @@ function App() {
       const nextConfig = {
         checkin_hours: parseHours(values.checkin),
         keepalive_hours: parseHours(values.keepalive),
+        request_logs: { retention_days: Number(values.retention) },
       };
       const invalid = Object.values(nextConfig).some(hours => (
-        !hours.length || hours.some(hour => !Number.isInteger(hour) || hour < 0 || hour > 23)
-      ));
+        Array.isArray(hours) && (!hours.length || hours.some(hour => !Number.isInteger(hour) || hour < 0 || hour > 23))
+      )) || !Number.isInteger(nextConfig.request_logs.retention_days)
+        || nextConfig.request_logs.retention_days < 0 || nextConfig.request_logs.retention_days > 3650;
       if (invalid) {
-        message.error('每项至少填写一个 0-23 的整数小时');
+        message.error('签到/保活需填写 0-23 小时，日志保留天数需为 0-3650 的整数');
         return;
       }
       const result = await api('/admin/config', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(nextConfig),
       });
-      setConfig(current => ({ ...current, ...(result.schedule || nextConfig) }));
+      setConfig(current => ({ ...current, ...(result.schedule || {}), request_logs: result.request_logs || nextConfig.request_logs }));
       message.success(result.restart_required ? '配置已保存，重启后生效' : '配置已保存');
     } catch (error) {
       message.error(error.message);
@@ -601,6 +609,7 @@ function App() {
             <Form form={form} layout="inline" onFinish={saveConfig}>
               <Form.Item name="checkin" label="签到小时"><Input placeholder="9,21" /></Form.Item>
               <Form.Item name="keepalive" label="保活小时"><Input placeholder="22" /></Form.Item>
+              <Form.Item name="retention" label="日志保留天数" extra="0 表示不自动删除"><Input placeholder="30" /></Form.Item>
               <Button type="primary" htmlType="submit">保存</Button>
             </Form>
           </Card>

@@ -241,32 +241,34 @@ func main() {
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
 
 	sch := scheduler.New(scheduler.Config{
-		Pool:           p,
-		Upstream:       up,
-		RequestCredits: metricsDB,
-		CheckinHours:   cfg.Schedule.CheckinHours,
-		KeepaliveHours: cfg.Schedule.KeepaliveHours,
+		Pool:                    p,
+		Upstream:                up,
+		RequestCredits:          metricsDB,
+		CheckinHours:            cfg.Schedule.CheckinHours,
+		KeepaliveHours:          cfg.Schedule.KeepaliveHours,
+		RequestLogRetentionDays: cfg.RequestLogs.RetentionDays,
 	})
 
 	h := server.NewHandler(server.Config{
-		Pool:             p,
-		Upstream:         up,
-		APIKey:           cfg.APIKey,
-		FrontendPassword: cfg.FrontendPassword,
-		ConfigPath:       *cfgPath,
-		AuthDir:          cfg.AuthDir,
-		Region:           cfg.Region,
-		LoginBin:         "/app/login",
-		CheckinNow:       sch.RunCheckinNow,
-		CreditRefreshNow: sch.RunCreditRefreshNow,
-		UpdateSchedule:   sch.UpdateSchedule,
-		Session:          sessRouter,
-		StickyCount:      sessCount,
-		RedisMode:        redisMode,
-		ResponseStore:    responseStore,
-		MetricsStore:     persistentMetrics,
-		RequestLogStore:  requestLogs,
-		CompletionStore:  completions,
+		Pool:               p,
+		Upstream:           up,
+		APIKey:             cfg.APIKey,
+		FrontendPassword:   cfg.FrontendPassword,
+		ConfigPath:         *cfgPath,
+		AuthDir:            cfg.AuthDir,
+		Region:             cfg.Region,
+		LoginBin:           "/app/login",
+		CheckinNow:         sch.RunCheckinNow,
+		CreditRefreshNow:   sch.RunCreditRefreshNow,
+		UpdateSchedule:     sch.UpdateSchedule,
+		UpdateLogRetention: sch.UpdateRequestLogRetention,
+		Session:            sessRouter,
+		StickyCount:        sessCount,
+		RedisMode:          redisMode,
+		ResponseStore:      responseStore,
+		MetricsStore:       persistentMetrics,
+		RequestLogStore:    requestLogs,
+		CompletionStore:    completions,
 		CreditPolicy: server.CreditPolicy{
 			InputPer1K:       cfg.Billing.InputCreditsPer1KTokens,
 			OutputPer1K:      cfg.Billing.OutputCreditsPer1KTokens,
@@ -280,6 +282,7 @@ func main() {
 	defer stop()
 	go sch.RunCreditRefreshNow()
 	go sch.RunRequestCreditRefreshNow()
+	go sch.RunRequestLogCleanupNow()
 	go sch.Run(ctx)
 
 	srv := &http.Server{

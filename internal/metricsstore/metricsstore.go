@@ -90,6 +90,13 @@ type RequestCreditTimeMatcher interface {
 	ReconcileRequestCreditByTime(string, string, time.Time, float64) error
 }
 
+// RequestLogCleaner is an optional capability for stores that persist request
+// details. Keeping it separate preserves compatibility with lightweight
+// metrics backends that only implement aggregate/request reconciliation.
+type RequestLogCleaner interface {
+	DeleteRequestLogsBefore(time.Time) (int64, error)
+}
+
 const maxRequestLogs = 10000
 
 func Open(path string) (*Store, error) {
@@ -452,6 +459,21 @@ func (s *Store) RecentRequests(limit int) ([]RequestRecord, error) {
 		out = append(out, record)
 	}
 	return out, rows.Err()
+}
+
+// DeleteRequestLogsBefore removes request details older than cutoff while
+// leaving lifetime aggregate metrics untouched.
+func (s *Store) DeleteRequestLogsBefore(cutoff time.Time) (int64, error) {
+	if cutoff.IsZero() {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(`DELETE FROM request_logs WHERE created_at < ?`, cutoff.Unix())
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func (s *Store) Snapshot() (Snapshot, error) {
