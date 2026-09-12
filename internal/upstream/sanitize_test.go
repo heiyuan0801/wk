@@ -80,6 +80,32 @@ func TestNoFeatureReturnsSameString(t *testing.T) {
 	}
 }
 
+func TestInternalPromptWrappersStripped(t *testing.T) {
+	in := "before <system-reminder>internal task metadata</system-reminder> <user_input>正文内容</user_input> after"
+	out := sanitizeText(in)
+	if strings.Contains(out, "system-reminder") || strings.Contains(out, "internal task metadata") {
+		t.Fatalf("system reminder leaked: %q", out)
+	}
+	if strings.Contains(out, "user_input") || !strings.Contains(out, "正文内容") {
+		t.Fatalf("user input wrapper/content handling incorrect: %q", out)
+	}
+}
+
+func TestInternalPromptWrappersStrippedFromMultimodalText(t *testing.T) {
+	content := []any{map[string]any{
+		"type": "text",
+		"text": "<user_input>保留这段</user_input><system-reminder>删除这段</system-reminder>",
+	}}
+	out, changed := sanitizeContent(content)
+	if !changed {
+		t.Fatal("expected wrapper cleanup")
+	}
+	text := out.([]any)[0].(map[string]any)["text"].(string)
+	if text != "保留这段" {
+		t.Fatalf("cleaned text=%q", text)
+	}
+}
+
 func TestMultimodalTextPartOnly(t *testing.T) {
 	imgPart := map[string]any{"type": "image", "source": map[string]any{"type": "base64", "data": "..."}}
 	content := []any{

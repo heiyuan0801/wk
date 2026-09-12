@@ -13,11 +13,22 @@ import (
 // sanitizeFeatures 特征预检：任一命中才进入净化（strings.Contains 快速路径，
 // 普通请求全不中 → 原样返回，零分配）。
 var sanitizeFeatures = []string{
+	"<system-reminder",           // internal task metadata must never reach upstream
+	"<user_input",                // internal user prompt wrapper
 	"x-anthropic-billing-header", // header 键值段键名
 	"cc_entrypoint=",             // 尾随裸键值（截断前缀即可命中）
 	"You are Claude Code",        // 身份句（截断前缀即可命中）
 	"Main branch (",              // 注入指令句（截断前缀即可命中）
 }
+
+// internalSystemReminderRe removes internal task metadata blocks. These
+// wrappers can be injected by a client/runtime and are not part of the user's
+// prompt. The non-greedy match handles multiple blocks independently.
+var internalSystemReminderRe = regexp.MustCompile(`(?is)<system-reminder\b[^>]*>.*?</system-reminder\s*>`)
+
+// internalUserInputTagRe removes only user_input wrapper tags and keeps the
+// actual user content intact.
+var internalUserInputTagRe = regexp.MustCompile(`(?is)</?user_input\b[^>]*>`)
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
 var sanitizeHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^;\n]*;?\s*`)
@@ -42,6 +53,8 @@ func sanitizeText(text string) string {
 	if !hasFingerprint(text) {
 		return text
 	}
+	text = internalSystemReminderRe.ReplaceAllString(text, "")
+	text = internalUserInputTagRe.ReplaceAllString(text, "")
 	for _, rw := range sanitizeRewrites {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
 	}
