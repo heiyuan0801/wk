@@ -259,6 +259,8 @@ func main() {
 		LoginBin:         "/app/login",
 		CheckinNow:       sch.RunCheckinNow,
 		CreditRefreshNow: sch.RunCreditRefreshNow,
+		CheckinAccount:   sch.CheckinAccount,
+		KeepaliveAccount: sch.KeepaliveAccount,
 		UpdateSchedule:   sch.UpdateSchedule,
 		Session:          sessRouter,
 		StickyCount:      sessCount,

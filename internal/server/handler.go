@@ -25,6 +25,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
@@ -41,6 +42,9 @@ type Config struct {
 	LoginBin         string // OAuth 登录辅助程序路径
 	CheckinNow       func()
 	CreditRefreshNow func()
+	// CheckinAccount / KeepaliveAccount 按单账号执行签到/保活，供控制台手动触发。
+	CheckinAccount   func(uid string) scheduler.AccountResult
+	KeepaliveAccount func(uid string) scheduler.AccountResult
 	UpdateSchedule   func(checkinHours, keepaliveHours []int)
 	MaxRotate        int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
@@ -144,6 +148,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/account/poll", h.withFrontend(h.accountPoll))
 	h.mux.HandleFunc("POST /admin/account/{uid}/enable", h.withFrontend(h.enableAccount))
 	h.mux.HandleFunc("POST /admin/account/{uid}/disable", h.withFrontend(h.disableAccount))
+	h.mux.HandleFunc("POST /admin/account/{uid}/clear-cooldown", h.withFrontend(h.clearCooldownAccount))
+	h.mux.HandleFunc("POST /admin/account/{uid}/checkin", h.withFrontend(h.checkinAccount))
+	h.mux.HandleFunc("POST /admin/account/{uid}/keepalive", h.withFrontend(h.keepaliveAccount))
 	h.mux.HandleFunc("DELETE /admin/account/{uid}", h.withFrontend(h.deleteAccount))
 	// Static console assets are served from the image's frontend directory.
 	h.mux.Handle("/", http.FileServer(http.Dir("frontend")))
@@ -730,6 +737,48 @@ func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	h.cfg.Pool.Flush()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "message": "账号已删除"})
+}
+
+func (h *Handler) clearCooldownAccount(w http.ResponseWriter, r *http.Request) {
+	uid := strings.TrimSpace(r.PathValue("uid"))
+	if uid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "账号 UID 不能为空"})
+		return
+	}
+	if h.cfg.Pool == nil || !h.cfg.Pool.ClearCooldown(uid) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "账号不存在"})
+		return
+	}
+	h.cfg.Pool.Flush()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "message": "冷却与熔断已清除"})
+}
+
+func (h *Handler) checkinAccount(w http.ResponseWriter, r *http.Request) {
+	uid := strings.TrimSpace(r.PathValue("uid"))
+	if uid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "账号 UID 不能为空"})
+		return
+	}
+	if h.cfg.CheckinAccount == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "签到服务不可用"})
+		return
+	}
+	res := h.cfg.CheckinAccount(uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": res.OK, "uid": res.UID, "detail": res.Detail})
+}
+
+func (h *Handler) keepaliveAccount(w http.ResponseWriter, r *http.Request) {
+	uid := strings.TrimSpace(r.PathValue("uid"))
+	if uid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "账号 UID 不能为空"})
+		return
+	}
+	if h.cfg.KeepaliveAccount == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "保活服务不可用"})
+		return
+	}
+	res := h.cfg.KeepaliveAccount(uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": res.OK, "uid": res.UID, "detail": res.Detail})
 }
 
 func (h *Handler) removeAccountFile(uid string, account *auth.Auth) error {

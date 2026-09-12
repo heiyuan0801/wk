@@ -16,6 +16,7 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
+	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
@@ -824,6 +825,87 @@ func TestAdminAccountActions(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/account/u1/enable", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("missing enable code=%d body=%s", rec.Code, rec.Body)
+	}
+}
+
+func TestAdminClearCooldownAction(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at"})
+	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足")
+	h := NewHandler(Config{Pool: p})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/account/u1/clear-cooldown", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear-cooldown code=%d body=%s", rec.Code, rec.Body)
+	}
+	st, _ := p.Status("u1")
+	if st.Cooling {
+		t.Fatalf("cooling should be cleared: %+v", st)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/account/missing/clear-cooldown", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing clear-cooldown code=%d body=%s", rec.Code, rec.Body)
+	}
+}
+
+func TestAdminCheckinAndKeepaliveAccount(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at"})
+	var checked, kept string
+	h := NewHandler(Config{
+		Pool: p,
+		CheckinAccount: func(uid string) scheduler.AccountResult {
+			checked = uid
+			return scheduler.AccountResult{UID: uid, OK: true}
+		},
+		KeepaliveAccount: func(uid string) scheduler.AccountResult {
+			kept = uid
+			return scheduler.AccountResult{UID: uid, Detail: "upstream 401"}
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/account/u1/checkin", nil))
+	if rec.Code != http.StatusOK || checked != "u1" {
+		t.Fatalf("checkin code=%d checked=%q body=%s", rec.Code, checked, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"ok":true`) {
+		t.Fatalf("checkin body should report ok=true: %s", rec.Body)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/account/u1/keepalive", nil))
+	if rec.Code != http.StatusOK || kept != "u1" {
+		t.Fatalf("keepalive code=%d kept=%q body=%s", rec.Code, kept, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"ok":false`) {
+		t.Fatalf("keepalive body should report ok=false: %s", rec.Body)
+	}
+}
+
+func TestAdminCheckinUnavailableWithNilCallback(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at"})
+	h := NewHandler(Config{Pool: p})
+	for _, path := range []string{"/admin/account/u1/checkin", "/admin/account/u1/keepalive"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", path, nil))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s code=%d body=%s", path, rec.Code, rec.Body)
+		}
+	}
+}
+
+func TestStatusTokenExpiresAtExposed(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 1893456000})
+	h := NewHandler(Config{Pool: p})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	if rec.Code != 200 {
+		t.Fatalf("status code=%d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"token_expires_at":1893456000`) {
+		t.Fatalf("status should expose token_expires_at: %s", rec.Body)
 	}
 }
 
