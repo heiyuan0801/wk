@@ -76,6 +76,7 @@ type Backend interface {
 	AddCredit(float64, string) error
 	RecordRequest(RequestRecord) error
 	RecordCompletion(Snapshot, RequestRecord) error
+	ReconcileRequestCredit(string, float64) error
 	RecentRequests(int) ([]RequestRecord, error)
 	Snapshot() (Snapshot, error)
 	Close() error
@@ -315,6 +316,49 @@ func (s *Store) RecordCompletion(delta Snapshot, record RequestRecord) error {
 		s.requestWrites++
 	}
 	return err
+}
+
+// ReconcileRequestCredit replaces an estimated/unknown charge with the
+// authoritative billing-meter value for a request ID.
+func (s *Store) ReconcileRequestCredit(id string, credit float64) error {
+	if id == "" || credit < 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var old float64
+	var source string
+	err = tx.QueryRow(`SELECT credits_consumed, credit_source FROM request_logs WHERE id=? ORDER BY log_id DESC LIMIT 1`, id).Scan(&old, &source)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if source == "upstream" && old == credit {
+		return nil
+	}
+	delta := Snapshot{CreditsConsumed: credit - old, CreditsUpstream: credit - old}
+	switch source {
+	case "estimated":
+		delta.CreditsEstimated = -old
+		delta.CreditsUpstream = credit
+	case "unknown":
+		delta.CreditRequests = 1
+		delta.CreditsUpstream = credit
+	}
+	if err = addDelta(tx, delta); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE request_logs SET credits_consumed=?, credit_source='upstream' WHERE log_id=(SELECT log_id FROM request_logs WHERE id=? ORDER BY log_id DESC LIMIT 1)`, credit, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func insertRequest(db metricsExecutor, record RequestRecord, writes int) error {

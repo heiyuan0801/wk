@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"workbuddy2api/internal/auth"
 )
@@ -290,6 +291,22 @@ func TestUserResourceNegativeClamped(t *testing.T) {
 	remain, err := c.UserResource(&auth.Auth{AccessToken: "at"})
 	if err != nil || remain != 0 {
 		t.Errorf("remain=%d err=%v, want 0 (clamped)", remain, err)
+	}
+}
+
+func TestUserRequestUsage(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/billing/meter/get-user-request-usage" || r.Method != http.MethodPost {
+			return nil, errors.New("wrong request")
+		}
+		if r.Header.Get("Authorization") != "Bearer at" || r.Header.Get("X-User-Id") != "u1" {
+			return nil, errors.New("missing billing headers")
+		}
+		return jsonResp(200, `{"code":0,"data":{"total":1,"data":[{"requestId":"req-1","credit":1.25,"model":"deepseek-v4-pro","requestTime":"2026-09-12 10:22:00"}]}}`), nil
+	})
+	rows, total, err := c.UserRequestUsage(&auth.Auth{AccessToken: "at", UID: "u1"}, time.Unix(0, 0), time.Now(), 1, 20)
+	if err != nil || total != 1 || len(rows) != 1 || rows[0].RequestID != "req-1" || rows[0].Credit != 1.25 {
+		t.Fatalf("rows=%+v total=%d err=%v", rows, total, err)
 	}
 }
 

@@ -228,6 +228,48 @@ func (s *PostgresStore) RecordCompletion(delta Snapshot, record RequestRecord) e
 	return err
 }
 
+func (s *PostgresStore) ReconcileRequestCredit(id string, credit float64) error {
+	if id == "" || credit < 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var old float64
+	var source string
+	var logID int64
+	err = tx.QueryRow(`SELECT log_id, credits_consumed, credit_source FROM request_logs WHERE id=$1 ORDER BY log_id DESC LIMIT 1 FOR UPDATE`, id).Scan(&logID, &old, &source)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if source == "upstream" && old == credit {
+		return nil
+	}
+	delta := Snapshot{CreditsConsumed: credit - old, CreditsUpstream: credit - old}
+	switch source {
+	case "estimated":
+		delta.CreditsEstimated = -old
+		delta.CreditsUpstream = credit
+	case "unknown":
+		delta.CreditRequests = 1
+		delta.CreditsUpstream = credit
+	}
+	if err = addDeltaPostgres(tx, delta); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE request_logs SET credits_consumed=$1, credit_source='upstream' WHERE log_id=$2`, credit, logID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func insertRequestPostgres(db postgresExecutor, record RequestRecord, writes int) error {
 	_, err := db.Exec(`INSERT INTO request_logs(
 		id, created_at, route, model, mode, status, account_uid, requested_output_tokens,

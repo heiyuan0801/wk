@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/metricsstore"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/upstream"
 )
@@ -20,6 +21,7 @@ type Config struct {
 	Upstream       *upstream.Client
 	CheckinHours   []int // 默认 [9, 21]
 	KeepaliveHours []int // 默认 [22]
+	RequestCredits metricsstore.Backend
 }
 
 // Scheduler 调度器。
@@ -82,6 +84,8 @@ func nextFire(now time.Time, hours []int) time.Time {
 
 // Run 主循环，阻塞直到 ctx 取消。
 func (s *Scheduler) Run(ctx context.Context) {
+	creditTicker := time.NewTicker(5 * time.Minute)
+	defer creditTicker.Stop()
 	for {
 		checkinHours, keepaliveHours := s.schedule()
 		all := append(append([]int{}, checkinHours...), keepaliveHours...)
@@ -102,6 +106,46 @@ func (s *Scheduler) Run(ctx context.Context) {
 			}
 			if contains(keepaliveHours, h) {
 				s.RunKeepaliveNow()
+			}
+		case <-creditTicker.C:
+			s.RunRequestCreditRefreshNow()
+		}
+	}
+}
+
+// RunRequestCreditRefreshNow reconciles recent request logs with the
+// authoritative web billing meter. It is intentionally asynchronous and never
+// blocks an in-flight model request.
+func (s *Scheduler) RunRequestCreditRefreshNow() {
+	if s.cfg.RequestCredits == nil {
+		return
+	}
+	logs, err := s.cfg.RequestCredits.RecentRequests(200)
+	if err != nil {
+		log.Printf("request usage logs: %v", err)
+		return
+	}
+	if len(logs) == 0 {
+		return
+	}
+	start := time.Now().Add(-48 * time.Hour)
+	end := time.Now().Add(2 * time.Hour)
+	for _, st := range s.cfg.Pool.List() {
+		if st.Disabled {
+			continue
+		}
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || a.Snapshot().AccessToken == "" {
+			continue
+		}
+		rows, _, err := s.cfg.Upstream.UserRequestUsage(a, start, end, 1, 200)
+		if err != nil {
+			log.Printf("request-usage %s: %v", st.UID, err)
+			continue
+		}
+		for _, row := range rows {
+			if row.RequestID != "" {
+				_ = s.cfg.RequestCredits.ReconcileRequestCredit(row.RequestID, row.Credit)
 			}
 		}
 	}

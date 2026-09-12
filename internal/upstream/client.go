@@ -439,6 +439,47 @@ type ResourceUsage struct {
 	CycleCapacityUsed   int64
 }
 
+// RequestUsage is the authoritative per-request credit record returned by the
+// billing meter. Input text is intentionally not modeled or persisted.
+type RequestUsage struct {
+	RequestID   string  `json:"requestId"`
+	Credit      float64 `json:"credit"`
+	Model       string  `json:"model"`
+	RequestTime string  `json:"requestTime"`
+}
+
+// UserRequestUsage queries the web billing meter for recent request charges.
+func (c *Client) UserRequestUsage(a *auth.Auth, start, end time.Time, page, pageSize int) ([]RequestUsage, int, error) {
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 || pageSize > 200 {
+		pageSize = 200
+	}
+	body := map[string]any{"startTime": start.Format("2006-01-02 15:04:05"), "endTime": end.Format("2006-01-02 15:04:05"), "pageNum": page, "pageSize": pageSize}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, 0, err
+	}
+	req, err := http.NewRequest(http.MethodPost, c.billingBase(a)+"/billing/meter/get-user-request-usage", bytes.NewReader(raw))
+	if err != nil {
+		return nil, 0, err
+	}
+	BillingHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	var resp struct {
+		Data  []RequestUsage `json:"data"`
+		Total int            `json:"total"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, 0, fmt.Errorf("request usage parse: %w", err)
+	}
+	return resp.Data, resp.Total, nil
+}
+
 // UserResourceDetails queries the upstream credit counters for one account.
 func (c *Client) UserResourceDetails(a *auth.Auth) (ResourceUsage, error) {
 	url := c.billingBase(a) + "/v2/billing/meter/get-user-resource"

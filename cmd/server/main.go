@@ -241,6 +241,7 @@ func main() {
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
+		RequestCredits: metricsDB,
 		CheckinHours:   cfg.Schedule.CheckinHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
 	})
@@ -276,6 +277,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.RunCreditRefreshNow()
+	go sch.RunRequestCreditRefreshNow()
 	go sch.Run(ctx)
 
 	srv := &http.Server{
