@@ -133,7 +133,7 @@ curl -sN http://localhost:7863/v1/chat/completions \
 
 `region` 支持 `cn`、`global` 和 `all`。`cn`/`global` 只加载对应区域的授权文件，`all` 会同时加载中国区与海外版账号。控制台“账号授权”中选择“海外版”完成登录后，如果当前配置是单区域，服务会自动将配置切换为 `all`，保证新账号在重启后仍然可用；使用脚本时可执行 `./login.sh global`。
 
-也可以直接调用登录辅助程序：`./login url global` 获取海外版授权链接，浏览器完成授权后执行 `./login poll global`。中国区仍可使用原来的 `./login url` / `./login poll` 用法。两种区域使用独立的临时 state 文件，交替登录不会互相覆盖。
+也可以直接调用登录辅助程序：`./login url global` 获取海外版授权链接，浏览器完成授权后执行 `./login poll global`。中国区仍可使用原来的 `./login url` / `./login poll` 用法。中国区登录入口默认是 CodeBuddy.cn，也可以设置 `WB2A_LOGIN_PORTAL=workbuddy` 让授权链接直接打开 WorkBuddy.cn；控制台“账号授权”中也可以自由选择这两个入口。两种区域使用独立的临时 state 文件，交替登录不会互相覆盖。
 
 **注意**：`cooldown.hard_credit` / `cooldown.err_threshold` / `cooldown.err_cooldown` 三个历史键已退役。硬冷却固定为**次日 04:00**（本地时区，`CooldownUntilTomorrow4AM`），连续错误语义并入熔断器（`pool.breaker_threshold` 触发指数退避）。旧配置中的这些键因 JSON 未知字段被自然忽略，不报错。
 
@@ -279,8 +279,8 @@ stdout 同时保留一行便于排查的表格日志：
 | `POST /admin/account/{uid}/enable` | 前端会话/Bearer | 手动启用账号并清除禁用/冷却状态 |
 | `POST /admin/account/{uid}/disable` | 前端会话/Bearer | 手动禁用账号，停止新请求使用 |
 | `DELETE /admin/account/{uid}` | 前端会话/Bearer | 删除账号池记录及对应授权文件 |
-| `POST /admin/account/url?region=cn|global` | 前端会话/Bearer | 生成对应区域 OAuth 授权链接 |
-| `POST /admin/account/poll?region=cn|global` | 前端会话/Bearer | 轮询并保存对应区域授权结果 |
+| `POST /admin/account/url?region=cn|global&portal=codebuddy|workbuddy` | 前端会话/Bearer | 生成对应区域和登录入口的 OAuth 授权链接 |
+| `POST /admin/account/poll?region=cn|global&portal=codebuddy|workbuddy` | 前端会话/Bearer | 轮询并保存对应区域授权结果 |
 | `GET /healthz` | 无 | 健康检查（无健康账号时 503） |
 
 ZCode 等使用 OpenAI Compatible 提供商的客户端，Base URL 应填写

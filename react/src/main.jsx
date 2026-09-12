@@ -58,6 +58,7 @@ function App() {
   const [requestStatusFilter, setRequestStatusFilter] = useState('all');
   const [config, setConfig] = useState({ checkin_hours: [9, 21], keepalive_hours: [22], request_logs: { retention_days: 30 }, region: 'cn' });
   const [loginRegion, setLoginRegion] = useState('cn');
+  const [loginPortal, setLoginPortal] = useState('codebuddy');
   const [selectedModel, setSelectedModel] = useState('');
   const [promptText, setPromptText] = useState('你好，请简短介绍一下你自己。');
   const [answer, setAnswer] = useState('');
@@ -69,6 +70,7 @@ function App() {
   const [accountAction, setAccountAction] = useState('');
   const [loginURL, setLoginURL] = useState('');
   const [loginPendingRegion, setLoginPendingRegion] = useState('');
+  const [loginPendingPortal, setLoginPendingPortal] = useState('codebuddy');
   const loginRegionTouched = useRef(false);
   const refreshController = useRef(null);
   const refreshSerial = useRef(0);
@@ -633,26 +635,40 @@ function App() {
                 style={{ width: 150 }}
                 options={[{ value: 'cn', label: '中国区' }, { value: 'global', label: '海外版' }]}
               />
+              <Text type="secondary">登录入口</Text>
+              <Select
+                value={loginPortal}
+                onChange={setLoginPortal}
+                disabled={loginRegion === 'global'}
+                style={{ width: 170 }}
+                options={[
+                  { value: 'codebuddy', label: 'CodeBuddy.cn' },
+                  { value: 'workbuddy', label: 'WorkBuddy.cn' },
+                ]}
+              />
               <Button icon={<UnlockOutlined />} onClick={async () => {
                 try {
-                  const query = `?region=${encodeURIComponent(loginRegion)}`;
+                  const query = `?region=${encodeURIComponent(loginRegion)}&portal=${encodeURIComponent(loginRegion === 'global' ? 'global' : loginPortal)}`;
                   const result = await api(`/admin/account/url${query}`, { method: 'POST' });
                   setLoginURL(result.url || '');
                   setLoginPendingRegion(result.region || loginRegion);
+                  setLoginPendingPortal(result.portal || loginPortal);
                   const popup = window.open(result.url, '_blank', 'noopener');
+                  const loginLabel = loginRegion === 'global' ? '海外版' : (loginPortal === 'workbuddy' ? 'WorkBuddy.cn' : 'CodeBuddy.cn');
                   message.info(popup
-                    ? `${loginRegion === 'global' ? '海外版' : '中国区'}授权链接已打开，完成浏览器授权后点击轮询`
+                    ? `${loginLabel}授权链接已打开，完成浏览器授权后点击轮询`
                     : '浏览器拦截了弹窗，请点击下方授权链接完成登录后轮询');
                 } catch (error) { message.error(error.message); }
               }}>生成 OAuth 登录链接</Button>
               <Button icon={<ToolOutlined />} onClick={async () => {
                 try {
-                  const query = `?region=${encodeURIComponent(pollRegion)}`;
+                  const query = `?region=${encodeURIComponent(pollRegion)}&portal=${encodeURIComponent(pollRegion === 'global' ? 'global' : loginPendingPortal)}`;
                   const result = await api(`/admin/account/poll${query}`, { method: 'POST' });
                   if (result.warning) message.warning(result.warning);
                   else message.success(`${result.region === 'global' ? '海外版' : '中国区'}账号已添加`);
                   setLoginURL('');
                   setLoginPendingRegion('');
+                  setLoginPendingPortal('codebuddy');
                   await refresh();
                 } catch (error) { message.error(error.message); }
               }}>轮询授权结果</Button>

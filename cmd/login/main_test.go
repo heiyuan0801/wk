@@ -13,6 +13,7 @@ import (
 func TestResolveLoginRegion(t *testing.T) {
 	t.Setenv("WB2A_LOGIN_REGION", "")
 	t.Setenv("WB2A_REGION", "all")
+	t.Setenv("WB2A_LOGIN_PORTAL", "")
 	t.Setenv("WB2A_LOGIN_STATE_FILE", "")
 
 	cn, err := resolveLoginRegion("")
@@ -22,6 +23,21 @@ func TestResolveLoginRegion(t *testing.T) {
 	if cn.Name != "cn" || cn.BaseURL != upstreamBaseCN || cn.Origin != originRefererCN {
 		t.Fatalf("cn config=%+v", cn)
 	}
+	if cn.Portal != "codebuddy" {
+		t.Fatalf("default cn portal=%q", cn.Portal)
+	}
+	t.Setenv("WB2A_LOGIN_PORTAL", "workbuddy")
+	work, err := resolveLoginRegion("cn")
+	if err != nil {
+		t.Fatalf("resolve workbuddy portal: %v", err)
+	}
+	if work.Portal != "workbuddy" || work.Origin != originRefererWorkCN {
+		t.Fatalf("workbuddy config=%+v", work)
+	}
+	if got := rewriteLoginURL("https://copilot.tencent.com/login?platform=CLI&state=s1", work.Portal); got != "https://www.workbuddy.cn/login?platform=CLI&state=s1" {
+		t.Fatalf("rewritten login URL=%q", got)
+	}
+	t.Setenv("WB2A_LOGIN_PORTAL", "")
 
 	global, err := resolveLoginRegion("overseas")
 	if err != nil {
@@ -36,6 +52,13 @@ func TestResolveLoginRegion(t *testing.T) {
 
 	if _, err := resolveLoginRegion("all"); err == nil {
 		t.Fatal("all must not select a single OAuth endpoint")
+	}
+}
+
+func TestResolveLoginPortalRejectsUnknownValue(t *testing.T) {
+	t.Setenv("WB2A_LOGIN_PORTAL", "other")
+	if _, err := resolveLoginRegion("cn"); err == nil {
+		t.Fatal("unknown portal should fail")
 	}
 }
 

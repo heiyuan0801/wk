@@ -30,6 +30,21 @@ func TestLoginRegionSelection(t *testing.T) {
 	}
 }
 
+func TestLoginPortalSelection(t *testing.T) {
+	h := NewHandler(Config{Region: "cn"})
+	portal, err := h.loginPortal(httptest.NewRequest("POST", "/admin/account/url?region=cn&portal=workbuddy", nil), "cn")
+	if err != nil || portal != "workbuddy" {
+		t.Fatalf("portal=%q err=%v", portal, err)
+	}
+	portal, err = h.loginPortal(httptest.NewRequest("POST", "/admin/account/url?region=global&portal=workbuddy", nil), "global")
+	if err != nil || portal != "global" {
+		t.Fatalf("global portal=%q err=%v", portal, err)
+	}
+	if _, err := h.loginPortal(httptest.NewRequest("POST", "/admin/account/url?region=cn&portal=other", nil), "cn"); err == nil {
+		t.Fatal("unknown portal should fail")
+	}
+}
+
 func TestPromoteMixedRegionPersistsConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"region":"cn","schedule":{"checkin_hours":[9]}}`), 0o600); err != nil {

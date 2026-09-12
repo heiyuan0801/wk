@@ -499,6 +499,17 @@ func normalizeLoginRegion(raw string) (string, error) {
 	}
 }
 
+func normalizeLoginPortal(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "codebuddy", "code-buddy", "codebuddy.cn":
+		return "codebuddy", nil
+	case "workbuddy", "work-buddy", "workbuddy.cn":
+		return "workbuddy", nil
+	default:
+		return "", fmt.Errorf("登录入口只能选择 codebuddy 或 workbuddy")
+	}
+}
+
 func (h *Handler) loginRegion(r *http.Request) (string, error) {
 	if raw := strings.TrimSpace(r.URL.Query().Get("region")); raw != "" {
 		return normalizeLoginRegion(raw)
@@ -515,7 +526,18 @@ func (h *Handler) loginRegion(r *http.Request) (string, error) {
 	return "cn", nil
 }
 
-func (h *Handler) loginCommand(ctx context.Context, arg, region string) ([]byte, error) {
+func (h *Handler) loginPortal(r *http.Request, region string) (string, error) {
+	portal := "codebuddy"
+	if region == "global" {
+		return "global", nil
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("portal")); raw != "" {
+		return normalizeLoginPortal(raw)
+	}
+	return portal, nil
+}
+
+func (h *Handler) loginCommand(ctx context.Context, arg, region, portal string) ([]byte, error) {
 	bin := h.cfg.LoginBin
 	if bin == "" {
 		bin = "./login"
@@ -523,6 +545,7 @@ func (h *Handler) loginCommand(ctx context.Context, arg, region string) ([]byte,
 	cmd := exec.CommandContext(ctx, bin, arg)
 	cmd.Dir = filepath.Dir(h.cfg.ConfigPath)
 	cmd.Env = setCommandEnv(os.Environ(), "WB2A_LOGIN_REGION", region)
+	cmd.Env = setCommandEnv(cmd.Env, "WB2A_LOGIN_PORTAL", portal)
 	return cmd.Output()
 }
 
@@ -547,7 +570,12 @@ func (h *Handler) accountURL(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	out, err := h.loginCommand(r.Context(), "url", region)
+	portal, err := h.loginPortal(r, region)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	out, err := h.loginCommand(r.Context(), "url", region, portal)
 	if err != nil {
 		writeJSON(w, 502, map[string]string{"error": fmt.Sprintf("登录初始化失败: %v", err)})
 		return
@@ -557,7 +585,7 @@ func (h *Handler) accountURL(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "登录初始化未返回授权链接"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"url": loginURL, "region": region})
+	writeJSON(w, http.StatusOK, map[string]string{"url": loginURL, "region": region, "portal": portal})
 }
 
 func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
@@ -566,7 +594,12 @@ func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	out, err := h.loginCommand(r.Context(), "poll", region)
+	portal, err := h.loginPortal(r, region)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	out, err := h.loginCommand(r.Context(), "poll", region, portal)
 	if err != nil {
 		writeJSON(w, 409, map[string]string{"error": "登录尚未完成，请先在浏览器完成授权"})
 		return

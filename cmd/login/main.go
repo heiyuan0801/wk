@@ -22,6 +22,7 @@ const (
 	upstreamBaseCN      = "https://copilot.tencent.com"
 	upstreamBaseGlobal  = "https://www.workbuddy.ai"
 	originRefererCN     = "https://www.codebuddy.cn"
+	originRefererWorkCN = "https://www.workbuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
 	legacyStateFile     = "/tmp/wb2api-login-state.json"
@@ -33,6 +34,7 @@ type loginRegion struct {
 	BaseURL       string
 	Origin        string
 	DefaultDomain string
+	Portal        string
 	StateFile     string
 }
 
@@ -59,14 +61,45 @@ func resolveLoginRegion(raw string) (loginRegion, error) {
 	}
 	switch strings.ToLower(raw) {
 	case "", "cn", "china":
-		return newLoginRegion("cn", upstreamBaseCN, originRefererCN, ""), nil
+		cfg := newLoginRegion("cn", upstreamBaseCN, originRefererCN, "")
+		portal, err := resolveLoginPortal("")
+		if err != nil {
+			return loginRegion{}, err
+		}
+		cfg.Portal = portal
+		cfg.Origin = loginPortalOrigin(portal)
+		return cfg, nil
 	case "global", "overseas", "international", "intl":
-		return newLoginRegion("global", upstreamBaseGlobal, originRefererGlobal, "www.workbuddy.ai"), nil
+		cfg := newLoginRegion("global", upstreamBaseGlobal, originRefererGlobal, "www.workbuddy.ai")
+		cfg.Portal = "global"
+		return cfg, nil
 	case "all", "mixed":
 		return loginRegion{}, fmt.Errorf("login region must be cn or global, not %q", raw)
 	default:
 		return loginRegion{}, fmt.Errorf("unknown login region %q (want cn or global)", raw)
 	}
+}
+
+func resolveLoginPortal(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("WB2A_LOGIN_PORTAL"))
+	}
+	switch strings.ToLower(raw) {
+	case "", "codebuddy", "code-buddy", "codebuddy.cn":
+		return "codebuddy", nil
+	case "workbuddy", "work-buddy", "workbuddy.cn":
+		return "workbuddy", nil
+	default:
+		return "", fmt.Errorf("login portal must be codebuddy or workbuddy, not %q", raw)
+	}
+}
+
+func loginPortalOrigin(portal string) string {
+	if portal == "workbuddy" {
+		return originRefererWorkCN
+	}
+	return originRefererCN
 }
 
 func newLoginRegion(name, baseURL, origin, defaultDomain string) loginRegion {
@@ -133,6 +166,7 @@ func startLogin(client *http.Client, cfg loginRegion) {
 	if err := json.Unmarshal(data, &state); err != nil || state.State == "" || state.AuthURL == "" {
 		fatal("auth state response is missing state or authUrl")
 	}
+	state.AuthURL = rewriteLoginURL(state.AuthURL, cfg.Portal)
 	raw, err := json.Marshal(loginState{State: state.State, Region: cfg.Name})
 	if err != nil {
 		fatal("encode state: %v", err)
@@ -147,6 +181,23 @@ func startLogin(client *http.Client, cfg loginRegion) {
 	}
 	_ = os.Chmod(cfg.StateFile, 0o600)
 	fmt.Println(state.AuthURL)
+}
+
+func rewriteLoginURL(raw, portal string) string {
+	if portal != "codebuddy" && portal != "workbuddy" {
+		return raw
+	}
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Host == "" {
+		return raw
+	}
+	parsed.Scheme = "https"
+	if portal == "workbuddy" {
+		parsed.Host = "www.workbuddy.cn"
+	} else {
+		parsed.Host = "www.codebuddy.cn"
+	}
+	return parsed.String()
 }
 
 func pollLogin(client *http.Client, cfg loginRegion) {
