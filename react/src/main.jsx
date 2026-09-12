@@ -14,6 +14,14 @@ import './theme.css';
 const { Header, Sider, Content } = Layout;
 const { Title, Text, Paragraph } = Typography;
 const fmt = value => Number(value || 0).toLocaleString();
+const fmtCompact = value => {
+  const number = Number(value || 0);
+  const absolute = Math.abs(number);
+  const units = [[1e9, 'B'], [1e6, 'M'], [1e3, 'K']];
+  const unit = units.find(([threshold]) => absolute >= threshold);
+  if (!unit) return fmt(number);
+  return `${(number / unit[0]).toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1')}${unit[1]}`;
+};
 const fmtCredits = value => Number(value || 0).toFixed(4);
 const parseHours = value => String(value || '').split(',').map(item => item.trim()).filter(Boolean).map(Number);
 const initialAPIKey = sessionStorage.getItem('wb2api-api-key') || localStorage.getItem('wb2api-api-key') || '';
@@ -41,6 +49,8 @@ function App() {
   const [password, setPassword] = useState('');
   const [activeSection, setActiveSection] = useState('dashboard');
   const [data, setData] = useState({ accounts: [], metrics: {}, total: 0, healthy: 0, cooling: 0, disabled: 0 });
+  const [statsRange, setStatsRange] = useState('24h');
+  const [rangeMetrics, setRangeMetrics] = useState(null);
   const [models, setModels] = useState([]);
   const [requestLogs, setRequestLogs] = useState([]);
   const [requestSearch, setRequestSearch] = useState('');
@@ -79,17 +89,19 @@ function App() {
     const controller = new AbortController();
     refreshController.current = controller;
     try {
-      const [status, modelList, requestList] = await Promise.all([
+      const [status, modelList, requestList, selectedMetrics] = await Promise.all([
         api('/status', { signal: controller.signal }),
         api('/v1/models', { signal: controller.signal }),
         api('/requests?limit=200', { signal: controller.signal }).catch(() => ({ data: [] })),
+        api(`/stats?range=${encodeURIComponent(statsRange)}`, { signal: controller.signal }).catch(() => null),
       ]);
       if (serial !== refreshSerial.current) return;
       setData(status);
+      setRangeMetrics(selectedMetrics || status.metrics || {});
       setModels(modelList.data || []);
       setRequestLogs(requestList.data || []);
       setSelectedModel(current => current || modelList.data?.[0]?.id || '');
-      const metrics = status.metrics || {};
+      const metrics = selectedMetrics || status.metrics || {};
       const inputTokens = Number(metrics.input_tokens || 0);
       const cacheRate = inputTokens ? (Number(metrics.cache_read_tokens || 0) / inputTokens) * 100 : 0;
       setMetricSamples(current => [...current, { at: Date.now(), cacheRate, avgTTFB: Number(metrics.avg_ttfb_ms || 0) }].slice(-24));
@@ -121,7 +133,7 @@ function App() {
     refresh();
     const timer = setInterval(refresh, 30000);
     return () => clearInterval(timer);
-  }, [apiKey]);
+  }, [apiKey, statsRange]);
 
   useEffect(() => {
     form.setFieldsValue({
@@ -484,15 +496,14 @@ function App() {
     credits: filteredRequestLogs.reduce((sum, record) => sum + Number(record.credits_consumed || 0), 0),
   }), [filteredRequestLogs]);
 
-  const metrics = data.metrics || {};
-  const cacheHitRate = Number(metrics.input_tokens || 0)
-    ? (Number(metrics.cache_read_tokens || 0) / Number(metrics.input_tokens || 1)) * 100
-    : 0;
+  const metrics = rangeMetrics || data.metrics || {};
+  const rawInputTokens = Number(metrics.input_tokens || 0);
+  const cacheReadTokens = Number(metrics.cache_read_tokens || 0);
+  const uncachedInputTokens = Number(metrics.uncached_input_tokens ?? Math.max(rawInputTokens - cacheReadTokens, 0));
+  const cacheHitRate = Number(metrics.cache_hit_rate ?? (rawInputTokens ? (cacheReadTokens / rawInputTokens) * 100 : 0));
   const statCards = [
-    ['请求总数', metrics.requests, '#7aa2ff'], ['成功请求', metrics.successes, '#52c41a'],
-    ['失败请求', metrics.failures, '#ff7875'], ['输入 token', metrics.input_tokens, '#69c0ff'],
-    ['输出 token', metrics.output_tokens, '#b37feb'], ['总 token', metrics.total_tokens, '#9254de'],
-    ['缓存读取', metrics.cache_read_tokens, '#36cfc9'], ['缓存创建', metrics.cache_write_tokens, '#13c2c2'],
+    ['成功请求', metrics.successes, '#52c41a'], ['失败请求', metrics.failures, '#ff7875'],
+    ['缓存创建', metrics.cache_write_tokens, '#13c2c2'],
     ['工具调用', metrics.tool_calls, '#ffc53d'], ['积分消耗', metrics.credits_consumed, '#fa8c16', fmtCredits],
   ];
   const activeTab = activeSection === 'dashboard' ? 'pool' : activeSection === 'settings' ? 'admin' : activeSection;
@@ -687,6 +698,38 @@ function App() {
             <Paragraph type="secondary">{pageDescription}</Paragraph>
             {activeSection === 'dashboard' && (
               <>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+                  <Text type="secondary">统计范围</Text>
+                  <Select
+                    value={statsRange}
+                    style={{ width: 128 }}
+                    options={[
+                      { value: '24h', label: '最近 24 小时' },
+                      { value: '7d', label: '最近 7 天' },
+                      { value: '30d', label: '最近 30 天' },
+                      { value: '90d', label: '最近 90 天' },
+                      { value: 'all', label: '全部时间' },
+                    ]}
+                    onChange={value => {
+                      setMetricSamples([]);
+                      setStatsRange(value);
+                    }}
+                  />
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(260px,1fr))', gap: 16, marginBottom: 16 }}>
+                  <Card>
+                    <Statistic title="总请求数" value={fmt(metrics.requests)} valueStyle={{ color: '#356ae6' }} />
+                    <Text type="secondary">所选范围内</Text>
+                  </Card>
+                  <Card>
+                    <Statistic title="总 Token" value={fmtCompact(metrics.total_tokens)} valueStyle={{ color: '#9254de' }} />
+                    <Text type="secondary">输入: {fmtCompact(uncachedInputTokens)} / 输出: {fmtCompact(metrics.output_tokens)} / 缓存: {fmtCompact(cacheReadTokens)}</Text>
+                  </Card>
+                  <Card>
+                    <Statistic title="缓存命中率" value={cacheHitRate} precision={2} suffix="%" valueStyle={{ color: '#12a594' }} />
+                    <Text type="secondary">缓存 Token / 输入 Token</Text>
+                  </Card>
+                </div>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(170px,1fr))', gap: 16, marginBottom: 20 }}>
                   {statCards.map(([label, value, color, formatter]) => <Card key={label}><Statistic title={label} value={formatter ? formatter(value) : fmt(value)} valueStyle={{ color }} /></Card>)}
                 </div>

@@ -122,6 +122,12 @@ type MetricsStore interface {
 	SnapshotMetrics() map[string]any
 }
 
+// RangeMetricsStore is an optional request-log-backed statistics capability.
+// The base interface stays small so aggregate-only integrations keep working.
+type RangeMetricsStore interface {
+	SnapshotMetricsRange(from, to time.Time) (map[string]any, error)
+}
+
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
 func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 	return newChatStatWithStore(now, body, stream, nil)

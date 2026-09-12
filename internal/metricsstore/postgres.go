@@ -205,7 +205,7 @@ func (s *PostgresStore) AddCredit(consumed float64, source string) error {
 func (s *PostgresStore) RecordRequest(record RequestRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	err := insertRequestPostgres(s.db, record, s.requestWrites+1)
+	err := insertRequestPostgres(s.db, record)
 	if err == nil {
 		s.requestWrites++
 	}
@@ -223,7 +223,7 @@ func (s *PostgresStore) RecordCompletion(delta Snapshot, record RequestRecord) e
 	if err = addDeltaPostgres(tx, delta); err != nil {
 		return err
 	}
-	if err = insertRequestPostgres(tx, record, s.requestWrites+1); err != nil {
+	if err = insertRequestPostgres(tx, record); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err == nil {
@@ -303,7 +303,7 @@ func (s *PostgresStore) ReconcileRequestCreditByTime(accountUID, model string, r
 	return s.ReconcileRequestCredit(id, credit)
 }
 
-func insertRequestPostgres(db postgresExecutor, record RequestRecord, writes int) error {
+func insertRequestPostgres(db postgresExecutor, record RequestRecord) error {
 	_, err := db.Exec(`INSERT INTO request_logs(
 		id, created_at, route, model, mode, status, account_uid, account_region, requested_output_tokens,
 		input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
@@ -314,11 +314,6 @@ func insertRequestPostgres(db postgresExecutor, record RequestRecord, writes int
 		record.InputTokens, record.OutputTokens, record.TotalTokens, record.CacheReadTokens, record.CacheWriteTokens,
 		record.ToolCalls, record.TTFBMillis, record.LatencyMillis, record.CreditsConsumed, record.CreditSource,
 		record.Passthrough, record.ErrorCode, record.ErrorMessage)
-	if err == nil && writes%100 == 0 {
-		_, err = db.Exec(`DELETE FROM request_logs WHERE log_id IN (
-			SELECT log_id FROM request_logs ORDER BY created_at DESC, log_id DESC OFFSET $1
-		)`, maxRequestLogs)
-	}
 	return err
 }
 
@@ -368,6 +363,28 @@ func (s *PostgresStore) Snapshot() (Snapshot, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return readSnapshotPostgres(s.db)
+}
+
+// SnapshotRange derives metrics from request details that are still retained.
+func (s *PostgresStore) SnapshotRange(from, to time.Time) (Snapshot, error) {
+	if from.IsZero() || to.IsZero() || !from.Before(to) {
+		return Snapshot{}, fmt.Errorf("invalid metrics time range")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return scanRangeSnapshot(s.db.QueryRow(`SELECT
+		COUNT(*),
+		COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status < 200 OR status >= 300 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(total_tokens), 0),
+		COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(tool_calls), 0),
+		COALESCE(SUM(ttfb_millis), 0), COALESCE(SUM(CASE WHEN ttfb_millis > 0 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(latency_millis), 0), COALESCE(SUM(credits_consumed), 0),
+		COALESCE(SUM(CASE WHEN credit_source = 'upstream' THEN credits_consumed ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN credit_source = 'estimated' THEN credits_consumed ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN credit_source IN ('upstream', 'estimated') THEN 1 ELSE 0 END), 0),
+		COALESCE(MAX(created_at), 0)
+		FROM request_logs WHERE created_at >= $1 AND created_at < $2`, from.Unix(), to.Unix()))
 }
 
 func (s *PostgresStore) Close() error { return s.db.Close() }

@@ -824,7 +824,41 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, h.metricsSnapshot())
+	rangeName := strings.TrimSpace(r.URL.Query().Get("range"))
+	if rangeName == "" || rangeName == "all" {
+		metrics := h.metricsSnapshot()
+		metrics["range"] = "all"
+		writeJSON(w, http.StatusOK, metrics)
+		return
+	}
+	durations := map[string]time.Duration{
+		"24h": 24 * time.Hour,
+		"7d":  7 * 24 * time.Hour,
+		"30d": 30 * 24 * time.Hour,
+		"90d": 90 * 24 * time.Hour,
+	}
+	duration, ok := durations[rangeName]
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"code": "invalid_stats_range", "message": "range must be one of 24h, 7d, 30d, 90d, all"}})
+		return
+	}
+	rangeStore, ok := h.cfg.MetricsStore.(RangeMetricsStore)
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]string{"code": "range_metrics_unavailable", "message": "time-range metrics are unavailable"}})
+		return
+	}
+	to := time.Now()
+	from := to.Add(-duration)
+	metrics, err := rangeStore.SnapshotMetricsRange(from, to)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"code": "range_metrics_unavailable", "message": err.Error()}})
+		return
+	}
+	metrics["range"] = rangeName
+	metrics["range_start"] = from.Unix()
+	metrics["range_end"] = to.Unix()
+	metrics["scope"] = "retained_request_logs"
+	writeJSON(w, http.StatusOK, metrics)
 }
 
 func (h *Handler) requests(w http.ResponseWriter, r *http.Request) {

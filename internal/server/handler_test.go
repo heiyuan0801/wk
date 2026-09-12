@@ -78,6 +78,55 @@ func TestUnlockRateLimitBlocksRepeatedFailures(t *testing.T) {
 	}
 }
 
+type rangeMetricsCapture struct {
+	from time.Time
+	to   time.Time
+}
+
+func (s *rangeMetricsCapture) AddMetrics(int64, int64, int64, int64, int64, int64, int64, int64, int64, int64, int64, int64, int64) error {
+	return nil
+}
+
+func (s *rangeMetricsCapture) SnapshotMetrics() map[string]any {
+	return map[string]any{"requests": int64(99)}
+}
+
+func (s *rangeMetricsCapture) SnapshotMetricsRange(from, to time.Time) (map[string]any, error) {
+	s.from, s.to = from, to
+	return map[string]any{"requests": int64(7)}, nil
+}
+
+func TestStatsSupportsSelectedTimeRange(t *testing.T) {
+	store := &rangeMetricsCapture{}
+	h := NewHandler(Config{MetricsStore: store})
+	req := httptest.NewRequest(http.MethodGet, "/stats?range=7d", nil)
+	rec := httptest.NewRecorder()
+	h.stats(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["range"] != "7d" || body["scope"] != "retained_request_logs" || body["requests"] != float64(7) {
+		t.Fatalf("body=%#v", body)
+	}
+	if duration := store.to.Sub(store.from); duration != 7*24*time.Hour {
+		t.Fatalf("range duration=%s", duration)
+	}
+}
+
+func TestStatsRejectsUnknownTimeRange(t *testing.T) {
+	h := NewHandler(Config{})
+	req := httptest.NewRequest(http.MethodGet, "/stats?range=year", nil)
+	rec := httptest.NewRecorder()
+	h.stats(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_stats_range") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 // newFakeUpstream 返回一个 ChatStream 走 fake 的 upstream.Client。
 // fake 依据 Authorization 头决定行为。
 func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body string, isStream bool)) *upstream.Client {

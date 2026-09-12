@@ -97,7 +97,12 @@ type RequestLogCleaner interface {
 	DeleteRequestLogsBefore(time.Time) (int64, error)
 }
 
-const maxRequestLogs = 10000
+// RangeSnapshotter aggregates metrics from retained request logs in the
+// half-open interval [from, to). It is optional so custom aggregate-only
+// backends remain compatible.
+type RangeSnapshotter interface {
+	SnapshotRange(from, to time.Time) (Snapshot, error)
+}
 
 func Open(path string) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
@@ -309,7 +314,7 @@ func (s *Store) AddCredit(consumed float64, source string) error {
 func (s *Store) RecordRequest(record RequestRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	err := insertRequest(s.db, record, s.requestWrites+1)
+	err := insertRequest(s.db, record)
 	if err == nil {
 		s.requestWrites++
 	}
@@ -330,7 +335,7 @@ func (s *Store) RecordCompletion(delta Snapshot, record RequestRecord) error {
 	if err = addDelta(tx, delta); err != nil {
 		return err
 	}
-	if err = insertRequest(tx, record, s.requestWrites+1); err != nil {
+	if err = insertRequest(tx, record); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err == nil {
@@ -410,7 +415,7 @@ func (s *Store) ReconcileRequestCreditByTime(accountUID, model string, requestAt
 	return s.ReconcileRequestCredit(id, credit)
 }
 
-func insertRequest(db metricsExecutor, record RequestRecord, writes int) error {
+func insertRequest(db metricsExecutor, record RequestRecord) error {
 	_, err := db.Exec(`INSERT INTO request_logs(
 		id, created_at, route, model, mode, status, account_uid, account_region, requested_output_tokens,
 		input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
@@ -422,13 +427,6 @@ func insertRequest(db metricsExecutor, record RequestRecord, writes int) error {
 		record.ToolCalls, record.TTFBMillis, record.LatencyMillis, record.CreditsConsumed, record.CreditSource,
 		boolInt(record.Passthrough), record.ErrorCode, record.ErrorMessage,
 	)
-	if err == nil {
-		if writes%100 == 0 {
-			_, err = db.Exec(`DELETE FROM request_logs WHERE rowid IN (
-				SELECT rowid FROM request_logs ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?
-			)`, maxRequestLogs)
-		}
-	}
 	return err
 }
 
@@ -480,6 +478,45 @@ func (s *Store) Snapshot() (Snapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.snapshotLocked()
+}
+
+// SnapshotRange derives metrics from request details that are still retained.
+func (s *Store) SnapshotRange(from, to time.Time) (Snapshot, error) {
+	if from.IsZero() || to.IsZero() || !from.Before(to) {
+		return Snapshot{}, fmt.Errorf("invalid metrics time range")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return scanRangeSnapshot(s.db.QueryRow(`SELECT
+		COUNT(*),
+		COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status < 200 OR status >= 300 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(total_tokens), 0),
+		COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(tool_calls), 0),
+		COALESCE(SUM(ttfb_millis), 0), COALESCE(SUM(CASE WHEN ttfb_millis > 0 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(latency_millis), 0), COALESCE(SUM(credits_consumed), 0),
+		COALESCE(SUM(CASE WHEN credit_source = 'upstream' THEN credits_consumed ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN credit_source = 'estimated' THEN credits_consumed ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN credit_source IN ('upstream', 'estimated') THEN 1 ELSE 0 END), 0),
+		COALESCE(MAX(created_at), 0)
+		FROM request_logs WHERE created_at >= ? AND created_at < ?`, from.Unix(), to.Unix()))
+}
+
+type snapshotScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanRangeSnapshot(row snapshotScanner) (Snapshot, error) {
+	var snapshot Snapshot
+	err := row.Scan(
+		&snapshot.Requests, &snapshot.Successes, &snapshot.Failures,
+		&snapshot.InputTokens, &snapshot.OutputTokens, &snapshot.TotalTokens,
+		&snapshot.CacheRead, &snapshot.CacheWrite, &snapshot.ToolCalls,
+		&snapshot.TTFBMillis, &snapshot.TTFBSamples, &snapshot.LatencyMillis,
+		&snapshot.CreditsConsumed, &snapshot.CreditsUpstream, &snapshot.CreditsEstimated,
+		&snapshot.CreditRequests, &snapshot.LastRequestUnix,
+	)
+	return snapshot, err
 }
 
 func (s *Store) snapshotLocked() (Snapshot, error) {

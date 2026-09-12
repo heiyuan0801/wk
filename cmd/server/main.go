@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -128,6 +129,22 @@ func (m metricsAdapter) SnapshotMetrics() map[string]any {
 	if err != nil {
 		return map[string]any{"error": "metrics unavailable"}
 	}
+	return metricsSnapshotMap(snapshot)
+}
+
+func (m metricsAdapter) SnapshotMetricsRange(from, to time.Time) (map[string]any, error) {
+	store, ok := m.store.(metricsstore.RangeSnapshotter)
+	if !ok {
+		return nil, fmt.Errorf("metrics backend does not support time ranges")
+	}
+	snapshot, err := store.SnapshotRange(from, to)
+	if err != nil {
+		return nil, err
+	}
+	return metricsSnapshotMap(snapshot), nil
+}
+
+func metricsSnapshotMap(snapshot metricsstore.Snapshot) map[string]any {
 	requests := snapshot.Requests
 	ttfbSamples := snapshot.TTFBSamples
 	avgLatency := int64(0)
@@ -138,7 +155,15 @@ func (m metricsAdapter) SnapshotMetrics() map[string]any {
 	if ttfbSamples > 0 {
 		avgTTFB = snapshot.TTFBMillis / ttfbSamples
 	}
-	return map[string]any{"requests": requests, "successes": snapshot.Successes, "failures": snapshot.Failures, "input_tokens": snapshot.InputTokens, "output_tokens": snapshot.OutputTokens, "total_tokens": snapshot.TotalTokens, "cache_read_tokens": snapshot.CacheRead, "cache_write_tokens": snapshot.CacheWrite, "tool_calls": snapshot.ToolCalls, "credits_consumed": snapshot.CreditsConsumed, "credits_upstream": snapshot.CreditsUpstream, "credits_estimated": snapshot.CreditsEstimated, "credit_requests": snapshot.CreditRequests, "avg_ttfb_ms": avgTTFB, "avg_latency_ms": avgLatency, "last_request_at": snapshot.LastRequestUnix}
+	uncachedInput := snapshot.InputTokens - snapshot.CacheRead
+	if uncachedInput < 0 {
+		uncachedInput = 0
+	}
+	cacheHitRate := float64(0)
+	if snapshot.InputTokens > 0 {
+		cacheHitRate = float64(snapshot.CacheRead) / float64(snapshot.InputTokens) * 100
+	}
+	return map[string]any{"requests": requests, "successes": snapshot.Successes, "failures": snapshot.Failures, "input_tokens": snapshot.InputTokens, "uncached_input_tokens": uncachedInput, "output_tokens": snapshot.OutputTokens, "total_tokens": snapshot.TotalTokens, "cache_read_tokens": snapshot.CacheRead, "cache_write_tokens": snapshot.CacheWrite, "cache_hit_rate": cacheHitRate, "tool_calls": snapshot.ToolCalls, "credits_consumed": snapshot.CreditsConsumed, "credits_upstream": snapshot.CreditsUpstream, "credits_estimated": snapshot.CreditsEstimated, "credit_requests": snapshot.CreditRequests, "avg_ttfb_ms": avgTTFB, "avg_latency_ms": avgLatency, "last_request_at": snapshot.LastRequestUnix}
 }
 
 func main() {
