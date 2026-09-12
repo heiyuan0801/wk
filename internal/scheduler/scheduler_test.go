@@ -42,6 +42,25 @@ func TestNextFireMergesSchedules(t *testing.T) {
 	}
 }
 
+func TestRequestIDCandidatesMapsBillingPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		id   string
+		want []string
+	}{
+		{"billing", "crb-abc", []string{"crb-abc", "cmb-abc"}},
+		{"chat", "cmb-abc", []string{"cmb-abc", "crb-abc"}},
+		{"other", "gen-abc", []string{"gen-abc"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := requestIDCandidates(tc.id)
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("candidates=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // fakeUpstream 同时模拟 billing 与 refresh。
 type fakeUpstream struct {
 	checkinCalls   atomic.Int32

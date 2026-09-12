@@ -2077,7 +2077,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.creditsConsumed = credits
 				st.creditSource = "upstream"
 			}
-			if responseID := stats.ResponseID(); responseID != "" {
+			if responseID := stats.ResponseID(); responseID != "" && upstreamHeaderID == "" {
 				st.id = responseID
 			}
 			rc.Close()
@@ -2106,7 +2106,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		usageStats(resp, st)
-		if responseID := upstream.ResponseID(resp); responseID != "" {
+		if responseID := upstream.ResponseID(resp); responseID != "" && upstreamHeaderID == "" {
 			st.id = responseID
 			if w.Header().Get("X-Request-Id") == "" {
 				w.Header().Set("X-Request-Id", responseID)

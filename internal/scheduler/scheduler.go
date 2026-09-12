@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -138,16 +139,44 @@ func (s *Scheduler) RunRequestCreditRefreshNow() {
 		if a == nil || a.Snapshot().AccessToken == "" {
 			continue
 		}
-		rows, _, err := s.cfg.Upstream.UserRequestUsage(a, start, end, 1, 200)
-		if err != nil {
-			log.Printf("request-usage %s: %v", st.UID, err)
-			continue
-		}
-		for _, row := range rows {
-			if row.RequestID != "" {
-				_ = s.cfg.RequestCredits.ReconcileRequestCredit(row.RequestID, row.Credit)
+		const pageSize = 200
+		for page := 1; ; page++ {
+			rows, total, err := s.cfg.Upstream.UserRequestUsage(a, start, end, page, pageSize)
+			if err != nil {
+				log.Printf("request-usage %s: %v", st.UID, err)
+				break
+			}
+			for _, row := range rows {
+				if row.RequestID == "" {
+					continue
+				}
+				for _, id := range requestIDCandidates(row.RequestID) {
+					if err := s.cfg.RequestCredits.ReconcileRequestCredit(id, row.Credit); err != nil {
+						log.Printf("reconcile request credit %s: %v", id, err)
+					}
+				}
+			}
+			if len(rows) == 0 || total <= page*pageSize {
+				break
 			}
 		}
+	}
+}
+
+// requestIDCandidates accounts for WorkBuddy's billing meter using the crb-
+// prefix while chat responses historically exposed the same identifier with
+// a cmb- prefix. The original ID remains unchanged in downstream responses.
+func requestIDCandidates(id string) []string {
+	if id == "" {
+		return nil
+	}
+	switch {
+	case strings.HasPrefix(id, "crb-"):
+		return []string{id, "cmb-" + strings.TrimPrefix(id, "crb-")}
+	case strings.HasPrefix(id, "cmb-"):
+		return []string{id, "crb-" + strings.TrimPrefix(id, "cmb-")}
+	default:
+		return []string{id}
 	}
 }
 
