@@ -163,6 +163,8 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/account/sms/captcha", h.withFrontend(h.accountSMSSubmitCaptcha))
 	h.mux.HandleFunc("POST /admin/account/sms/auto-enroll", h.withFrontend(h.accountSMSAutoEnroll))
 	h.mux.HandleFunc("GET /admin/account/sms/auto-enroll", h.withFrontend(h.accountSMSAutoEnrollStatus))
+	h.mux.HandleFunc("POST /admin/account/sms/auto-enroll/stop", h.withFrontend(h.accountSMSAutoEnrollStop))
+	h.mux.HandleFunc("GET /admin/proxy/status", h.withFrontend(h.proxyStatus))
 	h.mux.HandleFunc("POST /admin/account/{uid}/enable", h.withFrontend(h.enableAccount))
 	h.mux.HandleFunc("POST /admin/account/{uid}/disable", h.withFrontend(h.disableAccount))
 	h.mux.HandleFunc("POST /admin/account/{uid}/clear-cooldown", h.withFrontend(h.clearCooldownAccount))
@@ -877,6 +879,50 @@ func (h *Handler) accountSMSVerify(w http.ResponseWriter, r *http.Request) {
 // accountSMSAutoEnroll 豪猪自动加号：后台循环"取号→发码→收码→验码落盘"。
 // POST {"count": N, "workers": M} 启动；同一时刻只允许一个任务在跑。
 // workers 并发数 1-8，默认 3（每个号一个独立代理出口，共享同一个号池）。
+// accountSMSAutoEnrollStop 停止正在跑的自动加号任务。
+//
+// 没有这个端点时只能重启容器才能停下一个跑偏的任务（例如对接商全是空号，
+// 循环一直在取号失败）。已在途的号会由各自的超时收尾，不会落半截账号。
+func (h *Handler) accountSMSAutoEnrollStop(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.AutoEnroll == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "自动加号未启用"})
+		return
+	}
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	// body 可选：没有 body 也能停。
+	_ = json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&req)
+
+	if !h.cfg.AutoEnroll.Stop(req.Reason) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "note": "当前没有正在运行的任务"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "note": "已请求停止，正在收尾"})
+}
+
+// proxyStatus 导出登录代理池状态，供「代理池」页展示。
+//
+// 只报告配置与冷却情况，**绝不返回代理密码**：这些凭据对控制台没有
+// 使用价值，但会留在浏览器历史/日志里。
+func (h *Handler) proxyStatus(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.SMSLogin == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "reason": "短信直登未启用"})
+		return
+	}
+	st := h.cfg.SMSLogin.ProxyStatus()
+	if st == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled": false,
+			"reason":  "未配置登录代理（直连模式）",
+		})
+		return
+	}
+	st["enabled"] = true
+	writeJSON(w, http.StatusOK, st)
+}
+
+// accountSMSAutoEnroll 启动自动加号任务。
 func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.SMSLogin == nil || h.cfg.AutoEnroll == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "自动加号未启用（缺少豪猪配置）"})
@@ -920,6 +966,7 @@ func (h *Handler) accountSMSAutoEnrollStatus(w http.ResponseWriter, r *http.Requ
 	body := map[string]any{
 		"running": st.Running, "attempts": st.Attempts,
 		"ok": st.OK, "fail": st.Fail, "logs": st.Logs,
+		"consumed": st.Consumed,
 	}
 	if st.Workers > 0 {
 		body["workers"] = st.Workers

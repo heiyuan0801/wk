@@ -18,6 +18,7 @@ import (
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/session"
+	"workbuddy2api/internal/smslogin"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -56,6 +57,56 @@ func TestReadRequestBodyDetectsLimit(t *testing.T) {
 	got, tooLarge, err := readRequestBody(req)
 	if err != nil || !tooLarge || got != nil {
 		t.Fatalf("readRequestBody = (%d bytes, tooLarge=%v, err=%v)", len(got), tooLarge, err)
+	}
+}
+
+// TestProxyStatusEndpoint 代理池页依赖这个端点：未配置时要明确报"直连"，
+// 而不是返回空对象让前端猜；配置后要给出池内容量与冷却明细，且不带密码。
+func TestProxyStatusEndpoint(t *testing.T) {
+	// 未配置 SMSLogin：明确说未启用。
+	h := NewHandler(Config{})
+	rec := httptest.NewRecorder()
+	h.proxyStatus(rec, httptest.NewRequest(http.MethodGet, "/admin/proxy/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d", rec.Code)
+	}
+	var disabled map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &disabled); err != nil {
+		t.Fatal(err)
+	}
+	if disabled["enabled"] != false {
+		t.Fatalf("enabled=%v want false", disabled["enabled"])
+	}
+	if disabled["reason"] == nil || disabled["reason"] == "" {
+		t.Fatal("disabled response must explain why")
+	}
+
+	// 配了代理池：给出明细。
+	pool, err := smslogin.NewPoolDialer([]string{"1.1.1.1:1:alice:SECRETPW"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := smslogin.NewManager(smslogin.Endpoints{}, time.Minute)
+	m.SetProxyDialer(pool)
+	h2 := NewHandler(Config{SMSLogin: m})
+	rec2 := httptest.NewRecorder()
+	h2.proxyStatus(rec2, httptest.NewRequest(http.MethodGet, "/admin/proxy/status", nil))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec2.Code, rec2.Body.String())
+	}
+	body := rec2.Body.String()
+	if strings.Contains(body, "SECRETPW") {
+		t.Fatalf("proxy status leaked the password: %s", body)
+	}
+	var enabled map[string]any
+	if err := json.Unmarshal([]byte(body), &enabled); err != nil {
+		t.Fatal(err)
+	}
+	if enabled["enabled"] != true || enabled["mode"] != "pool" {
+		t.Fatalf("enabled=%v mode=%v", enabled["enabled"], enabled["mode"])
+	}
+	if enabled["endpoints"] != float64(1) {
+		t.Fatalf("endpoints=%v want 1", enabled["endpoints"])
 	}
 }
 

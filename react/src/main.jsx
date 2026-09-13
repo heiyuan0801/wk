@@ -7,11 +7,14 @@ import {
 import {
   ApiOutlined, CheckCircleOutlined, DashboardOutlined, FileSearchOutlined, KeyOutlined,
   ReloadOutlined, SendOutlined, DeleteOutlined, SettingOutlined, StopOutlined,
-  ThunderboltOutlined, ToolOutlined, UnlockOutlined, SafetyOutlined,
+  ThunderboltOutlined, ToolOutlined, UnlockOutlined, SafetyOutlined, CloudServerOutlined,
+  UserAddOutlined,
 } from '@ant-design/icons';
 import 'antd/dist/reset.css';
 import './theme.css';
 import { orderCaptchaOptions, runTencentCaptcha } from './captcha';
+import AutoEnrollPage from './pages/AutoEnroll';
+import ProxyPoolPage from './pages/ProxyPool';
 
 const { Header, Sider, Content } = Layout;
 const { Title, Text, Paragraph } = Typography;
@@ -27,6 +30,16 @@ const COOL_KIND_LABEL = {
   soft_rate: '429 限流',
   rate_limit: '上游限流',
 };
+
+// 页面标识。用 hash 路由（#/auto-enroll）而不是给每页单独打包：
+// 刷新能停在原页、地址可收藏转发，且不引入 react-router 依赖。
+const SECTIONS = ['dashboard', 'models', 'playground', 'requests', 'auto-enroll', 'proxy', 'settings'];
+
+// sectionFromHash 读取地址栏里的页面标识；非法/缺失时回落到仪表盘。
+function sectionFromHash() {
+  const raw = String(window.location.hash || '').replace(/^#\/?/, '').trim();
+  return SECTIONS.includes(raw) ? raw : 'dashboard';
+}
 
 // fmtDuration 把秒数格式化成紧凑的中文时长文案。
 function fmtDuration(seconds) {
@@ -125,8 +138,7 @@ function Console() {
   const [apiKey, setApiKey] = useState(initialAPIKey);
   const [locked, setLocked] = useState(false);
   const [password, setPassword] = useState('');
-  const [activeSection, setActiveSection] = useState('dashboard');
-  const [data, setData] = useState({ accounts: [], metrics: {}, total: 0, healthy: 0, cooling: 0, disabled: 0 });
+  const [activeSection, setActiveSection] = useState(() => sectionFromHash());  const [data, setData] = useState({ accounts: [], metrics: {}, total: 0, healthy: 0, cooling: 0, disabled: 0 });
   const [models, setModels] = useState([]);
   const [requestLogs, setRequestLogs] = useState([]);
   const [requestSearch, setRequestSearch] = useState('');
@@ -239,6 +251,19 @@ function Console() {
       keepalive: (config.keepalive_hours || []).join(','),
     });
   }, [config, form]);
+
+  // hash 路由：切换页面时写回地址栏；浏览器前进/后退（hashchange）时同步
+  // 回 state。两处都必要——只写不同步会让后退键失效。
+  useEffect(() => {
+    const next = `#/${activeSection}`;
+    if (window.location.hash !== next) window.location.hash = next;
+  }, [activeSection]);
+
+  useEffect(() => {
+    const onHashChange = () => setActiveSection(sectionFromHash());
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
 
   // 短信验证码重发倒计时：上游 60 秒内会拒绝重复发码。
   useEffect(() => {
@@ -968,6 +993,8 @@ function Console() {
     models: ['模型与请求', '查看当前可用的上游模型。'],
     playground: ['请求测试', '发送 Responses API 请求并查看标准化的 output_text。'],
     requests: ['请求日志', '查看每次请求的端点、模式、token、耗时、积分和错误详情。'],
+    'auto-enroll': ['自动加号', '用豪猪接码平台批量添加中国区账号：取号 → 发码 → 收码 → 自动落盘，全程免浏览器。'],
+    proxy: ['代理池', '短信直登链路的出口代理：池内容量、冷却状态和后续扩展。'],
     settings: ['管理设置', '配置签到计划和管理授权账号。'],
   };
   const [pageTitle, pageDescription] = pageCopy[activeSection] || pageCopy.dashboard;
@@ -978,6 +1005,14 @@ function Console() {
     { key: 'models', icon: <ApiOutlined />, label: '模型目录' },
     { key: 'playground', icon: <SendOutlined />, label: '请求测试' },
     { key: 'requests', icon: <FileSearchOutlined />, label: '请求日志' },
+    {
+      key: 'accounts-group', icon: <UserAddOutlined />, label: '账号运营',
+      type: 'group',
+      children: [
+        { key: 'auto-enroll', icon: <ThunderboltOutlined />, label: '自动加号' },
+        { key: 'proxy', icon: <CloudServerOutlined />, label: '代理池' },
+      ],
+    },
     { key: 'settings', icon: <SettingOutlined />, label: '管理设置' },
   ];
   const tabItems = [
@@ -1352,6 +1387,8 @@ function Console() {
                 </Card>
               </>
             )}
+            {activeSection === 'auto-enroll' && <AutoEnrollPage api={api} />}
+            {activeSection === 'proxy' && <ProxyPoolPage api={api} />}
             {tabItems.find(item => item.key === activeTab)?.children}
           </Content>
         </Layout>

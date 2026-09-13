@@ -498,6 +498,122 @@ func TestRealBalanceInsufficientIsFatal(t *testing.T) {
 	}
 }
 
+// TestAutoEnrollStop 运行中必须能被停掉（否则只能重启容器）。
+// 刻意用"取号成功但永远收不到码"：任务会一直轮询，只有 Stop 能结束它。
+func TestAutoEnrollStop(t *testing.T) {
+	f := newFakeHZM(t)
+	// getMessage 永远返回"等待"，pollTimeout 设很长，任务因此一直挂着。
+	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
+		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil)
+	en.retryDelay = 10 * time.Millisecond
+	en.pollInterval = 20 * time.Millisecond
+	en.pollTimeout = 60 * time.Second // 故意很长：证明是 Stop 生效而不是等超时
+
+	// noSMSManager 发码会立刻失败，任务瞬间跑完；这里换成一个"发码成功但
+	// 收不到码"的假上游，让任务停在收码轮询上。
+	en.sms = successSMSManager(t)
+
+	if err := en.AutoRun(10, 2); err != nil {
+		t.Fatal(err)
+	}
+	// 等它真的进入收码轮询。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !en.Status().Running {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !en.Status().Running {
+		t.Fatal("task should be running")
+	}
+
+	if !en.Stop("测试停止") {
+		t.Fatal("Stop should report true while running")
+	}
+	// 必须在很短时间内结束（远小于 60s 的 pollTimeout，证明是取消起作用）。
+	done := make(chan struct{})
+	go func() { waitDone(t, en); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop did not finish the task in time")
+	}
+	if en.Status().Running {
+		t.Fatal("should not be running after Stop")
+	}
+	// 没有正在跑的任务时 Stop 返回 false，而不是报错。
+	if en.Stop("") {
+		t.Fatal("Stop on idle task should report false")
+	}
+}
+
+// TestAutoEnrollStopKeepsReason Stop 之后轮询仍能读到终止原因。
+func TestAutoEnrollStopKeepsReason(t *testing.T) {
+	f := newFakeHZM(t)
+	en := NewAutoEnroller(noSMSManager(), f.client(), "52283",
+		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil)
+	en.retryDelay = 10 * time.Millisecond
+	en.pollInterval = 10 * time.Millisecond
+	en.pollTimeout = 60 * time.Second
+
+	if err := en.AutoRun(10, 1); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !en.Status().Running {
+		time.Sleep(10 * time.Millisecond)
+	}
+	en.Stop("用户手动停止")
+	waitDone(t, en)
+	if got := en.Status().StopReason; !strings.Contains(got, "停止") {
+		t.Fatalf("stop_reason=%q want 手动停止", got)
+	}
+}
+
+// TestAutoEnrollStopCountsConsumedNumbers 中途停止时，已经取走的号必须
+// 计入消耗——否则"取了 3 个号后停止"会显示成 0，看不出号码去了哪。
+func TestAutoEnrollStopCountsConsumedNumbers(t *testing.T) {
+	f := newFakeHZM(t)
+	en := NewAutoEnroller(successSMSManager(t), f.client(), "52283",
+		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
+		nil)
+	en.retryDelay = 10 * time.Millisecond
+	en.pollInterval = 20 * time.Millisecond
+	en.pollTimeout = 60 * time.Second // 卡在收码轮询，等 Stop
+
+	if err := en.AutoRun(10, 2); err != nil {
+		t.Fatal(err)
+	}
+	// 等两个 worker 都取到号（getPhone 被调用 >= 2 次）。
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if f.getPhone.Load() >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if f.getPhone.Load() < 2 {
+		t.Fatalf("workers should have taken numbers, getPhone=%d", f.getPhone.Load())
+	}
+
+	en.Stop("测试停止")
+	waitDone(t, en)
+
+	st := en.Status()
+	taken := int(f.getPhone.Load())
+	if st.Consumed == 0 {
+		t.Fatalf("consumed=0 but %d numbers were taken — consumption must be reported", taken)
+	}
+	// 每个取到的号都应被计入（允许任务在 Stop 前多取，所以用 >=）。
+	if st.Consumed < 2 {
+		t.Fatalf("consumed=%d want >=2 (getPhone called %d times)", st.Consumed, taken)
+	}
+	// 被取消的尝试不该被算成失败。
+	if st.Fail != 0 {
+		t.Fatalf("fail=%d, cancelled attempts must not count as failures", st.Fail)
+	}
+}
+
 func waitDone(t *testing.T, en *AutoEnroller) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)

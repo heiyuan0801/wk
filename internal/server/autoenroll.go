@@ -37,12 +37,16 @@ type AutoEnroller struct {
 	logs    []string
 	started time.Time
 	// stats
+	//
+	// attempts 只统计**跑完**的尝试（成功 + 失败），被取消中断的不算，
+	// 否则中途停止会把半截尝试算成失败，成功率看起来比实际差。
+	// consumed 统计**实际取到的号**（含被中断的），它才是"消耗了多少号码"。
 	attempts   int
 	ok         int
 	fail       int
+	consumed   int
 	stopReason string
 	workers    int
-
 	// retryDelay 两次尝试之间的间隔（测试里调短）。0 时用默认 5s。
 	retryDelay time.Duration
 	// pollTimeout 单个号等验证码的时长（测试里调短）。0 时用默认 90s。
@@ -53,6 +57,10 @@ type AutoEnroller struct {
 	// reloginMu 保证并发的 token 失效只触发一次重登。
 	reloginMu   sync.Mutex
 	lastRelogin time.Time
+
+	// cancel 停止当前运行中的任务（由 run 注册，任务结束后清空）。
+	// 没有它就只能重启容器才能停下一个跑偏的任务。
+	cancel context.CancelFunc
 }
 
 // 并发默认值与上限。并发加号靠代理池撑：每个号一个独立出口 IP
@@ -100,6 +108,9 @@ type AutoEnrollStatus struct {
 	Workers    int      `json:"workers,omitempty"`
 	StopReason string   `json:"stop_reason,omitempty"`
 	Logs       []string `json:"logs"`
+	// Consumed 本次已取到的号码数（含中途停止时在途的）。
+	// 与 Attempts 分开：Attempts 是跑完的尝试数，Consumed 是真实号码消耗。
+	Consumed int `json:"consumed"`
 }
 
 // NewAutoEnroller 组装自动加号器。persist 落盘回调必填（nil 时 tryOne 会
@@ -143,6 +154,7 @@ func (a *AutoEnroller) Status() AutoEnrollStatus {
 		Attempts:   a.attempts,
 		OK:         a.ok,
 		Fail:       a.fail,
+		Consumed:   a.consumed,
 		Workers:    a.workers,
 		StopReason: a.stopReason,
 		Logs:       append([]string(nil), a.logs...),
@@ -179,14 +191,21 @@ func (a *AutoEnroller) AutoRun(n, workers int) error {
 	a.logs = nil
 	a.stopReason = ""
 	a.workers = workers
+	// ctx/cancel 必须在置 running 之前就绪：否则"启动后立刻点停止"会
+	// 撞上 a.cancel 还是 nil，Stop 静默失效（用户以为停了其实还在跑）。
+	ctx, cancel := context.WithCancel(context.Background())
+	a.cancel = cancel
 	a.mu.Unlock()
 	go func() {
 		defer func() {
+			cancel()
 			a.mu.Lock()
 			a.running = false
+			a.cancel = nil
 			a.mu.Unlock()
 		}()
-		reason := a.run(n, workers)
+		reason := a.run(ctx, n, workers)
+		reason = a.outcome(reason)
 		a.mu.Lock()
 		a.stopReason = reason
 		a.mu.Unlock()
@@ -198,6 +217,28 @@ func (a *AutoEnroller) AutoRun(n, workers int) error {
 		}
 	}()
 	return nil
+}
+
+// Stop 请求停止正在运行的任务。没有在跑时返回 false。
+//
+// 运行中的 run 循环通过 ctx 感知取消：worker 会尽快退出，已在途的会话
+// 由各自的超时收尾（不会把半截账号落盘）。
+func (a *AutoEnroller) Stop(reason string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.running || a.cancel == nil {
+		return false
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "用户手动停止"
+	}
+	a.cancel()
+	// 记下来是为了让前端在轮询里看到"为什么停了"；run 返回时若已有
+	// 更具体的原因会覆盖它（setStop 只写非空值）。
+	if a.stopReason == "" {
+		a.stopReason = reason
+	}
+	return true
 }
 
 // run 并发主循环：workers 个 goroutine 各自串行地"取号→发码→收码→落盘"，
@@ -212,7 +253,9 @@ func (a *AutoEnroller) AutoRun(n, workers int) error {
 //   - 豪猪余额不足 / 无号可取 / 项目不存在等致命错误
 //   - 连续失败达到熔断阈值（跨 worker 累计——整个通道崩了）
 //   - token 失效：重登一次（用 mutex 保证只登一次），再失败才停
-func (a *AutoEnroller) run(want, workers int) string {
+//
+// ctx 由 AutoRun 创建并注册到 a.cancel，让 Stop() 能中断（含"启动后立刻停止"）。
+func (a *AutoEnroller) run(ctx context.Context, want, workers int) string {
 	const maxPerSuccess = 12
 	limit := want * maxPerSuccess
 	if limit < 20 {
@@ -239,7 +282,10 @@ func (a *AutoEnroller) run(want, workers int) string {
 		return stopReason != ""
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// ctx 来自 AutoRun（Stop() 通过它的 cancel 中断整个任务）。
+	// 这里再派生一层：worker 内部"达到目标就全体停"用局部 cancel，
+	// 不会误触发外部的停止语义。
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	var wg sync.WaitGroup
@@ -265,11 +311,19 @@ func (a *AutoEnroller) run(want, workers int) string {
 					}
 				}
 				tctx, tcancel := context.WithTimeout(ctx, 6*time.Minute)
-				ok, err := a.tryOne(tctx, worker)
+				ok, usedPhone, err := a.tryOne(tctx, worker)
 				tcancel()
 
+				// 只要真的取到了号就计入消耗：中途被取消的尝试也要算，
+				// 否则"取了 3 个号后停止"会显示成 0 消耗，看不出号码去向。
+				if usedPhone {
+					a.mu.Lock()
+					a.consumed++
+					a.mu.Unlock()
+				}
+
 				// 整体取消（另一 worker 已达目标/命中致命错误）导致的失败不算
-				// 真实尝试：不计入统计，也不计入熔断。
+				// 真实尝试：不计入完成统计，也不计入熔断。
 				if !ok && errors.Is(err, context.Canceled) && ctx.Err() != nil {
 					return
 				}
@@ -346,6 +400,22 @@ func (a *AutoEnroller) run(want, workers int) string {
 	return stopReason
 }
 
+// outcome 合并本次运行的终止原因与外部 Stop() 写入的原因。
+//
+// Stop() 只写 a.stopReason（run 内部的 stopReason 是另一个变量），
+// 所以这里以内部原因为准，内部为空时保留外部写的"用户手动停止"。
+func (a *AutoEnroller) outcome(internal string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if internal != "" {
+		a.stopReason = internal
+	} else if a.stopReason == "" {
+		// 既没内部原因也没外部原因 = 正常达标签。
+		a.stopReason = ""
+	}
+	return a.stopReason
+}
+
 // reloginOnce 保证并发的 token 失效只触发一次重登。
 func (a *AutoEnroller) reloginOnce() {
 	a.reloginMu.Lock()
@@ -362,18 +432,24 @@ func (a *AutoEnroller) reloginOnce() {
 	a.logf("豪猪 token 已重登，继续")
 }
 
-// tryOne 走一个号的完整流程。返回是否成功加了号。
+// tryOne 走一个号的完整流程。返回是否成功加了号、是否真的取到了号。
 // worker 只用于日志标记，方便并发时区分是哪个 worker 的动作。
+//
+// usedPhone 与 ok 分开的原因：即使尝试被中途取消，号也已经从豪猪取走了
+// （并被拉黑），调用方需要把它算进"号码消耗"，否则统计会漏报。
 //
 // 号码处置：**所有**通过本流程取到的号最后都进黑名单——成功的号已经有账号了，
 // 不该再发给我；失败/超时的号收不到腾讯短信，留着只会下次又被取到。
 // 黑名单在 release 之前调用（豪猪要求先拉黑再释放）。
-func (a *AutoEnroller) tryOne(ctx context.Context, worker int) (bool, error) {
+func (a *AutoEnroller) tryOne(ctx context.Context, worker int) (ok bool, usedPhone bool, err error) {
 	// 1) 豪猪取号。
 	phone, err := a.hzm.GetPhone(ctx, a.sid)
 	if err != nil {
-		return false, fmt.Errorf("取号失败: %w", err)
+		// 没取到号 = 没有消耗。
+		return false, false, fmt.Errorf("取号失败: %w", err)
 	}
+	// 从这里开始，号码已经被占用，任何退出路径都要计入消耗。
+	usedPhone = true
 	a.logf("[w%d] 取号 %s", worker, phone)
 
 	// finish 统一收尾：先拉黑再释放（豪猪 SDK 的顺序）。任何退出路径都要走它。
@@ -387,7 +463,7 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker int) (bool, error) {
 	if _, exists := a.find(phone); exists {
 		a.logf("号 %s 已在号池，拉黑换下一个", phone)
 		finish()
-		return false, nil
+		return false, true, nil
 	}
 
 	// 3) 发码（走本服务 SMSLogin：代理池 + 风控处理都在里面）。
@@ -400,7 +476,7 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker int) (bool, error) {
 			a.logf("号 %s 发码失败: %v", phone, err)
 		}
 		finish()
-		return false, err
+		return false, true, err
 	}
 	sid := send.SessionID
 	if len(sid) > 8 {
@@ -429,21 +505,21 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker int) (bool, error) {
 			if perr != nil {
 				a.logf("号 %s 登录成功但落盘失败: %v", phone, perr)
 				finish()
-				return false, perr
+				return false, true, perr
 			}
 			a.logf("号 %s 加号成功 uid=%s…（已拉黑）", phone, shortUID(creds.UID))
 			finish()
-			return true, nil
+			return true, true, nil
 		}
 		a.logf("号 %s 验码失败: %v", phone, verr)
 		finish()
-		return false, verr
+		return false, true, verr
 	}
 
 	// 等不到码：拉黑 + 释放，换下一个号。
 	a.logf("号 %s 未收到验证码: %v（已拉黑）", phone, waitErr)
 	finish()
-	return false, waitErr
+	return false, true, waitErr
 }
 
 // pollCode 轮询豪猪 getMessage，直到拿到验证码或短信过期。

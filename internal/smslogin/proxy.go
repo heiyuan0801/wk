@@ -177,6 +177,52 @@ func (m *Manager) proxyTimeout() time.Duration {
 // SetProxyDialer 配置登录代理。nil = 直连（默认）。
 func (m *Manager) SetProxyDialer(d ProxyDialer) { m.proxy = d }
 
+// ProxyStatus 导出当前代理配置，供控制台展示。
+//
+// 两种拨号器形态不同，快照也不同：
+//   - PoolDialer（静态名单）：能看到每条的冷却状态，逐个列出。
+//   - ResolverProxyDialer（单出口，靠 sid 换 IP）：地址是唯一的，
+//     出口 IP 每次登录才生成，因此只能报告模式而无法列出 IP。
+//
+// 密码一律不外送。返回 nil 表示未配置代理（直连）。
+func (m *Manager) ProxyStatus() map[string]any {
+	if m.proxy == nil {
+		return nil
+	}
+	switch d := m.proxy.(type) {
+	case *PoolDialer:
+		snap := d.Snapshot()
+		return map[string]any{
+			"mode":              "pool",
+			"endpoints":         snap.Total,
+			"available":         snap.Available,
+			"cooling":           snap.Cooling,
+			"unused":            snap.Unused,
+			"cooldown":          snap.Cooldown,
+			"entries":           snap.Entries,
+			"next_ready_in_sec": snap.NextReadyInSec,
+		}
+	case *ResolverProxyDialer:
+		host, user := "", ""
+		if u, err := url.Parse(d.Address); err == nil {
+			host = u.Host
+			if u.User != nil {
+				user = url.User(u.User.Username()).String()
+			}
+		}
+		return map[string]any{
+			"mode":           "resolver",
+			"host":           host,
+			"user":           user,
+			"region":         d.Region,
+			"inject_sid":     d.InjectSID,
+			"sticky_minutes": d.StickyMinutes,
+		}
+	default:
+		return map[string]any{"mode": "custom"}
+	}
+}
+
 // SetProxyTimeout 拨号超时。
 func (m *Manager) SetProxyTimeout(d time.Duration) { m.proxyDialTimeout = d }
 
