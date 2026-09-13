@@ -1128,7 +1128,7 @@ function Console() {
     ['缓存读取', metrics.cache_read_tokens, '#36cfc9'], ['缓存创建', metrics.cache_write_tokens, '#13c2c2'],
     ['工具调用', metrics.tool_calls, '#ffc53d'], ['积分消耗', metrics.credits_consumed, '#fa8c16', fmtCredits],
   ];
-  const activeTab = activeSection === 'dashboard' ? 'pool' : activeSection === 'settings' ? 'admin' : activeSection;
+  const activeTab = activeSection === 'settings' ? 'admin' : activeSection;
   const pageCopy = {
     dashboard: ['运营概览', '账号池、请求量和 token 用量实时汇总，数据每 30 秒自动更新。'],
     accounts: ['账号状态', '查看账号健康、冷却、禁用状态，并对单个账号执行签到、保活和解冻。'],
@@ -1532,7 +1532,7 @@ function Console() {
             </Space>
           </Header>
           <Content style={{ padding: 26 }}>
-            {updateStatus && (updateStatus.state !== 'idle' || updateStatus.log_tail) && <Alert showIcon type={updateStatus.state === 'failed' ? 'error' : updateStatus.state === 'succeeded' ? 'success' : 'info'} message={updateStatus.message} description={updateStatus.log_tail ? <pre style={{ maxHeight: 220, overflow: 'auto', margin: 0, whiteSpace: 'pre-wrap' }}>{updateStatus.log_tail}</pre> : undefined} style={{ marginBottom: 16 }} />}
+            {updateStatus && updateStatus.state !== 'idle' && updateStatus.state !== 'succeeded' && <Alert showIcon type={updateStatus.state === 'failed' ? 'error' : 'info'} message={updateStatus.message} description={updateStatus.log_tail ? <pre style={{ maxHeight: 220, overflow: 'auto', margin: 0, whiteSpace: 'pre-wrap' }}>{updateStatus.log_tail}</pre> : undefined} style={{ marginBottom: 16 }} />}
             <Title level={2} style={{ marginTop: 0 }}>{pageTitle}</Title>
             <Paragraph type="secondary">{pageDescription}</Paragraph>
             {activeSection === 'dashboard' && (
