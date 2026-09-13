@@ -5,10 +5,10 @@ import {
   Select, Space, Statistic, Switch, Table, Tag, Tooltip, Typography, message,
 } from 'antd';
 import {
-  ApiOutlined, CheckCircleOutlined, DashboardOutlined, FileSearchOutlined, KeyOutlined,
+  ApiOutlined, CheckCircleOutlined, DashboardOutlined, FileSearchOutlined, KeyOutlined, CopyOutlined,
   ReloadOutlined, SendOutlined, DeleteOutlined, SettingOutlined, StopOutlined,
   ThunderboltOutlined, ToolOutlined, UnlockOutlined, SafetyOutlined, CloudServerOutlined,
-  UserAddOutlined,
+  UserAddOutlined, UserOutlined,
 } from '@ant-design/icons';
 import 'antd/dist/reset.css';
 import './theme.css';
@@ -164,9 +164,11 @@ function Console() {
   const [metricSamples, setMetricSamples] = useState([]);
   const [creditRefreshing, setCreditRefreshing] = useState(false);
   const [checkinRunning, setCheckinRunning] = useState(false);
+  const [checkinStatus, setCheckinStatus] = useState(null);
   const [apiKeyResetting, setApiKeyResetting] = useState(false);
   const [updateStarting, setUpdateStarting] = useState(false);
   const updatePollRef = useRef(null);
+  const checkinPollRef = useRef(null);
   const [accountAction, setAccountAction] = useState('');
   const [accountSearch, setAccountSearch] = useState('');
   const [accountStatusFilter, setAccountStatusFilter] = useState('all');
@@ -337,6 +339,16 @@ function Console() {
     message.success(next ? 'API Key 已保存' : 'API Key 已清除');
   };
 
+  const copyAPIKey = async () => {
+    if (!apiKeyDraft) { message.warning('当前没有 API Key'); return; }
+    try {
+      await navigator.clipboard.writeText(apiKeyDraft);
+      message.success('API Key 已复制');
+    } catch {
+      message.error('浏览器拒绝访问剪贴板，请手动复制');
+    }
+  };
+
   const resetAPIKey = async () => {
     setApiKeyResetting(true);
     try {
@@ -391,6 +403,8 @@ function Console() {
     return () => {
       if (updatePollRef.current) clearTimeout(updatePollRef.current);
       updatePollRef.current = null;
+      if (checkinPollRef.current) clearTimeout(checkinPollRef.current);
+      checkinPollRef.current = null;
     };
   }, [apiKey]);
 
@@ -429,7 +443,7 @@ function Console() {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(nextConfig),
       });
       setConfig(current => ({ ...current, ...(result.schedule || nextConfig), request_logs: result.request_logs || nextConfig.request_logs }));
-      message.success('配置已保存；短信/自动加号参数将在服务重启后生效');
+      message.success('配置已保存，签到计划和短信/自动加号参数已立即生效');
     } catch (error) {
       message.error(error.message);
     }
@@ -452,12 +466,28 @@ function Console() {
     setCheckinRunning(true);
     try {
       const result = await api('/admin/checkin', { method: 'POST' });
-      message.success(result.message || '签到任务已启动');
-      window.setTimeout(refresh, 2500);
+      message.info('签到任务已启动，正在等待全部账号返回结果');
+      pollCheckinStatus();
     } catch (error) {
       message.error(error.message);
     } finally {
       setCheckinRunning(false);
+    }
+  };
+
+  const pollCheckinStatus = async () => {
+    try {
+      const status = await api('/admin/checkin/status');
+      setCheckinStatus(status);
+      if (status.running) {
+        if (!checkinPollRef.current) checkinPollRef.current = setTimeout(() => { checkinPollRef.current = null; pollCheckinStatus(); }, 1500);
+      } else {
+        if (checkinPollRef.current) clearTimeout(checkinPollRef.current);
+        checkinPollRef.current = null;
+        if (status.summary) refresh();
+      }
+    } catch {
+      if (!checkinPollRef.current) checkinPollRef.current = setTimeout(() => { checkinPollRef.current = null; pollCheckinStatus(); }, 2000);
     }
   };
 
@@ -1101,6 +1131,8 @@ function Console() {
   const activeTab = activeSection === 'dashboard' ? 'pool' : activeSection === 'settings' ? 'admin' : activeSection;
   const pageCopy = {
     dashboard: ['运营概览', '账号池、请求量和 token 用量实时汇总，数据每 30 秒自动更新。'],
+    accounts: ['账号状态', '查看账号健康、冷却、禁用状态，并对单个账号执行签到、保活和解冻。'],
+    checkin: ['签到中心', '执行全部账号签到，并查看本次任务的成功、失败和跳过数量。'],
     models: ['模型与请求', '查看当前可用的上游模型。'],
     playground: ['请求测试', '发送 Responses API 请求并查看标准化的 output_text。'],
     requests: ['请求日志', '查看每次请求的端点、模式、token、耗时、积分和错误详情。'],
@@ -1113,6 +1145,8 @@ function Console() {
   const pollRegion = loginPendingRegion || loginRegion;
   const menuItems = [
     { key: 'dashboard', icon: <DashboardOutlined />, label: '仪表盘' },
+    { key: 'accounts', icon: <UserOutlined />, label: '账号状态' },
+    { key: 'checkin', icon: <CheckCircleOutlined />, label: '签到中心' },
     { key: 'models', icon: <ApiOutlined />, label: '模型目录' },
     { key: 'playground', icon: <SendOutlined />, label: '请求测试' },
     { key: 'requests', icon: <FileSearchOutlined />, label: '请求日志' },
@@ -1338,6 +1372,7 @@ function Console() {
                   await refresh();
                 } catch (error) { message.error(error.message); }
               }}>轮询授权结果</Button>
+              {loginPolling && <Text className="login-poll-status">正在等待授权完成，系统每 3 秒检查一次…</Text>}
             </Space>
             {loginURL && (
               <div style={{ marginTop: 12, wordBreak: 'break-all' }}>
@@ -1464,11 +1499,11 @@ function Console() {
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
-        <Sider breakpoint="lg" collapsedWidth="0">
+        <Sider className="app-sider" width={240} breakpoint="lg" collapsedWidth="0">
           <div style={{ color: '#172033', fontSize: 18, fontWeight: 700, padding: '22px 20px' }}>WorkBuddy<span style={{ color: '#356ae6' }}>2API</span></div>
           <Menu theme="light" mode="inline" selectedKeys={[activeSection]} items={menuItems} onClick={({ key }) => setActiveSection(key)} />
         </Sider>
-        <Layout>
+        <Layout className="app-main-layout">
           <Header style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 26px' }}>
             <Space>
               <Text strong style={{ color: '#172033' }}>服务控制台</Text>
@@ -1497,7 +1532,7 @@ function Console() {
             </Space>
           </Header>
           <Content style={{ padding: 26 }}>
-            {updateStatus && updateStatus.state !== 'idle' && <Alert showIcon type={updateStatus.state === 'failed' ? 'error' : updateStatus.state === 'succeeded' ? 'success' : 'info'} message={updateStatus.message} description={updateStatus.log_tail ? <pre style={{ maxHeight: 140, overflow: 'auto', margin: 0, whiteSpace: 'pre-wrap' }}>{updateStatus.log_tail}</pre> : undefined} style={{ marginBottom: 16 }} />}
+            {updateStatus && (updateStatus.state !== 'idle' || updateStatus.log_tail) && <Alert showIcon type={updateStatus.state === 'failed' ? 'error' : updateStatus.state === 'succeeded' ? 'success' : 'info'} message={updateStatus.message} description={updateStatus.log_tail ? <pre style={{ maxHeight: 220, overflow: 'auto', margin: 0, whiteSpace: 'pre-wrap' }}>{updateStatus.log_tail}</pre> : undefined} style={{ marginBottom: 16 }} />}
             <Title level={2} style={{ marginTop: 0 }}>{pageTitle}</Title>
             <Paragraph type="secondary">{pageDescription}</Paragraph>
             {activeSection === 'dashboard' && (
@@ -1530,6 +1565,17 @@ function Console() {
                 </Card>
               </>
             )}
+            {activeSection === 'accounts' && tabItems.find(item => item.key === 'pool')?.children}
+            {activeSection === 'checkin' && (
+              <Card title="全部账号签到" extra={checkinStatus?.running ? <Tag color="processing">执行中</Tag> : checkinStatus?.summary ? <Tag color={checkinStatus.summary.failed ? 'warning' : 'success'}>最近一次已完成</Tag> : null}>
+                <Space direction="vertical" size={14} style={{ width: '100%' }}>
+                  <Text type="secondary">签到会处理所有启用且有 refresh token 的账号，并在完成后显示成功、失败和跳过数量。</Text>
+                  <Button type="primary" icon={<CheckCircleOutlined />} loading={checkinRunning || checkinStatus?.running} onClick={runCheckinAll}>立即签到全部账号</Button>
+                  {checkinStatus?.running && <Alert type="info" showIcon message="签到任务执行中，请稍候…" />}
+                  {!checkinStatus?.running && checkinStatus?.summary && <Alert type={checkinStatus.summary.failed ? 'warning' : 'success'} showIcon message={`完成：成功 ${checkinStatus.summary.succeeded} 个，失败 ${checkinStatus.summary.failed} 个，跳过 ${checkinStatus.summary.skipped} 个`} description={checkinStatus.finished_at ? `完成时间：${checkinStatus.finished_at}` : undefined} />}
+                </Space>
+              </Card>
+            )}
             {activeSection === 'auto-enroll' && <AutoEnrollPage api={api} />}
             {activeSection === 'proxy' && <ProxyPoolPage api={api} />}
             {tabItems.find(item => item.key === activeTab)?.children}
@@ -1549,6 +1595,12 @@ function Console() {
                 <br />
                 <Text type="secondary">密钥只保存在当前浏览器会话中，用于访问管理接口。</Text>
               </div>
+              <Card size="small" style={{ background: '#fff' }}>
+                <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                  <Text type="secondary">当前密钥状态</Text>
+                  <Text code>{apiKey ? `${apiKey.slice(0, 6)}••••••${apiKey.slice(-4)}` : '未设置'}</Text>
+                </Space>
+              </Card>
               <Input.Password
                 value={apiKeyDraft}
                 onChange={event => setApiKeyDraft(event.target.value)}
@@ -1558,6 +1610,7 @@ function Console() {
               />
               <Space wrap>
                 <Button type="primary" icon={<KeyOutlined />} onClick={saveAPIKey}>保存密钥</Button>
+                <Button icon={<CopyOutlined />} onClick={copyAPIKey}>复制当前密钥</Button>
                 <Button danger icon={<ReloadOutlined />} loading={apiKeyResetting} onClick={resetAPIKey}>重置并生成新密钥</Button>
               </Space>
               <Alert type="info" showIcon message="重置会在服务器端生成新 API Key 并立即替换旧密钥，当前浏览器会自动保存新密钥。" />

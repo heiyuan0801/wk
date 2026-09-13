@@ -253,23 +253,46 @@ func contains(hours []int, h int) bool {
 	return false
 }
 
+type CheckinSummary struct {
+	Total     int             `json:"total"`
+	Succeeded int             `json:"succeeded"`
+	Failed    int             `json:"failed"`
+	Skipped   int             `json:"skipped"`
+	Details   []AccountResult `json:"details,omitempty"`
+}
+
 // RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
-func (s *Scheduler) RunCheckinNow() {
+func (s *Scheduler) RunCheckinNow() { _ = s.RunCheckinNowDetailed() }
+
+func (s *Scheduler) RunCheckinNowDetailed() CheckinSummary {
+	summary := CheckinSummary{}
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
+			summary.Skipped++
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.Snapshot().RefreshToken == "" {
+			summary.Skipped++
 			continue
 		}
+		summary.Total++
+		result := AccountResult{UID: st.UID}
 		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 			log.Printf("checkin %s: %v", st.UID, err)
 			// 已签到等业务错误也继续走余额查询
 		}
-		_ = s.refreshAccountCredits(st.UID, a)
+		if err := s.refreshAccountCredits(st.UID, a); err != nil {
+			result.Detail = err.Error()
+			summary.Failed++
+		} else {
+			result.OK = true
+			summary.Succeeded++
+		}
+		summary.Details = append(summary.Details, result)
 	}
+	return summary
 }
 
 // RunCreditRefreshNow refreshes upstream credit counters without performing a

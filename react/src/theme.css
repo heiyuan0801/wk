@@ -38,6 +38,10 @@ button, input, textarea, select { font: inherit; }
   z-index: 90;
 }
 
+@media (max-width: 991px) {
+  .app-main-layout { margin-inline-start: 0; }
+}
+
 .login-poll-status {
   line-height: 32px;
   color: #667085 !important;

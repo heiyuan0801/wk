@@ -43,6 +43,7 @@ type Config struct {
 	Region             string
 	LoginBin           string // OAuth 登录辅助程序路径
 	CheckinNow         func()
+	CheckinNowDetailed func() scheduler.CheckinSummary
 	CreditRefreshNow   func()
 	UpdateLogRetention func(days int)
 	// CheckinAccount / KeepaliveAccount 按单账号执行签到/保活，供控制台手动触发。
@@ -111,6 +112,15 @@ type Handler struct {
 	unlockRateMu    sync.Mutex
 	unlockAttempts  map[string]unlockAttempt
 	smsMu           sync.RWMutex
+	checkinMu       sync.RWMutex
+	checkinStatus   checkinStatus
+}
+
+type checkinStatus struct {
+	Running    bool                      `json:"running"`
+	StartedAt  string                    `json:"started_at,omitempty"`
+	FinishedAt string                    `json:"finished_at,omitempty"`
+	Summary    *scheduler.CheckinSummary `json:"summary,omitempty"`
 }
 
 type unlockAttempt struct {
@@ -176,6 +186,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /admin/update/check", h.withFrontend(h.checkUpdate))
 	h.mux.HandleFunc("GET /admin/update/status", h.withFrontend(h.updateStatus))
 	h.mux.HandleFunc("POST /admin/checkin", h.withFrontend(h.runCheckin))
+	h.mux.HandleFunc("GET /admin/checkin/status", h.withFrontend(h.checkinStatusHandler))
 	h.mux.HandleFunc("POST /admin/credits/refresh", h.withFrontend(h.refreshCredits))
 	h.mux.HandleFunc("POST /admin/account/url", h.withFrontend(h.accountURL))
 	h.mux.HandleFunc("POST /admin/account/poll", h.withFrontend(h.accountPoll))
@@ -777,12 +788,40 @@ func writeFileInPlace(path string, data []byte, mode os.FileMode) error {
 }
 
 func (h *Handler) runCheckin(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.CheckinNow == nil {
+	if h.cfg.CheckinNow == nil && h.cfg.CheckinNowDetailed == nil {
 		writeJSON(w, 503, map[string]string{"error": "签到服务不可用"})
 		return
 	}
-	go h.cfg.CheckinNow()
-	writeJSON(w, 202, map[string]any{"ok": true, "message": "签到任务已启动"})
+	h.checkinMu.Lock()
+	if h.checkinStatus.Running {
+		h.checkinMu.Unlock()
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "已有签到任务正在执行"})
+		return
+	}
+	startedAt := time.Now().UTC().Format(time.RFC3339)
+	h.checkinStatus = checkinStatus{Running: true, StartedAt: startedAt}
+	h.checkinMu.Unlock()
+	go func() {
+		var summary scheduler.CheckinSummary
+		if h.cfg.CheckinNowDetailed != nil {
+			summary = h.cfg.CheckinNowDetailed()
+		} else {
+			h.cfg.CheckinNow()
+		}
+		h.checkinMu.Lock()
+		h.checkinStatus.Running = false
+		h.checkinStatus.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+		h.checkinStatus.Summary = &summary
+		h.checkinMu.Unlock()
+	}()
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "message": "签到任务已启动", "started_at": startedAt})
+}
+
+func (h *Handler) checkinStatusHandler(w http.ResponseWriter, r *http.Request) {
+	h.checkinMu.RLock()
+	status := h.checkinStatus
+	h.checkinMu.RUnlock()
+	writeJSON(w, http.StatusOK, status)
 }
 
 func (h *Handler) refreshCredits(w http.ResponseWriter, r *http.Request) {
