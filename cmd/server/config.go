@@ -131,6 +131,11 @@ type Config struct {
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
 	} `json:"session_sticky"`
 
+	Update struct {
+		Repository string `json:"repository"`
+		Branch     string `json:"branch"`
+	} `json:"update"`
+
 	// 解析后
 	SoftRateDur         time.Duration `json:"-"`
 	BreakerCooldownDur  time.Duration `json:"-"`
@@ -171,6 +176,8 @@ func Default() *Config {
 	c.Postgres.MaxIdleConns = 8
 	c.Postgres.ConnMaxLifetime = "30m"
 	c.Postgres.ConnMaxIdleTime = "5m"
+	c.Update.Repository = "heiyuan0801/wk"
+	c.Update.Branch = "main"
 	return c
 }
 
@@ -258,6 +265,12 @@ func applyEnv(c *Config) {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.RequestLogs.RetentionDays = n
 		}
+	}
+	if v := os.Getenv("WB2A_UPDATE_REPOSITORY"); v != "" {
+		c.Update.Repository = v
+	}
+	if v := os.Getenv("WB2A_UPDATE_BRANCH"); v != "" {
+		c.Update.Branch = v
 	}
 	if v := os.Getenv("WB2A_INPUT_CREDITS_PER_1K"); v != "" {
 		if n, err := strconv.ParseFloat(v, 64); err == nil {

@@ -64,17 +64,20 @@ type Config struct {
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
 	StickyCount func() int
 	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
-	RedisMode       string
-	SoftCooldown    time.Duration // 429 冷却，默认 60s
-	RefreshSkew     time.Duration // token 提前刷新窗口，默认 10m
-	ResponseStore   ResponseStore
-	MetricsStore    MetricsStore
-	RequestLogStore RequestLogStore
-	CompletionStore CompletionStore // optional atomic writer replacing separate metric/log writes
-	CreditPolicy    CreditPolicy
-	Passthrough     bool
-	Version         string // build/runtime version shown in the console
-	UpdateCommand   string // optional administrator-configured Docker update command
+	RedisMode         string
+	SoftCooldown      time.Duration // 429 冷却，默认 60s
+	RefreshSkew       time.Duration // token 提前刷新窗口，默认 10m
+	ResponseStore     ResponseStore
+	MetricsStore      MetricsStore
+	RequestLogStore   RequestLogStore
+	CompletionStore   CompletionStore // optional atomic writer replacing separate metric/log writes
+	CreditPolicy      CreditPolicy
+	Passthrough       bool
+	Version           string // build/runtime version shown in the console
+	UpdateCommand     string // optional administrator-configured Docker update command
+	UpdateRepository  string
+	UpdateBranch      string
+	UpdateRequestPath string
 }
 
 // ResponseStore is the optional Redis-backed persistence used by
@@ -159,6 +162,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/config", h.withFrontend(h.saveAdminConfig))
 	h.mux.HandleFunc("POST /admin/api-key/reset", h.withFrontend(h.resetAPIKey))
 	h.mux.HandleFunc("POST /admin/update", h.withFrontend(h.updateService))
+	h.mux.HandleFunc("GET /admin/update/check", h.withFrontend(h.checkUpdate))
 	h.mux.HandleFunc("POST /admin/checkin", h.withFrontend(h.runCheckin))
 	h.mux.HandleFunc("POST /admin/credits/refresh", h.withFrontend(h.refreshCredits))
 	h.mux.HandleFunc("POST /admin/account/url", h.withFrontend(h.accountURL))
@@ -351,6 +355,51 @@ func (h *Handler) cleanupUnlockAttemptsLocked(now time.Time) {
 	}
 }
 
+type adminSMSProxyConfig struct {
+	URL           string `json:"url"`
+	File          string `json:"file"`
+	Cooldown      string `json:"cooldown"`
+	Region        string `json:"region"`
+	InjectSID     bool   `json:"inject_sid"`
+	StickyMinutes int    `json:"sticky_minutes"`
+}
+
+type adminSMSHaozhumaConfig struct {
+	User       string `json:"user"`
+	SID        string `json:"sid"`
+	Author     string `json:"author"`
+	UID        string `json:"uid"`
+	ISP        string `json:"isp"`
+	Configured bool   `json:"configured"`
+}
+
+type adminSMSConfig struct {
+	TwoCaptchaConfigured bool                   `json:"two_captcha_configured"`
+	Proxy                adminSMSProxyConfig    `json:"proxy"`
+	Haozhuma             adminSMSHaozhumaConfig `json:"haozhuma"`
+}
+
+type adminSMSRequest struct {
+	TwoCaptchaKey *string `json:"two_captcha_key"`
+	Proxy         *struct {
+		URL           *string `json:"url"`
+		File          *string `json:"file"`
+		Cooldown      *string `json:"cooldown"`
+		Region        *string `json:"region"`
+		InjectSID     *bool   `json:"inject_sid"`
+		StickyMinutes *int    `json:"sticky_minutes"`
+	} `json:"proxy"`
+	Haozhuma *struct {
+		User   *string `json:"user"`
+		Pass   *string `json:"pass"`
+		Token  *string `json:"token"`
+		SID    *string `json:"sid"`
+		Author *string `json:"author"`
+		UID    *string `json:"uid"`
+		ISP    *string `json:"isp"`
+	} `json:"haozhuma"`
+}
+
 func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 	h.configMu.Lock()
 	defer h.configMu.Unlock()
@@ -372,13 +421,40 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 		RequestLogs struct {
 			RetentionDays int `json:"retention_days"`
 		} `json:"request_logs"`
+		SMS struct {
+			TwoCaptchaKey string              `json:"two_captcha_key"`
+			Proxy         adminSMSProxyConfig `json:"proxy"`
+			Haozhuma      struct {
+				User   string `json:"user"`
+				SID    string `json:"sid"`
+				Author string `json:"author"`
+				UID    string `json:"uid"`
+				ISP    string `json:"isp"`
+				Pass   string `json:"pass"`
+				Token  string `json:"token"`
+			} `json:"haozhuma"`
+		} `json:"sms"`
+		Update struct {
+			Repository string `json:"repository"`
+			Branch     string `json:"branch"`
+		} `json:"update"`
 	}
 	c.RequestLogs.RetentionDays = 30
 	if json.Unmarshal(raw, &c) != nil {
 		writeJSON(w, 500, map[string]string{"error": "invalid config"})
 		return
 	}
-	writeJSON(w, 200, c)
+	writeJSON(w, 200, map[string]any{
+		"schedule":     c.Schedule,
+		"region":       c.Region,
+		"request_logs": c.RequestLogs,
+		"sms": adminSMSConfig{
+			TwoCaptchaConfigured: strings.TrimSpace(c.SMS.TwoCaptchaKey) != "",
+			Proxy:                c.SMS.Proxy,
+			Haozhuma:             adminSMSHaozhumaConfig{User: c.SMS.Haozhuma.User, SID: c.SMS.Haozhuma.SID, Author: c.SMS.Haozhuma.Author, UID: c.SMS.Haozhuma.UID, ISP: c.SMS.Haozhuma.ISP, Configured: strings.TrimSpace(c.SMS.Haozhuma.Token) != "" || strings.TrimSpace(c.SMS.Haozhuma.User) != ""},
+		},
+		"update": c.Update,
+	})
 }
 
 func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
@@ -390,6 +466,11 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		RequestLogs    *struct {
 			RetentionDays *int `json:"retention_days"`
 		} `json:"request_logs"`
+		SMS    *adminSMSRequest `json:"sms"`
+		Update *struct {
+			Repository *string `json:"repository"`
+			Branch     *string `json:"branch"`
+		} `json:"update"`
 	}
 	if json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req) != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
@@ -428,6 +509,28 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	doc["schedule"] = schedule
 	requestLogs := map[string]any{"retention_days": retentionDays}
 	doc["request_logs"] = requestLogs
+	if req.SMS != nil {
+		mergeAdminSMSConfig(doc, req.SMS)
+	}
+	if req.Update != nil {
+		update, _ := doc["update"].(map[string]any)
+		if update == nil {
+			update = map[string]any{}
+		}
+		if req.Update.Repository != nil && strings.TrimSpace(*req.Update.Repository) != "" {
+			update["repository"] = strings.TrimSpace(*req.Update.Repository)
+		}
+		if req.Update.Branch != nil && strings.TrimSpace(*req.Update.Branch) != "" {
+			update["branch"] = strings.TrimSpace(*req.Update.Branch)
+		}
+		doc["update"] = update
+		if repository, ok := update["repository"].(string); ok && strings.TrimSpace(repository) != "" {
+			h.cfg.UpdateRepository = strings.TrimSpace(repository)
+		}
+		if branch, ok := update["branch"].(string); ok && strings.TrimSpace(branch) != "" {
+			h.cfg.UpdateBranch = strings.TrimSpace(branch)
+		}
+	}
 	out, _ := json.MarshalIndent(doc, "", "  ")
 	if err := writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600); err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
@@ -441,6 +544,70 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		h.cfg.UpdateLogRetention(retentionDays)
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "restart_required": restartRequired, "schedule": schedule, "request_logs": requestLogs})
+}
+
+func mergeAdminSMSConfig(doc map[string]any, req *adminSMSRequest) {
+	sms, _ := doc["sms"].(map[string]any)
+	if sms == nil {
+		sms = map[string]any{}
+	}
+	if req.TwoCaptchaKey != nil && strings.TrimSpace(*req.TwoCaptchaKey) != "" {
+		sms["two_captcha_key"] = strings.TrimSpace(*req.TwoCaptchaKey)
+	}
+	merge := func(name string) map[string]any {
+		value, _ := sms[name].(map[string]any)
+		if value == nil {
+			value = map[string]any{}
+		}
+		sms[name] = value
+		return value
+	}
+	if req.Proxy != nil {
+		proxy := merge("proxy")
+		if req.Proxy.URL != nil {
+			proxy["url"] = strings.TrimSpace(*req.Proxy.URL)
+		}
+		if req.Proxy.File != nil {
+			proxy["file"] = strings.TrimSpace(*req.Proxy.File)
+		}
+		if req.Proxy.Cooldown != nil {
+			proxy["cooldown"] = strings.TrimSpace(*req.Proxy.Cooldown)
+		}
+		if req.Proxy.Region != nil {
+			proxy["region"] = strings.TrimSpace(*req.Proxy.Region)
+		}
+		if req.Proxy.InjectSID != nil {
+			proxy["inject_sid"] = *req.Proxy.InjectSID
+		}
+		if req.Proxy.StickyMinutes != nil {
+			proxy["sticky_minutes"] = *req.Proxy.StickyMinutes
+		}
+	}
+	if req.Haozhuma != nil {
+		hz := merge("haozhuma")
+		if req.Haozhuma.User != nil {
+			hz["user"] = strings.TrimSpace(*req.Haozhuma.User)
+		}
+		if req.Haozhuma.Pass != nil && strings.TrimSpace(*req.Haozhuma.Pass) != "" {
+			hz["pass"] = *req.Haozhuma.Pass
+		}
+		if req.Haozhuma.Token != nil && strings.TrimSpace(*req.Haozhuma.Token) != "" {
+			hz["token"] = strings.TrimSpace(*req.Haozhuma.Token)
+		}
+		if req.Haozhuma.SID != nil {
+			hz["sid"] = strings.TrimSpace(*req.Haozhuma.SID)
+		}
+		if req.Haozhuma.Author != nil {
+			hz["author"] = strings.TrimSpace(*req.Haozhuma.Author)
+		}
+		if req.Haozhuma.UID != nil {
+			hz["uid"] = strings.TrimSpace(*req.Haozhuma.UID)
+		}
+		if req.Haozhuma.ISP != nil {
+			hz["isp"] = strings.TrimSpace(*req.Haozhuma.ISP)
+		}
+	}
+	doc["sms"] = sms
 }
 
 func normalizeScheduleHours(hours []int) ([]int, bool) {
@@ -1363,7 +1530,17 @@ func (h *Handler) resetAPIKey(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) updateService(w http.ResponseWriter, r *http.Request) {
 	command := strings.TrimSpace(h.cfg.UpdateCommand)
 	if command == "" {
-		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": map[string]string{"code": "update_not_configured", "message": "WB2A_UPDATE_COMMAND is not configured"}})
+		if strings.TrimSpace(h.cfg.UpdateRequestPath) == "" {
+			writeJSON(w, http.StatusNotImplemented, map[string]any{"error": map[string]string{"code": "update_not_configured", "message": "WB2A_UPDATE_COMMAND or update request watcher is not configured"}})
+			return
+		}
+		request := map[string]any{"requested_at": time.Now().UTC().Format(time.RFC3339), "version": h.cfg.Version, "repository": h.cfg.UpdateRepository, "branch": h.cfg.UpdateBranch}
+		body, err := json.Marshal(request)
+		if err != nil || writeFileAtomic(h.cfg.UpdateRequestPath, append(body, '\n'), 0600) != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"code": "update_request_failed", "message": "cannot write update request"}})
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "message": "已提交 GitHub 更新请求，宿主机更新脚本将拉取并重建容器"})
 		return
 	}
 	go func() {
@@ -1378,6 +1555,67 @@ func (h *Handler) updateService(w http.ResponseWriter, r *http.Request) {
 		log.Printf("admin update completed: %s", truncateRequestError(string(output)))
 	}()
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "message": "更新任务已启动，容器将按部署脚本重建"})
+}
+
+func (h *Handler) checkUpdate(w http.ResponseWriter, r *http.Request) {
+	repository := strings.TrimSpace(h.cfg.UpdateRepository)
+	branch := strings.TrimSpace(h.cfg.UpdateBranch)
+	if branch == "" {
+		branch = "main"
+	}
+	if !validGitHubRepository(repository) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"code": "invalid_update_repository", "message": "update repository must be owner/name"}})
+		return
+	}
+	endpoint := "https://api.github.com/repos/" + repository + "/commits/" + branch
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "workbuddy2api-update-check")
+	resp, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]string{"code": "github_unreachable", "message": err.Error()}})
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]string{"code": "github_status", "message": fmt.Sprintf("GitHub returned HTTP %d", resp.StatusCode)}})
+		return
+	}
+	var payload struct {
+		SHA     string `json:"sha"`
+		HTMLURL string `json:"html_url"`
+		Commit  struct {
+			Message string `json:"message"`
+		} `json:"commit"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 256<<10)).Decode(&payload); err != nil || strings.TrimSpace(payload.SHA) == "" {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]string{"code": "github_response_invalid", "message": "invalid GitHub commit response"}})
+		return
+	}
+	latest := payload.SHA
+	current := strings.TrimSpace(h.cfg.Version)
+	writeJSON(w, http.StatusOK, map[string]any{"repository": repository, "branch": branch, "current": current, "latest": latest, "update_available": current == "" || !strings.HasPrefix(latest, current), "url": payload.HTMLURL, "message": strings.Split(payload.Commit.Message, "\n")[0]})
+}
+
+func validGitHubRepository(repository string) bool {
+	parts := strings.Split(repository, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return false
+	}
+	for _, part := range parts {
+		for _, r := range part {
+			if !(r == '-' || r == '_' || r == '.' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {

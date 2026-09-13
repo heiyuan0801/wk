@@ -146,7 +146,13 @@ function Console() {
   const [requestSearch, setRequestSearch] = useState('');
   const [requestModeFilter, setRequestModeFilter] = useState('all');
   const [requestStatusFilter, setRequestStatusFilter] = useState('all');
-  const [config, setConfig] = useState({ checkin_hours: [9, 21], keepalive_hours: [22], region: 'cn' });
+  const [config, setConfig] = useState({ checkin_hours: [9, 21], keepalive_hours: [22], request_logs: { retention_days: 30 }, region: 'cn', update: { repository: 'heiyuan0801/wk', branch: 'main' } });
+  const [smsSettings, setSmsSettings] = useState({
+    twoCaptchaKey: '',
+    proxy: { url: '', file: '', cooldown: '30m', region: '', inject_sid: false, sticky_minutes: 30 },
+    haozhuma: { user: '', pass: '', token: '', sid: '', author: '', uid: '', isp: '' },
+  });
+  const [updateInfo, setUpdateInfo] = useState(null);
   const [loginRegion, setLoginRegion] = useState('cn');
   const [selectedModel, setSelectedModel] = useState('');
   const [promptText, setPromptText] = useState('你好，请简短介绍一下你自己。');
@@ -233,8 +239,16 @@ function Console() {
     try {
       const currentConfig = await api('/admin/config', { signal: controller.signal });
       if (serial !== refreshSerial.current) return;
-      if (currentConfig.schedule || currentConfig.region) {
-        setConfig(current => ({ ...current, ...(currentConfig.schedule || {}), region: currentConfig.region || current.region || 'cn' }));
+      if (currentConfig.schedule || currentConfig.region || currentConfig.request_logs || currentConfig.sms || currentConfig.update) {
+        setConfig(current => ({ ...current, ...(currentConfig.schedule || {}), request_logs: currentConfig.request_logs || current.request_logs || { retention_days: 30 }, update: currentConfig.update || current.update, region: currentConfig.region || current.region || 'cn' }));
+      }
+      if (currentConfig.sms) {
+        setSmsSettings(current => ({
+          ...current,
+          proxy: { ...current.proxy, ...(currentConfig.sms.proxy || {}) },
+          haozhuma: { ...current.haozhuma, ...(currentConfig.sms.haozhuma || {}) },
+          twoCaptchaConfigured: currentConfig.sms.two_captcha_configured === true,
+        }));
       }
       if (!loginRegionTouched.current && currentConfig.region === 'global') setLoginRegion('global');
     } catch (error) {
@@ -253,6 +267,7 @@ function Console() {
     form.setFieldsValue({
       checkin: (config.checkin_hours || []).join(','),
       keepalive: (config.keepalive_hours || []).join(','),
+      retention: config.request_logs?.retention_days ?? 30,
     });
   }, [config, form]);
 
@@ -346,15 +361,33 @@ function Console() {
     }
   };
 
+  const checkUpdate = async () => {
+    try {
+      const result = await api('/admin/update/check');
+      setUpdateInfo(result);
+      message.success(result.update_available ? `发现新版本 ${result.latest.slice(0, 7)}` : '当前已是最新版本');
+    } catch (error) {
+      message.error(`检查 GitHub 版本失败：${error.message}`);
+    }
+  };
+
   const saveConfig = async values => {
     try {
       const nextConfig = {
         checkin_hours: parseHours(values.checkin),
         keepalive_hours: parseHours(values.keepalive),
+        request_logs: { retention_days: Number(values.retention) },
+        sms: {
+          two_captcha_key: smsSettings.twoCaptchaKey || undefined,
+          proxy: smsSettings.proxy,
+          haozhuma: smsSettings.haozhuma,
+        },
+        update: config.update,
       };
-      const invalid = Object.values(nextConfig).some(hours => (
+      const invalidHours = [nextConfig.checkin_hours, nextConfig.keepalive_hours].some(hours => (
         !hours.length || hours.some(hour => !Number.isInteger(hour) || hour < 0 || hour > 23)
       ));
+      const invalid = invalidHours || !Number.isInteger(nextConfig.request_logs.retention_days) || nextConfig.request_logs.retention_days < 0 || nextConfig.request_logs.retention_days > 3650;
       if (invalid) {
         message.error('每项至少填写一个 0-23 的整数小时');
         return;
@@ -362,8 +395,8 @@ function Console() {
       const result = await api('/admin/config', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(nextConfig),
       });
-      setConfig(current => ({ ...current, ...(result.schedule || nextConfig) }));
-      message.success(result.restart_required ? '配置已保存，重启后生效' : '配置已保存');
+      setConfig(current => ({ ...current, ...(result.schedule || nextConfig), request_logs: result.request_logs || nextConfig.request_logs }));
+      message.success('配置已保存；短信/自动加号参数将在服务重启后生效');
     } catch (error) {
       message.error(error.message);
     }
@@ -1197,6 +1230,7 @@ function Console() {
             <Form form={form} layout="inline" onFinish={saveConfig}>
               <Form.Item name="checkin" label="签到小时"><Input placeholder="9,21" /></Form.Item>
               <Form.Item name="keepalive" label="保活小时"><Input placeholder="22" /></Form.Item>
+              <Form.Item name="retention" label="日志保留天数"><Input placeholder="30" /></Form.Item>
               <Button type="primary" htmlType="submit">保存</Button>
             </Form>
             <Paragraph type="secondary" style={{ margin: '12px 0 0' }}>
@@ -1205,6 +1239,36 @@ function Console() {
             <Space wrap style={{ marginTop: 8 }}>
               <Button icon={<CheckCircleOutlined />} loading={checkinRunning} onClick={runCheckinAll}>立即签到（全部账号）</Button>
               <Button icon={<ReloadOutlined />} loading={creditRefreshing} onClick={refreshCredits}>立即刷新积分</Button>
+            </Space>
+          </Card>
+          <Card title="短信直登与自动加号配置" extra={<Tag color={smsSettings.haozhuma.sid ? 'green' : 'default'}>{smsSettings.haozhuma.sid ? '已配置项目' : '未启用自动加号'}</Tag>}>
+            <Alert type="info" showIcon message="敏感字段不会回显；密码、token 或打码密钥留空会保留服务器原值。保存后重启服务，自动加号入口才会启用。" style={{ marginBottom: 14 }} />
+            <Space direction="vertical" style={{ width: '100%' }} size={10}>
+              <Text strong>豪猪接码</Text>
+              <Space wrap>
+                <Input value={smsSettings.haozhuma.user} onChange={e => setSmsSettings(s => ({ ...s, haozhuma: { ...s.haozhuma, user: e.target.value } }))} placeholder="豪猪账号" />
+                <Input.Password value={smsSettings.haozhuma.pass} onChange={e => setSmsSettings(s => ({ ...s, haozhuma: { ...s.haozhuma, pass: e.target.value } }))} placeholder="密码（留空保持）" />
+                <Input.Password value={smsSettings.haozhuma.token} onChange={e => setSmsSettings(s => ({ ...s, haozhuma: { ...s.haozhuma, token: e.target.value } }))} placeholder="Token（留空保持）" />
+                <Input value={smsSettings.haozhuma.sid} onChange={e => setSmsSettings(s => ({ ...s, haozhuma: { ...s.haozhuma, sid: e.target.value } }))} placeholder="项目 SID，如 52283" />
+                <Input value={smsSettings.haozhuma.author} onChange={e => setSmsSettings(s => ({ ...s, haozhuma: { ...s.haozhuma, author: e.target.value } }))} placeholder="Author（可选）" />
+                <Input value={smsSettings.haozhuma.uid} onChange={e => setSmsSettings(s => ({ ...s, haozhuma: { ...s.haozhuma, uid: e.target.value } }))} placeholder="对接码 UID（可选）" />
+                <Input value={smsSettings.haozhuma.isp} onChange={e => setSmsSettings(s => ({ ...s, haozhuma: { ...s.haozhuma, isp: e.target.value } }))} placeholder="运营商优先级，如 1,2,3" />
+              </Space>
+              <Text strong>短信代理与人机校验</Text>
+              <Space wrap>
+                <Input value={smsSettings.twoCaptchaKey} onChange={e => setSmsSettings(s => ({ ...s, twoCaptchaKey: e.target.value }))} placeholder="2Captcha Key（留空保持）" style={{ width: 260 }} />
+                <Input value={smsSettings.proxy.url} onChange={e => setSmsSettings(s => ({ ...s, proxy: { ...s.proxy, url: e.target.value } }))} placeholder="代理 URL（可选）" style={{ width: 300 }} />
+                <Input value={smsSettings.proxy.file} onChange={e => setSmsSettings(s => ({ ...s, proxy: { ...s.proxy, file: e.target.value } }))} placeholder="代理名单文件路径（可选）" style={{ width: 260 }} />
+                <Input value={smsSettings.proxy.cooldown} onChange={e => setSmsSettings(s => ({ ...s, proxy: { ...s.proxy, cooldown: e.target.value } }))} placeholder="冷却，如 30m" style={{ width: 150 }} />
+                <Input value={smsSettings.proxy.region} onChange={e => setSmsSettings(s => ({ ...s, proxy: { ...s.proxy, region: e.target.value } }))} placeholder="代理区域，如 HK" style={{ width: 150 }} />
+                <Input value={smsSettings.proxy.sticky_minutes} onChange={e => setSmsSettings(s => ({ ...s, proxy: { ...s.proxy, sticky_minutes: Number(e.target.value || 0) } }))} placeholder="粘性分钟" style={{ width: 120 }} />
+                <Space><Text>注入 SID</Text><Switch checked={!!smsSettings.proxy.inject_sid} onChange={value => setSmsSettings(s => ({ ...s, proxy: { ...s.proxy, inject_sid: value } }))} /></Space>
+              </Space>
+              <Space wrap>
+                <Button type="primary" onClick={() => form.submit()}>保存自动加号配置</Button>
+                <Button icon={<CloudServerOutlined />} onClick={checkUpdate}>检查 GitHub 版本</Button>
+                {updateInfo && <Text type={updateInfo.update_available ? 'warning' : 'success'}>当前 {updateInfo.current || 'dev'}，GitHub 最新 {updateInfo.latest.slice(0, 7)}{updateInfo.update_available ? '，可更新' : '，已是最新'}</Text>}
+              </Space>
             </Space>
           </Card>
           <Card title="账号授权" extra={<Tag color={config.region === 'all' ? 'green' : 'blue'}>账号池：{poolRegionLabel}</Tag>}>

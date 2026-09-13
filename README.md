@@ -76,14 +76,24 @@ curl -sN http://localhost:7863/v1/chat/completions \
 
 控制台右上角“版本”来自 `WB2A_VERSION`，Docker 构建时也可以通过 `WB2API_VERSION` 或 `-ldflags` 注入版本号，便于确认当前运行的镜像。首页 API 密钥面板中的“重置并生成新密钥”会调用 `POST /admin/api-key/reset`，在服务器配置文件中生成新的 64 位十六进制密钥并立即切换；新密钥只在响应中返回一次，浏览器会自动保存，旧密钥会立即失效。
 
-“Docker 更新”按钮调用 `POST /admin/update`。为避免控制台获得任意 shell 权限，该接口默认关闭，只有设置 `WB2A_UPDATE_COMMAND` 才会执行管理员预先配置的部署脚本，例如：
+“Docker 更新”按钮调用 `POST /admin/update`。服务会通过 `GET /admin/update/check` 查询配置的 GitHub 仓库和分支，显示当前提交与最新提交。默认更新流程把请求写入 `data/update-request.json`，由宿主机 `scripts/update-watcher.sh` 读取，再运行 `scripts/update.sh` 拉取 `main`、按最新提交注入版本号并执行 `docker compose up -d --build`；不需要把 Docker Socket 暴露给业务容器。也可以设置 `WB2A_UPDATE_COMMAND` 使用已有的宿主机部署命令。
 
 ```dotenv
 WB2A_VERSION=2026.09.13
 WB2A_UPDATE_COMMAND=/opt/workbuddy2api/update.sh
 ```
 
-更新脚本应由宿主机负责拉取代码、构建并重启 Compose 服务；容器内不默认挂载 Docker Socket。未配置命令时按钮会明确提示“更新未启动”，不会模拟成功。
+更新脚本应由宿主机负责拉取代码、构建并重启 Compose 服务；容器内不默认挂载 Docker Socket。未启用 watcher 且未配置命令时，按钮会明确提示更新未配置，不会模拟成功。
+
+首次在服务器启用宿主机 watcher：
+
+```bash
+cp scripts/workbuddy2api-update-watcher.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now workbuddy2api-update-watcher.service
+```
+
+控制台“管理设置”可以填写短信直登、代理池和豪猪自动加号参数。密码、豪猪 token、2Captcha key 不会回显；留空保存时保持服务器原值。保存后重启服务，自动加号页面会根据新的 `sms.haozhuma.sid` 启用。
 
 本版本还合入了账号运维扩展：控制台新增“自动加号”和“代理池”页面。中国区可以使用短信直登流程（手机号、验证码和必要的人机校验），也可以配置代理名单让短信登录按出口轮换；自动加号需要在 `config.json` 的 `sms.haozhuma` 中配置豪猪账号/token 与项目 `sid`，未配置时对应入口保持关闭。代理池支持文本名单或解析型代理 URL，代理密码只在服务端使用，不会返回给控制台。
 

@@ -245,6 +245,61 @@ func TestUpdateServiceRequiresExplicitCommand(t *testing.T) {
 	}
 }
 
+func TestUpdateServiceWritesHostWatcherRequest(t *testing.T) {
+	requestPath := filepath.Join(t.TempDir(), "update-request.json")
+	h := NewHandler(Config{APIKey: "test-key", UpdateRequestPath: requestPath, UpdateRepository: "heiyuan0801/wk", UpdateBranch: "main", Version: "abc1234", Pool: pool.New("")})
+	req := httptest.NewRequest(http.MethodPost, "/admin/update", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["ok"] != true {
+		t.Fatalf("response=%s", rec.Body.String())
+	}
+	raw, err := os.ReadFile(requestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request map[string]any
+	if err := json.Unmarshal(raw, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request["version"] != "abc1234" || request["repository"] != "heiyuan0801/wk" || request["branch"] != "main" {
+		t.Fatalf("request=%v", request)
+	}
+}
+
+func TestAdminConfigPreservesSecretWhenBlank(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	initial := `{"schedule":{"checkin_hours":[9],"keepalive_hours":[22]},"sms":{"haozhuma":{"token":"keep-me","sid":"old"}}}`
+	if err := os.WriteFile(path, []byte(initial), 0600); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{ConfigPath: path})
+	req := httptest.NewRequest(http.MethodPost, "/admin/config", strings.NewReader(`{"checkin_hours":[8],"keepalive_hours":[23],"sms":{"haozhuma":{"token":"","sid":"new"}}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]any
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatal(err)
+	}
+	sms := saved["sms"].(map[string]any)
+	hz := sms["haozhuma"].(map[string]any)
+	if hz["token"] != "keep-me" || hz["sid"] != "new" {
+		t.Fatalf("haozhuma=%v", hz)
+	}
+}
+
 // newFakeUpstream 返回一个 ChatStream 走 fake 的 upstream.Client。
 // fake 依据 Authorization 头决定行为。
 func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body string, isStream bool)) *upstream.Client {

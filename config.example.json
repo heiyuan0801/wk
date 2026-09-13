@@ -52,6 +52,10 @@
     "ttl": "30m",
     "gc_interval": "5m"
   },
+  "update": {
+    "repository": "heiyuan0801/wk",
+    "branch": "main"
+  },
   "sms": {
     "two_captcha_key": "",
     "proxy": {

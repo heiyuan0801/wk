@@ -316,10 +316,13 @@ func main() {
 			OutputPer1K:      cfg.Billing.OutputCreditsPer1KTokens,
 			CachedInputPer1K: cfg.Billing.CachedInputCreditsPer1KTokens,
 		},
-		Passthrough:   cfg.Features.Passthrough,
-		Version:       runtimeVersion(),
-		UpdateCommand: os.Getenv("WB2A_UPDATE_COMMAND"),
-		SoftCooldown:  cfg.SoftRateDur,
+		Passthrough:       cfg.Features.Passthrough,
+		Version:           runtimeVersion(),
+		UpdateCommand:     os.Getenv("WB2A_UPDATE_COMMAND"),
+		UpdateRepository:  cfg.Update.Repository,
+		UpdateBranch:      cfg.Update.Branch,
+		UpdateRequestPath: filepath.Join(filepath.Dir(cfg.StateFile), "update-request.json"),
+		SoftCooldown:      cfg.SoftRateDur,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

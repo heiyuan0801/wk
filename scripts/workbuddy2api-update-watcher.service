@@ -1,0 +1,15 @@
+[Unit]
+Description=WorkBuddy2API GitHub update watcher
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/workbuddy2api
+Environment=WB2A_REPO_DIR=/opt/workbuddy2api
+ExecStart=/opt/workbuddy2api/scripts/update-watcher.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
