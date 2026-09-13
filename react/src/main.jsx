@@ -245,7 +245,10 @@ function Console() {
       if (currentConfig.sms) {
         setSmsSettings(current => ({
           ...current,
-          proxy: { ...current.proxy, ...(currentConfig.sms.proxy || {}) },
+          // Proxy URLs may contain credentials and are intentionally masked by
+          // the API. Keep the local field empty so saving the form preserves
+          // the server-side value instead of exposing or overwriting it.
+          proxy: { ...current.proxy, ...(currentConfig.sms.proxy || {}), url: '' },
           haozhuma: { ...current.haozhuma, ...(currentConfig.sms.haozhuma || {}) },
           twoCaptchaConfigured: currentConfig.sms.two_captcha_configured === true,
         }));

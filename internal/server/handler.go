@@ -357,6 +357,7 @@ func (h *Handler) cleanupUnlockAttemptsLocked(now time.Time) {
 
 type adminSMSProxyConfig struct {
 	URL           string `json:"url"`
+	URLConfigured bool   `json:"url_configured"`
 	File          string `json:"file"`
 	Cooldown      string `json:"cooldown"`
 	Region        string `json:"region"`
@@ -456,7 +457,7 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 		"request_logs": c.RequestLogs,
 		"sms": adminSMSConfig{
 			TwoCaptchaConfigured: strings.TrimSpace(c.SMS.TwoCaptchaKey) != "",
-			Proxy:                c.SMS.Proxy,
+			Proxy:                adminSMSProxyConfig{URLConfigured: strings.TrimSpace(c.SMS.Proxy.URL) != "", File: c.SMS.Proxy.File, Cooldown: c.SMS.Proxy.Cooldown, Region: c.SMS.Proxy.Region, InjectSID: c.SMS.Proxy.InjectSID, StickyMinutes: c.SMS.Proxy.StickyMinutes},
 			Haozhuma:             adminSMSHaozhumaConfig{User: c.SMS.Haozhuma.User, SID: c.SMS.Haozhuma.SID, Author: c.SMS.Haozhuma.Author, UID: c.SMS.Haozhuma.UID, ISP: c.SMS.Haozhuma.ISP, Configured: strings.TrimSpace(c.SMS.Haozhuma.Token) != "" || strings.TrimSpace(c.SMS.Haozhuma.User) != ""},
 		},
 		"update": c.Update,
@@ -570,7 +571,10 @@ func mergeAdminSMSConfig(doc map[string]any, req *adminSMSRequest) {
 	}
 	if req.Proxy != nil {
 		proxy := merge("proxy")
-		if req.Proxy.URL != nil {
+		// The admin response never returns proxy credentials. Treat an empty
+		// value submitted by the UI as "keep the existing URL" so saving other
+		// settings cannot accidentally erase a configured authenticated proxy.
+		if req.Proxy.URL != nil && strings.TrimSpace(*req.Proxy.URL) != "" {
 			proxy["url"] = strings.TrimSpace(*req.Proxy.URL)
 		}
 		if req.Proxy.File != nil {
