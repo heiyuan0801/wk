@@ -58,6 +58,8 @@ type Config struct {
 	CompletionStore CompletionStore // optional atomic writer replacing separate metric/log writes
 	CreditPolicy    CreditPolicy
 	Passthrough     bool
+	Version         string // build/runtime version shown in the console
+	UpdateCommand   string // optional administrator-configured Docker update command
 }
 
 // ResponseStore is the optional Redis-backed persistence used by
@@ -139,6 +141,8 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/unlock", h.unlock)
 	h.mux.HandleFunc("GET /admin/config", h.withFrontend(h.adminConfig))
 	h.mux.HandleFunc("POST /admin/config", h.withFrontend(h.saveAdminConfig))
+	h.mux.HandleFunc("POST /admin/api-key/reset", h.withFrontend(h.resetAPIKey))
+	h.mux.HandleFunc("POST /admin/update", h.withFrontend(h.updateService))
 	h.mux.HandleFunc("POST /admin/checkin", h.withFrontend(h.runCheckin))
 	h.mux.HandleFunc("POST /admin/credits/refresh", h.withFrontend(h.refreshCredits))
 	h.mux.HandleFunc("POST /admin/account/url", h.withFrontend(h.accountURL))
@@ -843,6 +847,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		redisMode = "noop"
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"version":         h.cfg.Version,
 		"accounts":        h.cfg.Pool.List(),
 		"total":           total,
 		"healthy":         healthy,
@@ -854,6 +859,68 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		"redis_mode":      redisMode,
 		"metrics":         h.metricsSnapshot(),
 	})
+}
+
+// resetAPIKey generates and persists a new server API key. The new key is
+// returned once so the console can store it; it is never exposed by /status.
+func (h *Handler) resetAPIKey(w http.ResponseWriter, r *http.Request) {
+	h.configMu.Lock()
+	defer h.configMu.Unlock()
+	if strings.TrimSpace(h.cfg.ConfigPath) == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]string{"code": "api_key_persistence_unavailable", "message": "config path is not configured"}})
+		return
+	}
+	raw, err := os.ReadFile(h.cfg.ConfigPath)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"code": "config_read_failed", "message": err.Error()}})
+		return
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"code": "config_invalid", "message": "invalid config JSON"}})
+		return
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"code": "api_key_generation_failed", "message": err.Error()}})
+		return
+	}
+	key := hex.EncodeToString(buf)
+	doc["api_key"] = key
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"code": "config_encode_failed", "message": err.Error()}})
+		return
+	}
+	if err := writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"code": "config_write_failed", "message": err.Error()}})
+		return
+	}
+	h.cfg.APIKey = key
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "api_key": key})
+}
+
+// updateService runs an explicitly configured host/Docker update command.
+// Keeping the command opt-in avoids giving an exposed console arbitrary shell
+// access; deployments can wire it to their compose pull/build/restart script.
+func (h *Handler) updateService(w http.ResponseWriter, r *http.Request) {
+	command := strings.TrimSpace(h.cfg.UpdateCommand)
+	if command == "" {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": map[string]string{"code": "update_not_configured", "message": "WB2A_UPDATE_COMMAND is not configured"}})
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "sh", "-c", command)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			log.Printf("admin update failed: %v output=%s", err, truncateRequestError(string(output)))
+			return
+		}
+		log.Printf("admin update completed: %s", truncateRequestError(string(output)))
+	}()
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "message": "更新任务已启动，容器将按部署脚本重建"})
 }
 
 func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {

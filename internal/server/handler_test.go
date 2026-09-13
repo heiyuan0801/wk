@@ -127,6 +127,72 @@ func TestStatsRejectsUnknownTimeRange(t *testing.T) {
 	}
 }
 
+func TestResetAPIKeyPersistsAndRotatesServerKey(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	oldKey := "old-api-key"
+	if err := os.WriteFile(configPath, []byte("{\"api_key\":\"old-api-key\",\"region\":\"cn\"}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{APIKey: oldKey, ConfigPath: configPath, Version: "test-version", Pool: pool.New("")})
+	req := httptest.NewRequest(http.MethodPost, "/admin/api-key/reset", nil)
+	req.Header.Set("Authorization", "Bearer "+oldKey)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		OK     bool   `json:"ok"`
+		APIKey string `json:"api_key"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.OK || len(body.APIKey) != 64 || body.APIKey == oldKey {
+		t.Fatalf("unexpected reset response: %#v", body)
+	}
+	if h.cfg.APIKey != body.APIKey {
+		t.Fatalf("runtime key=%q response key=%q", h.cfg.APIKey, body.APIKey)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]any
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved["api_key"] != body.APIKey {
+		t.Fatalf("persisted key=%v response key=%q", saved["api_key"], body.APIKey)
+	}
+	oldReq := httptest.NewRequest(http.MethodGet, "/admin/config", nil)
+	oldReq.Header.Set("Authorization", "Bearer "+oldKey)
+	oldRec := httptest.NewRecorder()
+	h.ServeHTTP(oldRec, oldReq)
+	if oldRec.Code != http.StatusUnauthorized {
+		t.Fatalf("old key still accepted: status=%d body=%s", oldRec.Code, oldRec.Body.String())
+	}
+	newReq := httptest.NewRequest(http.MethodGet, "/admin/config", nil)
+	newReq.Header.Set("Authorization", "Bearer "+body.APIKey)
+	newRec := httptest.NewRecorder()
+	h.ServeHTTP(newRec, newReq)
+	if newRec.Code != http.StatusOK {
+		t.Fatalf("new key rejected: status=%d body=%s", newRec.Code, newRec.Body.String())
+	}
+}
+
+func TestUpdateServiceRequiresExplicitCommand(t *testing.T) {
+	h := NewHandler(Config{APIKey: "test-key", UpdateCommand: "", Pool: pool.New("")})
+	req := httptest.NewRequest(http.MethodPost, "/admin/update", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), "update_not_configured") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 // newFakeUpstream 返回一个 ChatStream 走 fake 的 upstream.Client。
 // fake 依据 Authorization 头决定行为。
 func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body string, isStream bool)) *upstream.Client {

@@ -7,11 +7,12 @@ COPY react/ ./
 RUN npm run build
 
 FROM golang:1.23-alpine AS build
+ARG WB2API_VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server \
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.buildVersion=${WB2API_VERSION}" -o /out/wb2api ./cmd/server \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login
 
 FROM alpine:3.20

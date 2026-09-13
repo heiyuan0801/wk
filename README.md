@@ -74,6 +74,17 @@ curl -sN http://localhost:7863/v1/chat/completions \
 
 生产部署必须设置非空 `api_key`（也可使用 `WB2A_API_KEY` 环境变量）。配置文件缺失且没有 API key 时，服务会拒绝启动，避免意外以无鉴权模式暴露接口。
 
+控制台右上角“版本”来自 `WB2A_VERSION`，Docker 构建时也可以通过 `WB2API_VERSION` 或 `-ldflags` 注入版本号，便于确认当前运行的镜像。首页 API 密钥面板中的“重置并生成新密钥”会调用 `POST /admin/api-key/reset`，在服务器配置文件中生成新的 64 位十六进制密钥并立即切换；新密钥只在响应中返回一次，浏览器会自动保存，旧密钥会立即失效。
+
+“Docker 更新”按钮调用 `POST /admin/update`。为避免控制台获得任意 shell 权限，该接口默认关闭，只有设置 `WB2A_UPDATE_COMMAND` 才会执行管理员预先配置的部署脚本，例如：
+
+```dotenv
+WB2A_VERSION=2026.09.13
+WB2A_UPDATE_COMMAND=/opt/workbuddy2api/update.sh
+```
+
+更新脚本应由宿主机负责拉取代码、构建并重启 Compose 服务；容器内不默认挂载 Docker Socket。未配置命令时按钮会明确提示“更新未启动”，不会模拟成功。
+
 ```json
 {
   "listen": ":7863",

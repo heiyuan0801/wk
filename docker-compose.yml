@@ -1,12 +1,18 @@
 services:
   wb2api:
-    build: .
+    build:
+      context: .
+      args:
+        WB2API_VERSION: ${WB2API_VERSION:-dev}
     container_name: workbuddy2api
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
     environment:
       - TZ=Asia/Shanghai
+      - WB2A_VERSION=${WB2A_VERSION:-dev}
+      # Set an explicit host-side compose script to enable console updates.
+      - WB2A_UPDATE_COMMAND=${WB2A_UPDATE_COMMAND:-}
     ports:
       - "7863:7863"
     volumes:

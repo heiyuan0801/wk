@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +23,10 @@ import (
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
+
+// buildVersion is injected by Docker builds with -ldflags and can be
+// overridden at runtime with WB2A_VERSION for local/dev deployments.
+var buildVersion = "dev"
 
 type metricsAdapter struct{ store metricsstore.Backend }
 
@@ -299,8 +304,10 @@ func main() {
 			OutputPer1K:      cfg.Billing.OutputCreditsPer1KTokens,
 			CachedInputPer1K: cfg.Billing.CachedInputCreditsPer1KTokens,
 		},
-		Passthrough:  cfg.Features.Passthrough,
-		SoftCooldown: cfg.SoftRateDur,
+		Passthrough:   cfg.Features.Passthrough,
+		Version:       runtimeVersion(),
+		UpdateCommand: os.Getenv("WB2A_UPDATE_COMMAND"),
+		SoftCooldown:  cfg.SoftRateDur,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -334,4 +341,11 @@ func main() {
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")
+}
+
+func runtimeVersion() string {
+	if value := strings.TrimSpace(os.Getenv("WB2A_VERSION")); value != "" {
+		return value
+	}
+	return buildVersion
 }

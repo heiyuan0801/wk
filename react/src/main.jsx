@@ -69,6 +69,8 @@ function App() {
   const [requestInfo, setRequestInfo] = useState(null);
   const [metricSamples, setMetricSamples] = useState([]);
   const [creditRefreshing, setCreditRefreshing] = useState(false);
+  const [apiKeyResetting, setApiKeyResetting] = useState(false);
+  const [updateStarting, setUpdateStarting] = useState(false);
   const [accountAction, setAccountAction] = useState('');
   const [loginURL, setLoginURL] = useState('');
   const [loginPendingRegion, setLoginPendingRegion] = useState('');
@@ -189,12 +191,33 @@ function App() {
     message.success(next ? 'API Key 已保存' : 'API Key 已清除');
   };
 
-  const resetAPIKey = () => {
-    setApiKeyDraft('');
-    setApiKey('');
-    sessionStorage.removeItem('wb2api-api-key');
-    localStorage.removeItem('wb2api-api-key');
-    message.success('API Key 已重置');
+  const resetAPIKey = async () => {
+    setApiKeyResetting(true);
+    try {
+      const result = await api('/admin/api-key/reset', { method: 'POST' });
+      const next = String(result.api_key || '');
+      if (!next) throw Error('服务器没有返回新 API Key');
+      setApiKeyDraft(next);
+      setApiKey(next);
+      sessionStorage.setItem('wb2api-api-key', next);
+      message.success('服务器 API Key 已重置并保存');
+    } catch (error) {
+      message.error(`API Key 重置失败：${error.message}`);
+    } finally {
+      setApiKeyResetting(false);
+    }
+  };
+
+  const updateService = async () => {
+    setUpdateStarting(true);
+    try {
+      const result = await api('/admin/update', { method: 'POST' });
+      message.success(result.message || '更新任务已启动');
+    } catch (error) {
+      message.error(`更新未启动：${error.message}`);
+    } finally {
+      setUpdateStarting(false);
+    }
   };
 
   const saveConfig = async values => {
@@ -733,9 +756,10 @@ function App() {
         </Sider>
         <Layout className="app-main-layout">
           <Header style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 26px' }}>
-            <Space><Text strong style={{ color: '#172033' }}>服务控制台</Text><Tag color={data.healthy ? 'green' : 'orange'}>{data.healthy ? '服务可用' : '账号池检查中'}</Tag></Space>
+            <Space><Text strong style={{ color: '#172033' }}>服务控制台</Text><Tag color={data.healthy ? 'green' : 'orange'}>{data.healthy ? '服务可用' : '账号池检查中'}</Tag><Tag>版本 {data.version || 'dev'}</Tag></Space>
             <Space>
               <Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
+              <Button icon={<ReloadOutlined />} loading={updateStarting} onClick={updateService}>Docker 更新</Button>
               <Button icon={<KeyOutlined />} onClick={() => {
                 setApiKeyDraft(apiKey);
                 setApiKeyOpen(true);
@@ -838,9 +862,9 @@ function App() {
               />
               <Space wrap>
                 <Button type="primary" icon={<KeyOutlined />} onClick={saveAPIKey}>保存密钥</Button>
-                <Button danger icon={<ReloadOutlined />} onClick={resetAPIKey}>重置密钥</Button>
+                <Button danger icon={<ReloadOutlined />} loading={apiKeyResetting} onClick={resetAPIKey}>重置并生成新密钥</Button>
               </Space>
-              <Alert type="info" showIcon message="重置只会清除本浏览器保存的密钥，不会修改服务器上的 API Key。" />
+              <Alert type="info" showIcon message="重置会在服务器端生成新 API Key 并立即替换旧密钥，当前浏览器会自动保存新密钥。" />
             </Space>
           </Card>
         </Modal>
