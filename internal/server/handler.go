@@ -76,6 +76,7 @@ type Handler struct {
 	sessionsMu      sync.Mutex
 	sessions        map[string]time.Time
 	configMu        sync.Mutex
+	apiKeyMu        sync.RWMutex
 	responsesMu     sync.Mutex
 	responseHistory map[string]storedResponse
 	responseBytes   int
@@ -161,7 +162,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if h.cfg.APIKey != "" && !h.validAPIKey(r) && !h.frontendSession(r) {
+		if h.apiKeyConfigured() && !h.validAPIKey(r) && !h.frontendSession(r) {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
@@ -170,11 +171,19 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (h *Handler) validAPIKey(r *http.Request) bool {
+	h.apiKeyMu.RLock()
+	defer h.apiKeyMu.RUnlock()
 	if h.cfg.APIKey == "" {
 		return false
 	}
 	authz := r.Header.Get("Authorization")
 	return strings.HasPrefix(authz, "Bearer ") && strings.TrimPrefix(authz, "Bearer ") == h.cfg.APIKey
+}
+
+func (h *Handler) apiKeyConfigured() bool {
+	h.apiKeyMu.RLock()
+	defer h.apiKeyMu.RUnlock()
+	return h.cfg.APIKey != ""
 }
 
 func (h *Handler) frontendSession(r *http.Request) bool {
@@ -199,7 +208,7 @@ func (h *Handler) withFrontend(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Admin endpoints accept either the configured API key or the frontend
 		// unlock cookie. If either credential is configured, require one of them.
-		if (h.cfg.APIKey != "" || h.cfg.FrontendPassword != "") &&
+		if (h.apiKeyConfigured() || h.cfg.FrontendPassword != "") &&
 			!h.validAPIKey(r) && !h.frontendSession(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"code": "frontend_locked", "message": "frontend password or API key required"}})
 			return
@@ -866,6 +875,8 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) resetAPIKey(w http.ResponseWriter, r *http.Request) {
 	h.configMu.Lock()
 	defer h.configMu.Unlock()
+	h.apiKeyMu.Lock()
+	defer h.apiKeyMu.Unlock()
 	if strings.TrimSpace(h.cfg.ConfigPath) == "" {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]string{"code": "api_key_persistence_unavailable", "message": "config path is not configured"}})
 		return
