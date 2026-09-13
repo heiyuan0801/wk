@@ -81,6 +81,7 @@ type Config struct {
 	UpdateRepository  string
 	UpdateBranch      string
 	UpdateRequestPath string
+	UpdateResultPath  string
 }
 
 type SMSRuntime struct {
@@ -173,6 +174,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/api-key/reset", h.withFrontend(h.resetAPIKey))
 	h.mux.HandleFunc("POST /admin/update", h.withFrontend(h.updateService))
 	h.mux.HandleFunc("GET /admin/update/check", h.withFrontend(h.checkUpdate))
+	h.mux.HandleFunc("GET /admin/update/status", h.withFrontend(h.updateStatus))
 	h.mux.HandleFunc("POST /admin/checkin", h.withFrontend(h.runCheckin))
 	h.mux.HandleFunc("POST /admin/credits/refresh", h.withFrontend(h.refreshCredits))
 	h.mux.HandleFunc("POST /admin/account/url", h.withFrontend(h.accountURL))
@@ -1625,6 +1627,10 @@ func (h *Handler) updateService(w http.ResponseWriter, r *http.Request) {
 		}
 		request := map[string]any{"requested_at": time.Now().UTC().Format(time.RFC3339), "version": h.cfg.Version, "repository": h.cfg.UpdateRepository, "branch": h.cfg.UpdateBranch}
 		body, err := json.Marshal(request)
+		resultPath := h.cfg.UpdateResultPath
+		if resultPath != "" {
+			_ = os.Remove(resultPath)
+		}
 		if err != nil || writeFileAtomic(h.cfg.UpdateRequestPath, append(body, '\n'), 0600) != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"code": "update_request_failed", "message": "cannot write update request"}})
 			return
@@ -1644,6 +1650,54 @@ func (h *Handler) updateService(w http.ResponseWriter, r *http.Request) {
 		log.Printf("admin update completed: %s", truncateRequestError(string(output)))
 	}()
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "message": "更新任务已启动，容器将按部署脚本重建"})
+}
+
+// updateStatus reports the host-side watcher state. The watcher writes a
+// small JSON result file; request/lock files distinguish queued from running.
+func (h *Handler) updateStatus(w http.ResponseWriter, r *http.Request) {
+	resultPath := h.cfg.UpdateResultPath
+	if resultPath == "" && h.cfg.UpdateRequestPath != "" {
+		resultPath = filepath.Join(filepath.Dir(h.cfg.UpdateRequestPath), "update-result.json")
+	}
+	state := "idle"
+	message := "没有正在执行的更新"
+	if h.cfg.UpdateRequestPath != "" {
+		if _, err := os.Stat(filepath.Join(filepath.Dir(h.cfg.UpdateRequestPath), "update.lock")); err == nil {
+			state, message = "running", "正在拉取代码、构建并重启容器"
+		} else if _, err := os.Stat(h.cfg.UpdateRequestPath); err == nil {
+			state, message = "queued", "更新请求已排队，等待宿主机执行"
+		}
+	}
+	var result map[string]any
+	if resultPath != "" {
+		if raw, err := os.ReadFile(resultPath); err == nil {
+			if json.Unmarshal(raw, &result) == nil {
+				if value, ok := result["state"].(string); ok && state == "idle" {
+					state = value
+				}
+				if value, ok := result["message"].(string); ok && state != "running" && state != "queued" {
+					message = value
+				}
+			}
+		}
+	}
+	response := map[string]any{"state": state, "message": message}
+	if result != nil {
+		for _, key := range []string{"started_at", "finished_at", "version", "message", "exit_code"} {
+			if value, ok := result[key]; ok {
+				response[key] = value
+			}
+		}
+	}
+	if logPath := filepath.Join(filepath.Dir(resultPath), "update.log"); resultPath != "" {
+		if raw, err := os.ReadFile(logPath); err == nil {
+			if len(raw) > 4000 {
+				raw = raw[len(raw)-4000:]
+			}
+			response["log_tail"] = string(raw)
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) checkUpdate(w http.ResponseWriter, r *http.Request) {

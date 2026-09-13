@@ -153,6 +153,7 @@ function Console() {
     haozhuma: { user: '', pass: '', token: '', sid: '', author: '', uid: '', isp: '' },
   });
   const [updateInfo, setUpdateInfo] = useState(null);
+  const [updateStatus, setUpdateStatus] = useState(null);
   const [loginRegion, setLoginRegion] = useState('cn');
   const [selectedModel, setSelectedModel] = useState('');
   const [promptText, setPromptText] = useState('你好，请简短介绍一下你自己。');
@@ -165,6 +166,7 @@ function Console() {
   const [checkinRunning, setCheckinRunning] = useState(false);
   const [apiKeyResetting, setApiKeyResetting] = useState(false);
   const [updateStarting, setUpdateStarting] = useState(false);
+  const updatePollRef = useRef(null);
   const [accountAction, setAccountAction] = useState('');
   const [accountSearch, setAccountSearch] = useState('');
   const [accountStatusFilter, setAccountStatusFilter] = useState('all');
@@ -356,13 +358,41 @@ function Console() {
     setUpdateStarting(true);
     try {
       const result = await api('/admin/update', { method: 'POST' });
-      message.success(result.message || '更新任务已启动');
+      setUpdateStatus({ state: 'queued', message: result.message || '更新任务已排队' });
+      message.info('更新请求已提交，正在等待宿主机执行');
+      pollUpdateStatus();
     } catch (error) {
       message.error(`更新未启动：${error.message}`);
     } finally {
       setUpdateStarting(false);
     }
   };
+
+  const pollUpdateStatus = async () => {
+    try {
+      const status = await api('/admin/update/status');
+      setUpdateStatus(status);
+      if (status.state === 'queued' || status.state === 'running') {
+        if (!updatePollRef.current) updatePollRef.current = setTimeout(() => { updatePollRef.current = null; pollUpdateStatus(); }, 2000);
+      } else if (updatePollRef.current) {
+        clearTimeout(updatePollRef.current);
+        updatePollRef.current = null;
+      }
+    } catch (error) {
+      // Container restarts briefly interrupt the status request; keep polling
+      // and let the next healthy response report the final result.
+      setUpdateStatus(current => current?.state === 'running' ? { ...current, message: '容器正在重启，等待恢复…' } : current);
+      if (!updatePollRef.current) updatePollRef.current = setTimeout(() => { updatePollRef.current = null; pollUpdateStatus(); }, 2000);
+    }
+  };
+
+  useEffect(() => {
+    pollUpdateStatus();
+    return () => {
+      if (updatePollRef.current) clearTimeout(updatePollRef.current);
+      updatePollRef.current = null;
+    };
+  }, [apiKey]);
 
   const checkUpdate = async () => {
     try {
@@ -1459,6 +1489,7 @@ function Console() {
             <Space>
               <Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
               <Button icon={<ReloadOutlined />} loading={updateStarting} onClick={updateService}>Docker 更新</Button>
+              {updateStatus && <Tag color={updateStatus.state === 'succeeded' ? 'green' : updateStatus.state === 'failed' ? 'red' : updateStatus.state === 'running' ? 'blue' : 'orange'}>{updateStatus.state === 'queued' ? '更新排队中' : updateStatus.state === 'running' ? '正在构建' : updateStatus.state === 'succeeded' ? '更新完成' : updateStatus.state === 'failed' ? '更新失败' : '更新空闲'}</Tag>}
               <Button icon={<KeyOutlined />} onClick={() => {
                 setApiKeyDraft(apiKey);
                 setApiKeyOpen(true);
@@ -1466,6 +1497,7 @@ function Console() {
             </Space>
           </Header>
           <Content style={{ padding: 26 }}>
+            {updateStatus && updateStatus.state !== 'idle' && <Alert showIcon type={updateStatus.state === 'failed' ? 'error' : updateStatus.state === 'succeeded' ? 'success' : 'info'} message={updateStatus.message} description={updateStatus.log_tail ? <pre style={{ maxHeight: 140, overflow: 'auto', margin: 0, whiteSpace: 'pre-wrap' }}>{updateStatus.log_tail}</pre> : undefined} style={{ marginBottom: 16 }} />}
             <Title level={2} style={{ marginTop: 0 }}>{pageTitle}</Title>
             <Paragraph type="secondary">{pageDescription}</Paragraph>
             {activeSection === 'dashboard' && (

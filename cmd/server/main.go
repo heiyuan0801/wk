@@ -338,6 +338,7 @@ func main() {
 		UpdateRepository:  cfg.Update.Repository,
 		UpdateBranch:      cfg.Update.Branch,
 		UpdateRequestPath: filepath.Join(filepath.Dir(cfg.StateFile), "update-request.json"),
+		UpdateResultPath:  filepath.Join(filepath.Dir(cfg.StateFile), "update-result.json"),
 		SoftCooldown:      cfg.SoftRateDur,
 	})
 
