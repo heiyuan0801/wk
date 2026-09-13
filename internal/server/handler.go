@@ -199,7 +199,7 @@ func NewHandler(cfg Config) *Handler {
 
 func (h *Handler) installSMSRuntime(rt SMSRuntime) {
 	h.smsMu.Lock()
-	defer h.smsMu.Unlock()
+	old := h.cfg.AutoEnroll
 	h.cfg.SMSLogin = rt.SMSLogin
 	h.cfg.HaozhumaClient = rt.HaozhumaClient
 	h.cfg.HaozhumaSid = rt.HaozhumaSid
@@ -218,6 +218,11 @@ func (h *Handler) installSMSRuntime(rt SMSRuntime) {
 				return st.Nickname, true
 			},
 		)
+	}
+	next := h.cfg.AutoEnroll
+	h.smsMu.Unlock()
+	if old != nil && old != next {
+		old.Stop("短信配置已更新")
 	}
 }
 
@@ -589,9 +594,11 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	if err := h.reloadSMSRuntime(); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "短信/代理配置未能立即生效：" + err.Error()})
-		return
+	if req.SMS != nil {
+		if err := h.reloadSMSRuntime(); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "短信/代理配置未能立即生效：" + err.Error()})
+			return
+		}
 	}
 	restartRequired := h.cfg.UpdateSchedule == nil
 	if h.cfg.UpdateSchedule != nil {
