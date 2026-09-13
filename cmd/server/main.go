@@ -361,25 +361,44 @@ func stickyMinutesOrDefault(v int) int {
 
 // newHaozhumaClient 建豪猪客户端。未配置账号或项目 ID 时返回 nil（端点关闭）。
 // persist/find 回调由 server.NewHandler 内部注入（依赖 handler 自身状态）。
+//
+// 有 user/pass 时优先用它们 login（token 失效能自动重登）；只有 token
+// 时用 NewWithCredentials 尽量带上账密，便于运行期重登。
 func newHaozhumaClient(cfg *Config) *haozhuma.Client {
 	hz := cfg.SMS.Haozhuma
 	sid := strings.TrimSpace(hz.Sid)
 	if sid == "" {
 		return nil
 	}
-	if token := strings.TrimSpace(hz.Token); token != "" {
-		log.Printf("auto-enroll: haozhuma token configured (sid=%s)", sid)
-		return haozhuma.New(token)
-	}
 	user := strings.TrimSpace(hz.User)
-	if user == "" || hz.Pass == "" {
-		return nil
+	pass := hz.Pass
+	token := strings.TrimSpace(hz.Token)
+	author := strings.TrimSpace(hz.Author)
+	uid := strings.TrimSpace(hz.UID)
+	isp := strings.TrimSpace(hz.ISP)
+
+	setup := func(c *haozhuma.Client) *haozhuma.Client {
+		c.Author, c.UID, c.ISP = author, uid, isp
+		return c
 	}
-	c, err := haozhuma.Login(user, hz.Pass)
-	if err != nil {
-		log.Printf("auto-enroll: 豪猪登录失败，自动加号关闭: %v", err)
-		return nil
+
+	if user != "" && pass != "" {
+		c, err := haozhuma.Login(user, pass)
+		if err != nil {
+			// login 失败但手里有 token 时仍可先跑（token 可能还有效）。
+			if token != "" {
+				log.Printf("auto-enroll: 豪猪 login 失败(%v)，改用已配置 token", err)
+				return setup(haozhuma.NewWithCredentials(token, user, pass))
+			}
+			log.Printf("auto-enroll: 豪猪登录失败，自动加号关闭: %v", err)
+			return nil
+		}
+		log.Printf("auto-enroll: haozhuma login ok (sid=%s uid=%q isp=%q author=%q)", sid, uid, isp, author)
+		return setup(c)
 	}
-	log.Printf("auto-enroll: haozhuma login ok (sid=%s)", sid)
-	return c
+	if token != "" {
+		log.Printf("auto-enroll: haozhuma token configured (sid=%s uid=%q isp=%q author=%q)", sid, uid, isp, author)
+		return setup(haozhuma.New(token))
+	}
+	return nil
 }

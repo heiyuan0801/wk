@@ -89,6 +89,16 @@ type Config struct {
 			Token string `json:"token"`
 			// Sid 项目 ID。52283 = 腾讯科技[限对接]。
 			Sid string `json:"sid"`
+			// Author 「[限对接]」项目的对接方标识。留空则不下发。
+			// 注意：实测 52283 项目带 author=adminzfz 反而取不到号，默认留空。
+			Author string `json:"author"`
+			// UID 指定对接码（豪猪后台的"对接码 UID"）。一个 sid 下可能挂了
+			// 多个对接商，质量不一：不指定时平台随机分配，可能撞上没号的那个。
+			// 实测指定有号的对接码成功率 6/6，随机只有 3/6。
+			UID string `json:"uid"`
+			// ISP 取号运营商优先级：1=移动 2=联通 3=电信，逗号分隔依次降级，
+			// 最后自动退回"不限"。留空表示直接不限。
+			ISP string `json:"isp"`
 		} `json:"haozhuma"`
 	} `json:"sms"`
 

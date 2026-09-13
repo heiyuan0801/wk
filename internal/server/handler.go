@@ -875,14 +875,16 @@ func (h *Handler) accountSMSVerify(w http.ResponseWriter, r *http.Request) {
 }
 
 // accountSMSAutoEnroll 豪猪自动加号：后台循环"取号→发码→收码→验码落盘"。
-// POST {"count": N} 启动；同一时刻只允许一个任务在跑。
+// POST {"count": N, "workers": M} 启动；同一时刻只允许一个任务在跑。
+// workers 并发数 1-8，默认 3（每个号一个独立代理出口，共享同一个号池）。
 func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.SMSLogin == nil || h.cfg.AutoEnroll == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "自动加号未启用（缺少豪猪配置）"})
 		return
 	}
 	var req struct {
-		Count int `json:"count"`
+		Count   int `json:"count"`
+		Workers int `json:"workers"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
@@ -892,14 +894,19 @@ func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "count 需在 1-50 之间"})
 		return
 	}
-	if err := h.cfg.AutoEnroll.AutoRun(req.Count); err != nil {
+	if req.Workers < 0 || req.Workers > 8 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "workers 需在 1-8 之间（不填默认 3）"})
+		return
+	}
+	if err := h.cfg.AutoEnroll.AutoRun(req.Count, req.Workers); err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
-		"ok":    true,
-		"count": req.Count,
-		"note":  "任务已在后台运行，用 GET /admin/account/sms/auto-enroll 查看进度",
+		"ok":      true,
+		"count":   req.Count,
+		"workers": req.Workers,
+		"note":    "任务已在后台运行，用 GET /admin/account/sms/auto-enroll 查看进度",
 	})
 }
 
@@ -910,10 +917,22 @@ func (h *Handler) accountSMSAutoEnrollStatus(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	st := h.cfg.AutoEnroll.Status()
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"running": st.Running, "attempts": st.Attempts,
 		"ok": st.OK, "fail": st.Fail, "logs": st.Logs,
-	})
+	}
+	if st.Workers > 0 {
+		body["workers"] = st.Workers
+	}
+	// 终止原因（余额不足/熔断/无号可取）：控制台据此提示用户，别只显示 0 成功。
+	if st.StopReason != "" {
+		body["stop_reason"] = st.StopReason
+	}
+	// 余额：任务开始前能看出钱还够不够，失败也不用翻后台。
+	if bal, err := h.cfg.AutoEnroll.Balance(r.Context()); err == nil && bal >= 0 {
+		body["balance"] = bal
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // smsLoginStatus 把登录失败映射到 HTTP 状态码：会话失效用 410，其余上游/参数
