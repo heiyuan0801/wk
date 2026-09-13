@@ -61,6 +61,7 @@
     "proxy": {
       "url": "",
       "file": "",
+      "lines": [],
       "cooldown": "30m",
       "region": "",
       "inject_sid": false,

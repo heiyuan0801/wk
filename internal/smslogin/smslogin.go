@@ -171,9 +171,11 @@ type Manager struct {
 	ttl time.Duration
 	// solver 用于自动过腾讯人机校验。nil = 未配置打码平台，
 	// 此时遇到 need_captcha 仍然提示用户改用浏览器授权。
-	solver Solver
+	solver   Solver
+	solverMu sync.RWMutex
 	// proxy 为登录链路提供出口代理（规避同 IP 注册频控）。nil = 直连。
-	proxy ProxyDialer
+	proxy   ProxyDialer
+	proxyMu sync.RWMutex
 	// proxyDialTimeout 代理拨号超时。
 	proxyDialTimeout time.Duration
 
@@ -203,7 +205,17 @@ func NewManager(ep Endpoints, ttl time.Duration) *Manager {
 
 // SetSolver 装上人机校验解算器（通常是 2captcha）。
 // 传入 nil 等价于关闭自动打码，行为回到"提示改用浏览器授权"。
-func (m *Manager) SetSolver(s Solver) { m.solver = s }
+func (m *Manager) SetSolver(s Solver) {
+	m.solverMu.Lock()
+	m.solver = s
+	m.solverMu.Unlock()
+}
+
+func (m *Manager) solverValue() Solver {
+	m.solverMu.RLock()
+	defer m.solverMu.RUnlock()
+	return m.solver
+}
 
 // session 是单次短信登录的全部中间状态。
 type session struct {
@@ -281,7 +293,7 @@ func (m *Manager) Send(ctx context.Context, mobile, region string) (SendResult, 
 				Captcha: &CaptchaPrompt{
 					Options:       need.options,
 					Reason:        reason,
-					AutoAttempted: m.solver != nil,
+					AutoAttempted: m.solverValue() != nil,
 				},
 			}, nil
 		}
@@ -375,10 +387,11 @@ func (m *Manager) tryAutoSolve(ctx context.Context, options CaptchaChallenge) (m
 	if !ok {
 		return nil, "该号码要求的人机校验（teg）无法自动通过，请手动完成"
 	}
-	if m.solver == nil {
+	solver := m.solverValue()
+	if solver == nil {
 		return nil, "未配置打码平台密钥，请手动完成校验"
 	}
-	ticket, randStr, err := m.solver.Solve(ctx, opt.AppID)
+	ticket, randStr, err := solver.Solve(ctx, opt.AppID)
 	if err != nil {
 		if errors.Is(err, ErrCaptchaBalance) {
 			return nil, "打码平台余额不足，请手动完成校验"

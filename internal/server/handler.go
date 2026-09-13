@@ -53,6 +53,9 @@ type Config struct {
 	// HaozhumaClient 豪猪接码客户端（可选）。配置了 sms.haozhuma 时由 main
 	// 注入；NewHandler 内部用它组装 AutoEnroll（persist/find 回调指向 handler）。
 	HaozhumaClient *haozhuma.Client
+	// ReloadSMS rereads persisted SMS settings and returns a fresh runtime.
+	// It lets the management page apply credentials and proxies without restart.
+	ReloadSMS func() (SMSRuntime, error)
 	// HaozhumaSid 豪猪项目 ID（如 52283 腾讯科技[限对接]）。
 	HaozhumaSid string
 	// AutoEnroll 豪猪自动加号（NewHandler 内部组装）。nil = 未启用该端点。
@@ -80,6 +83,12 @@ type Config struct {
 	UpdateRequestPath string
 }
 
+type SMSRuntime struct {
+	SMSLogin       *smslogin.Manager
+	HaozhumaClient *haozhuma.Client
+	HaozhumaSid    string
+}
+
 // ResponseStore is the optional Redis-backed persistence used by
 // previous_response_id across restarts and replicas.
 type ResponseStore interface {
@@ -100,6 +109,7 @@ type Handler struct {
 	responseBytes   int
 	unlockRateMu    sync.Mutex
 	unlockAttempts  map[string]unlockAttempt
+	smsMu           sync.RWMutex
 }
 
 type unlockAttempt struct {
@@ -181,11 +191,22 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/account/{uid}/checkin", h.withFrontend(h.checkinAccount))
 	h.mux.HandleFunc("POST /admin/account/{uid}/keepalive", h.withFrontend(h.keepaliveAccount))
 	h.mux.HandleFunc("DELETE /admin/account/{uid}", h.withFrontend(h.deleteAccount))
-	// 自动加号：豪猪取号→短信直登→落盘。persist/find 回调指向本 handler，
-	// 必须在 NewHandler 里组装（main 那边拿不到方法值）。
-	if cfg.HaozhumaClient != nil && cfg.SMSLogin != nil && cfg.HaozhumaSid != "" {
+	h.installSMSRuntime(SMSRuntime{SMSLogin: cfg.SMSLogin, HaozhumaClient: cfg.HaozhumaClient, HaozhumaSid: cfg.HaozhumaSid})
+	// Static console assets are served from the image's frontend directory.
+	h.mux.Handle("/", http.FileServer(http.Dir("frontend")))
+	return h
+}
+
+func (h *Handler) installSMSRuntime(rt SMSRuntime) {
+	h.smsMu.Lock()
+	defer h.smsMu.Unlock()
+	h.cfg.SMSLogin = rt.SMSLogin
+	h.cfg.HaozhumaClient = rt.HaozhumaClient
+	h.cfg.HaozhumaSid = rt.HaozhumaSid
+	h.cfg.AutoEnroll = nil
+	if rt.HaozhumaClient != nil && rt.SMSLogin != nil && strings.TrimSpace(rt.HaozhumaSid) != "" {
 		h.cfg.AutoEnroll = NewAutoEnroller(
-			cfg.SMSLogin, cfg.HaozhumaClient, cfg.HaozhumaSid,
+			rt.SMSLogin, rt.HaozhumaClient, rt.HaozhumaSid,
 			func(cred accountCredential, region string) (map[string]any, int, error) {
 				return h.persistAccount(cred, region)
 			},
@@ -198,9 +219,30 @@ func NewHandler(cfg Config) *Handler {
 			},
 		)
 	}
-	// Static console assets are served from the image's frontend directory.
-	h.mux.Handle("/", http.FileServer(http.Dir("frontend")))
-	return h
+}
+
+func (h *Handler) smsRuntime() SMSRuntime {
+	h.smsMu.RLock()
+	defer h.smsMu.RUnlock()
+	return SMSRuntime{SMSLogin: h.cfg.SMSLogin, HaozhumaClient: h.cfg.HaozhumaClient, HaozhumaSid: h.cfg.HaozhumaSid}
+}
+
+func (h *Handler) autoEnroller() *AutoEnroller {
+	h.smsMu.RLock()
+	defer h.smsMu.RUnlock()
+	return h.cfg.AutoEnroll
+}
+
+func (h *Handler) reloadSMSRuntime() error {
+	if h.cfg.ReloadSMS == nil {
+		return nil
+	}
+	rt, err := h.cfg.ReloadSMS()
+	if err != nil {
+		return err
+	}
+	h.installSMSRuntime(rt)
+	return nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -356,13 +398,16 @@ func (h *Handler) cleanupUnlockAttemptsLocked(now time.Time) {
 }
 
 type adminSMSProxyConfig struct {
-	URL           string `json:"url"`
-	URLConfigured bool   `json:"url_configured"`
-	File          string `json:"file"`
-	Cooldown      string `json:"cooldown"`
-	Region        string `json:"region"`
-	InjectSID     bool   `json:"inject_sid"`
-	StickyMinutes int    `json:"sticky_minutes"`
+	URL            string   `json:"url"`
+	URLConfigured  bool     `json:"url_configured"`
+	File           string   `json:"file"`
+	Lines          []string `json:"lines,omitempty"`
+	PoolConfigured bool     `json:"pool_configured"`
+	PoolCount      int      `json:"pool_count"`
+	Cooldown       string   `json:"cooldown"`
+	Region         string   `json:"region"`
+	InjectSID      bool     `json:"inject_sid"`
+	StickyMinutes  int      `json:"sticky_minutes"`
 }
 
 type adminSMSHaozhumaConfig struct {
@@ -385,6 +430,7 @@ type adminSMSRequest struct {
 	Proxy         *struct {
 		URL           *string `json:"url"`
 		File          *string `json:"file"`
+		Lines         *string `json:"lines"`
 		Cooldown      *string `json:"cooldown"`
 		Region        *string `json:"region"`
 		InjectSID     *bool   `json:"inject_sid"`
@@ -457,7 +503,7 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 		"request_logs": c.RequestLogs,
 		"sms": adminSMSConfig{
 			TwoCaptchaConfigured: strings.TrimSpace(c.SMS.TwoCaptchaKey) != "",
-			Proxy:                adminSMSProxyConfig{URLConfigured: strings.TrimSpace(c.SMS.Proxy.URL) != "", File: c.SMS.Proxy.File, Cooldown: c.SMS.Proxy.Cooldown, Region: c.SMS.Proxy.Region, InjectSID: c.SMS.Proxy.InjectSID, StickyMinutes: c.SMS.Proxy.StickyMinutes},
+			Proxy:                adminSMSProxyConfig{URLConfigured: strings.TrimSpace(c.SMS.Proxy.URL) != "", File: c.SMS.Proxy.File, PoolConfigured: len(c.SMS.Proxy.Lines) > 0, PoolCount: len(c.SMS.Proxy.Lines), Cooldown: c.SMS.Proxy.Cooldown, Region: c.SMS.Proxy.Region, InjectSID: c.SMS.Proxy.InjectSID, StickyMinutes: c.SMS.Proxy.StickyMinutes},
 			Haozhuma:             adminSMSHaozhumaConfig{User: c.SMS.Haozhuma.User, SID: c.SMS.Haozhuma.SID, Author: c.SMS.Haozhuma.Author, UID: c.SMS.Haozhuma.UID, ISP: c.SMS.Haozhuma.ISP, Configured: strings.TrimSpace(c.SMS.Haozhuma.Token) != "" || strings.TrimSpace(c.SMS.Haozhuma.User) != ""},
 		},
 		"update": c.Update,
@@ -543,6 +589,10 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
+	if err := h.reloadSMSRuntime(); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "短信/代理配置未能立即生效：" + err.Error()})
+		return
+	}
 	restartRequired := h.cfg.UpdateSchedule == nil
 	if h.cfg.UpdateSchedule != nil {
 		h.cfg.UpdateSchedule(checkinHours, keepaliveHours)
@@ -579,6 +629,20 @@ func mergeAdminSMSConfig(doc map[string]any, req *adminSMSRequest) {
 		}
 		if req.Proxy.File != nil {
 			proxy["file"] = strings.TrimSpace(*req.Proxy.File)
+		}
+		if req.Proxy.Lines != nil && strings.TrimSpace(*req.Proxy.Lines) != "" {
+			lines := make([]string, 0)
+			for _, line := range strings.Split(strings.ReplaceAll(*req.Proxy.Lines, "\r\n", "\n"), "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" && !strings.HasPrefix(line, "#") {
+					lines = append(lines, line)
+				}
+			}
+			if len(lines) > 0 {
+				proxy["lines"] = lines
+				delete(proxy, "file")
+				delete(proxy, "url")
+			}
 		}
 		if req.Proxy.Cooldown != nil {
 			proxy["cooldown"] = strings.TrimSpace(*req.Proxy.Cooldown)
@@ -1005,7 +1069,8 @@ func (h *Handler) findAccountByMobile(mobile string) (pool.Status, bool) {
 // accountSMSSend 短信直登第一步：向指定手机号下发 OneID 短信验证码。
 // 返回 session_id，验码时凭它取回本次登录的中间状态。
 func (h *Handler) accountSMSSend(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.SMSLogin == nil {
+	sms := h.smsRuntime().SMSLogin
+	if sms == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "短信登录未启用"})
 		return
 	}
@@ -1041,7 +1106,7 @@ func (h *Handler) accountSMSSend(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// 手机号与验证码属于敏感输入，失败原因要回给用户，但绝不写进日志。
-	res, err := h.cfg.SMSLogin.Send(r.Context(), req.Mobile, region)
+	res, err := sms.Send(r.Context(), req.Mobile, region)
 	if err != nil {
 		writeJSON(w, smsLoginStatus(err), smsLoginErrorBody(err))
 		return
@@ -1067,7 +1132,8 @@ func smsSendBody(res smslogin.SendResult) map[string]any {
 // 上游只认 captchaVerification 这个对象，不区分票据来自打码平台还是真人操作，
 // 所以这里与自动过码共用同一条回灌路径。
 func (h *Handler) accountSMSSubmitCaptcha(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.SMSLogin == nil {
+	sms := h.smsRuntime().SMSLogin
+	if sms == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "短信登录未启用"})
 		return
 	}
@@ -1081,7 +1147,7 @@ func (h *Handler) accountSMSSubmitCaptcha(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
 		return
 	}
-	res, err := h.cfg.SMSLogin.SubmitCaptcha(r.Context(), req.SessionID, req.Ticket, req.RandStr, req.CloudType)
+	res, err := sms.SubmitCaptcha(r.Context(), req.SessionID, req.Ticket, req.RandStr, req.CloudType)
 	if err != nil {
 		writeJSON(w, smsLoginStatus(err), smsLoginErrorBody(err))
 		return
@@ -1091,7 +1157,8 @@ func (h *Handler) accountSMSSubmitCaptcha(w http.ResponseWriter, r *http.Request
 
 // accountSMSVerify 短信直登第二步：校验验证码，走完全部上游步骤并把账号落盘。
 func (h *Handler) accountSMSVerify(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.SMSLogin == nil {
+	sms := h.smsRuntime().SMSLogin
+	if sms == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "短信登录未启用"})
 		return
 	}
@@ -1103,7 +1170,7 @@ func (h *Handler) accountSMSVerify(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
 		return
 	}
-	creds, err := h.cfg.SMSLogin.Verify(r.Context(), req.SessionID, req.Code)
+	creds, err := sms.Verify(r.Context(), req.SessionID, req.Code)
 	if err != nil {
 		writeJSON(w, smsLoginStatus(err), smsLoginErrorBody(err))
 		return
@@ -1132,7 +1199,8 @@ func (h *Handler) accountSMSVerify(w http.ResponseWriter, r *http.Request) {
 // 没有这个端点时只能重启容器才能停下一个跑偏的任务（例如对接商全是空号，
 // 循环一直在取号失败）。已在途的号会由各自的超时收尾，不会落半截账号。
 func (h *Handler) accountSMSAutoEnrollStop(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.AutoEnroll == nil {
+	en := h.autoEnroller()
+	if en == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "自动加号未启用"})
 		return
 	}
@@ -1142,7 +1210,7 @@ func (h *Handler) accountSMSAutoEnrollStop(w http.ResponseWriter, r *http.Reques
 	// body 可选：没有 body 也能停。
 	_ = json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&req)
 
-	if !h.cfg.AutoEnroll.Stop(req.Reason) {
+	if !en.Stop(req.Reason) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "note": "当前没有正在运行的任务"})
 		return
 	}
@@ -1154,11 +1222,12 @@ func (h *Handler) accountSMSAutoEnrollStop(w http.ResponseWriter, r *http.Reques
 // 只报告配置与冷却情况，**绝不返回代理密码**：这些凭据对控制台没有
 // 使用价值，但会留在浏览器历史/日志里。
 func (h *Handler) proxyStatus(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.SMSLogin == nil {
+	sms := h.smsRuntime().SMSLogin
+	if sms == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "reason": "短信直登未启用"})
 		return
 	}
-	st := h.cfg.SMSLogin.ProxyStatus()
+	st := sms.ProxyStatus()
 	if st == nil {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"enabled": false,
@@ -1172,7 +1241,9 @@ func (h *Handler) proxyStatus(w http.ResponseWriter, r *http.Request) {
 
 // accountSMSAutoEnroll 启动自动加号任务。
 func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.SMSLogin == nil || h.cfg.AutoEnroll == nil {
+	rt := h.smsRuntime()
+	en := h.autoEnroller()
+	if rt.SMSLogin == nil || en == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "自动加号未启用（缺少豪猪配置）"})
 		return
 	}
@@ -1192,7 +1263,7 @@ func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "workers 需在 1-8 之间（不填默认 3）"})
 		return
 	}
-	if err := h.cfg.AutoEnroll.AutoRun(req.Count, req.Workers); err != nil {
+	if err := en.AutoRun(req.Count, req.Workers); err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1206,11 +1277,12 @@ func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 
 // accountSMSAutoEnrollStatus 查询自动加号进度。
 func (h *Handler) accountSMSAutoEnrollStatus(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.AutoEnroll == nil {
+	en := h.autoEnroller()
+	if en == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "自动加号未启用"})
 		return
 	}
-	st := h.cfg.AutoEnroll.Status()
+	st := en.Status()
 	body := map[string]any{
 		"running": st.Running, "attempts": st.Attempts,
 		"ok": st.OK, "fail": st.Fail, "logs": st.Logs,
@@ -1224,7 +1296,7 @@ func (h *Handler) accountSMSAutoEnrollStatus(w http.ResponseWriter, r *http.Requ
 		body["stop_reason"] = st.StopReason
 	}
 	// 余额：任务开始前能看出钱还够不够，失败也不用翻后台。
-	if bal, err := h.cfg.AutoEnroll.Balance(r.Context()); err == nil && bal >= 0 {
+	if bal, err := en.Balance(r.Context()); err == nil && bal >= 0 {
 		body["balance"] = bal
 	}
 	writeJSON(w, http.StatusOK, body)

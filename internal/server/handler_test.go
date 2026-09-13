@@ -300,6 +300,40 @@ func TestAdminConfigPreservesSecretWhenBlank(t *testing.T) {
 	}
 }
 
+func TestAdminConfigReloadsSMSAndImportsProxyLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"schedule":{"checkin_hours":[9],"keepalive_hours":[22]}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := false
+	h := NewHandler(Config{ConfigPath: path, ReloadSMS: func() (SMSRuntime, error) {
+		reloaded = true
+		return SMSRuntime{}, nil
+	}})
+	req := httptest.NewRequest(http.MethodPost, "/admin/config", strings.NewReader(`{"checkin_hours":[8],"keepalive_hours":[23],"sms":{"proxy":{"lines":"1.2.3.4:8080:user:pass\nhttp://u:p@proxy.example:3128"}}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !reloaded {
+		t.Fatalf("status=%d reloaded=%v body=%s", rec.Code, reloaded, rec.Body.String())
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]any
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatal(err)
+	}
+	proxy := saved["sms"].(map[string]any)["proxy"].(map[string]any)
+	lines := proxy["lines"].([]any)
+	if len(lines) != 2 || lines[0] != "1.2.3.4:8080:user:pass" {
+		t.Fatalf("proxy lines=%v", lines)
+	}
+	if _, ok := proxy["file"]; ok {
+		t.Fatalf("direct import should not retain file field: %v", proxy)
+	}
+}
+
 // newFakeUpstream 返回一个 ChatStream 走 fake 的 upstream.Client。
 // fake 依据 Authorization 头决定行为。
 func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body string, isStream bool)) *upstream.Client {

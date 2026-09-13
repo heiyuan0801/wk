@@ -73,6 +73,8 @@ type Config struct {
 			// File 代理名单路径（每行 host:port:user:pass 或完整 URL）。
 			// 每次登录换一条，用过的条目进入 cooldown。
 			File string `json:"file"`
+			// Lines 由管理页面直接导入的代理名单；优先于 file/url。
+			Lines []string `json:"lines"`
 			// Cooldown 同一条代理再次用于注册的最短间隔，默认 "30m"。
 			Cooldown string `json:"cooldown"`
 			// Region 可选 ISO 3166-1 两位码（如 HK）。仅在 inject_sid 时拼进用户名。

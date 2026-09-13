@@ -283,6 +283,21 @@ func main() {
 	// SMSLogin 与 AutoEnroll 必须共享同一个管理器：代理池冷却是全局状态，
 	// 各建一份会让手动发码和自动加号在 30 分钟内撞同一个出口 IP。
 	smsManager := newSMSLoginManager(cfg)
+	reloadSMS := func() (server.SMSRuntime, error) {
+		next, err := Load(*cfgPath)
+		if err != nil {
+			return server.SMSRuntime{}, err
+		}
+		manager, err := buildSMSLoginManager(next)
+		if err != nil {
+			return server.SMSRuntime{}, err
+		}
+		return server.SMSRuntime{
+			SMSLogin:       manager,
+			HaozhumaClient: newHaozhumaClient(next),
+			HaozhumaSid:    strings.TrimSpace(next.SMS.Haozhuma.Sid),
+		}, nil
+	}
 
 	h := server.NewHandler(server.Config{
 		Pool:             p,
@@ -298,7 +313,8 @@ func main() {
 		CheckinAccount:   sch.CheckinAccount,
 		KeepaliveAccount: sch.KeepaliveAccount,
 		// 短信直登只走中国区 codebuddy.cn 的 OneID/Keycloak；海外版继续用 OAuth 链接。
-		SMSLogin: smsManager,
+		SMSLogin:  smsManager,
+		ReloadSMS: reloadSMS,
 		// 豪猪自动加号（可选）：取号→直登→落盘全自动。与手动发码共用代理池；
 		// AutoEnroll 在 NewHandler 内部组装（persist 回调指向 handler）。
 		HaozhumaClient:  newHaozhumaClient(cfg),
@@ -369,6 +385,14 @@ func runtimeVersion() string {
 // 未配置 sms.two_captcha_key 时不装 solver：遇到 need_captcha 会保持原有行为
 // （提示改用浏览器授权），而不是因为缺密钥就整体不可用。
 func newSMSLoginManager(cfg *Config) *smslogin.Manager {
+	m, err := buildSMSLoginManager(cfg)
+	if err != nil {
+		log.Fatalf("sms login: %v", err)
+	}
+	return m
+}
+
+func buildSMSLoginManager(cfg *Config) (*smslogin.Manager, error) {
 	m := smslogin.NewManager(smslogin.DefaultEndpoints(), 10*time.Minute)
 	if solver := smslogin.NewTwoCaptchaSolver(cfg.SMS.TwoCaptchaKey); solver != nil {
 		m.SetSolver(solver)
@@ -376,10 +400,17 @@ func newSMSLoginManager(cfg *Config) *smslogin.Manager {
 	}
 	// 登录代理只影响短信直登链路，号池的日常 API 调用不走它。
 	// file 优先：Webshare 这类静态名单每次登录换一条；url 是单出口（1024proxy 粘性或一条静态）。
-	if file := strings.TrimSpace(cfg.SMS.Proxy.File); file != "" {
+	if len(cfg.SMS.Proxy.Lines) > 0 {
+		pool, err := smslogin.NewPoolDialer(cfg.SMS.Proxy.Lines, cfg.SMSProxyCooldownDur)
+		if err != nil {
+			return nil, fmt.Errorf("加载代理池: %w", err)
+		}
+		m.SetProxyDialer(pool)
+		log.Printf("sms login: imported proxy pool enabled (%d endpoints, cooldown=%s)", pool.Len(), cfg.SMSProxyCooldownDur)
+	} else if file := strings.TrimSpace(cfg.SMS.Proxy.File); file != "" {
 		pool, err := smslogin.LoadPoolDialer(file, cfg.SMSProxyCooldownDur)
 		if err != nil {
-			log.Fatalf("sms login: 加载代理名单 %s: %v", file, err)
+			return nil, fmt.Errorf("加载代理名单 %s: %w", file, err)
 		}
 		m.SetProxyDialer(pool)
 		log.Printf("sms login: proxy pool enabled (%d endpoints, cooldown=%s)", pool.Len(), cfg.SMSProxyCooldownDur)
@@ -390,7 +421,7 @@ func newSMSLoginManager(cfg *Config) *smslogin.Manager {
 		log.Printf("sms login: outbound proxy enabled (inject_sid=%v region=%s sticky=%dm)",
 			d.InjectSID, strings.ToUpper(strings.TrimSpace(cfg.SMS.Proxy.Region)), stickyMinutesOrDefault(cfg.SMS.Proxy.StickyMinutes))
 	}
-	return m
+	return m, nil
 }
 
 func stickyMinutesOrDefault(v int) int {

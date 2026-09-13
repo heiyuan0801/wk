@@ -248,7 +248,7 @@ function Console() {
           // Proxy URLs may contain credentials and are intentionally masked by
           // the API. Keep the local field empty so saving the form preserves
           // the server-side value instead of exposing or overwriting it.
-          proxy: { ...current.proxy, ...(currentConfig.sms.proxy || {}), url: '' },
+          proxy: { ...current.proxy, ...(currentConfig.sms.proxy || {}), url: '', lines: '' },
           haozhuma: { ...current.haozhuma, ...(currentConfig.sms.haozhuma || {}) },
           twoCaptchaConfigured: currentConfig.sms.two_captcha_configured === true,
         }));
@@ -382,7 +382,7 @@ function Console() {
         request_logs: { retention_days: Number(values.retention) },
         sms: {
           two_captcha_key: smsSettings.twoCaptchaKey || undefined,
-          proxy: smsSettings.proxy,
+          proxy: { ...smsSettings.proxy, lines: smsSettings.proxy.lines || undefined },
           haozhuma: smsSettings.haozhuma,
         },
         update: config.update,
@@ -1245,7 +1245,7 @@ function Console() {
             </Space>
           </Card>
           <Card title="短信直登与自动加号配置" extra={<Tag color={smsSettings.haozhuma.sid ? 'green' : 'default'}>{smsSettings.haozhuma.sid ? '已配置项目' : '未启用自动加号'}</Tag>}>
-            <Alert type="info" showIcon message="敏感字段不会回显；密码、token 或打码密钥留空会保留服务器原值。保存后重启服务，自动加号入口才会启用。" style={{ marginBottom: 14 }} />
+            <Alert type="info" showIcon message="敏感字段不会回显；保存后账号、自动加号和代理立即生效，不需要重启。代理池可直接粘贴导入。" style={{ marginBottom: 14 }} />
             <Space direction="vertical" style={{ width: '100%' }} size={10}>
               <Text strong>豪猪接码</Text>
               <Space wrap>
@@ -1261,7 +1261,7 @@ function Console() {
               <Space wrap>
                 <Input value={smsSettings.twoCaptchaKey} onChange={e => setSmsSettings(s => ({ ...s, twoCaptchaKey: e.target.value }))} placeholder="2Captcha Key（留空保持）" style={{ width: 260 }} />
                 <Input value={smsSettings.proxy.url} onChange={e => setSmsSettings(s => ({ ...s, proxy: { ...s.proxy, url: e.target.value } }))} placeholder="代理 URL（可选）" style={{ width: 300 }} />
-                <Input value={smsSettings.proxy.file} onChange={e => setSmsSettings(s => ({ ...s, proxy: { ...s.proxy, file: e.target.value } }))} placeholder="代理名单文件路径（可选）" style={{ width: 260 }} />
+                <Input.TextArea value={smsSettings.proxy.lines || ''} onChange={e => setSmsSettings(s => ({ ...s, proxy: { ...s.proxy, lines: e.target.value } }))} placeholder={'直接粘贴代理池，每行 host:port:user:pass 或 http://user:pass@host:port'} autoSize={{ minRows: 2, maxRows: 5 }} style={{ width: 520 }} />
                 <Input value={smsSettings.proxy.cooldown} onChange={e => setSmsSettings(s => ({ ...s, proxy: { ...s.proxy, cooldown: e.target.value } }))} placeholder="冷却，如 30m" style={{ width: 150 }} />
                 <Input value={smsSettings.proxy.region} onChange={e => setSmsSettings(s => ({ ...s, proxy: { ...s.proxy, region: e.target.value } }))} placeholder="代理区域，如 HK" style={{ width: 150 }} />
                 <Input value={smsSettings.proxy.sticky_minutes} onChange={e => setSmsSettings(s => ({ ...s, proxy: { ...s.proxy, sticky_minutes: Number(e.target.value || 0) } }))} placeholder="粘性分钟" style={{ width: 120 }} />

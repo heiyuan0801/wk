@@ -142,10 +142,13 @@ func proxyTransport(proxyURL *url.URL, timeout time.Duration) *http.Transport {
 //
 // 返回的 cleanup 在会话结束时应被调用（关闭空闲连接）。
 func (m *Manager) applyProxy(s *session) (func(), error) {
-	if m.proxy == nil {
+	m.proxyMu.RLock()
+	dialer := m.proxy
+	m.proxyMu.RUnlock()
+	if dialer == nil {
 		return func() {}, nil
 	}
-	proxyURL, err := m.proxy.Dialer()
+	proxyURL, err := dialer.Dialer()
 	if err != nil {
 		return func() {}, fmt.Errorf("获取登录代理失败: %w", err)
 	}
@@ -175,7 +178,11 @@ func (m *Manager) proxyTimeout() time.Duration {
 }
 
 // SetProxyDialer 配置登录代理。nil = 直连（默认）。
-func (m *Manager) SetProxyDialer(d ProxyDialer) { m.proxy = d }
+func (m *Manager) SetProxyDialer(d ProxyDialer) {
+	m.proxyMu.Lock()
+	m.proxy = d
+	m.proxyMu.Unlock()
+}
 
 // ProxyStatus 导出当前代理配置，供控制台展示。
 //
@@ -186,10 +193,13 @@ func (m *Manager) SetProxyDialer(d ProxyDialer) { m.proxy = d }
 //
 // 密码一律不外送。返回 nil 表示未配置代理（直连）。
 func (m *Manager) ProxyStatus() map[string]any {
-	if m.proxy == nil {
+	m.proxyMu.RLock()
+	dialer := m.proxy
+	m.proxyMu.RUnlock()
+	if dialer == nil {
 		return nil
 	}
-	switch d := m.proxy.(type) {
+	switch d := dialer.(type) {
 	case *PoolDialer:
 		snap := d.Snapshot()
 		return map[string]any{
