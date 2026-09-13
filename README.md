@@ -95,6 +95,8 @@ systemctl enable --now workbuddy2api-update-watcher.service
 
 控制台“管理设置”可以填写短信直登、代理池和豪猪自动加号参数。密码、豪猪 token、2Captcha key 不会回显；留空保存时保持服务器原值。保存成功后会热重载短信登录、豪猪客户端和代理池，不需要重启服务。
 
+控制台左侧的“账号状态”和“签到中心”是独立入口；批量签到可通过 `GET /admin/checkin/status` 查看运行状态、成功数、失败数和跳过数。Docker 更新按钮通过 `GET /admin/update/status` 展示排队、构建、完成或失败状态，并保留宿主机更新日志尾部。
+
 本版本还合入了账号运维扩展：控制台新增“自动加号”和“代理池”页面。中国区可以使用短信直登流程（手机号、验证码和必要的人机校验），也可以在页面文本框直接粘贴代理池（每行 `host:port:user:pass` 或完整 URL），保存后立即按出口轮换；旧的 `file` 配置仍兼容。自动加号需要在 `config.json` 的 `sms.haozhuma` 中配置豪猪账号/token 与项目 `sid`，未配置时对应入口保持关闭。代理密码只在服务端使用，不会返回给控制台。
 
 ```json
