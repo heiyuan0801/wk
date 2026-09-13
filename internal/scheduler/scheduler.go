@@ -268,7 +268,7 @@ func (s *Scheduler) RunCheckinNow() {
 			log.Printf("checkin %s: %v", st.UID, err)
 			// 已签到等业务错误也继续走余额查询
 		}
-		s.refreshAccountCredits(st.UID, a)
+		_ = s.refreshAccountCredits(st.UID, a)
 	}
 }
 
@@ -283,15 +283,17 @@ func (s *Scheduler) RunCreditRefreshNow() {
 		if a == nil || a.Snapshot().RefreshToken == "" {
 			continue
 		}
-		s.refreshAccountCredits(st.UID, a)
+		_ = s.refreshAccountCredits(st.UID, a)
 	}
 }
 
-func (s *Scheduler) refreshAccountCredits(uid string, a *auth.Auth) {
+// refreshAccountCredits 拉取上游余额快照并写入账号池。
+// 返回 error 供按账号调用方区分"签到成功但余额查询失败"。
+func (s *Scheduler) refreshAccountCredits(uid string, a *auth.Auth) error {
 	resource, err := s.cfg.Upstream.UserResourceDetails(a)
 	if err != nil {
 		log.Printf("user-resource %s: %v", uid, err)
-		return
+		return err
 	}
 	s.cfg.Pool.SetCreditDetail(uid, pool.CreditDetail{
 		Remaining:           resource.Remaining,
@@ -302,6 +304,60 @@ func (s *Scheduler) refreshAccountCredits(uid string, a *auth.Auth) {
 		CycleCapacityRemain: resource.CycleCapacityRemain,
 		CycleCapacityUsed:   resource.CycleCapacityUsed,
 	})
+	return nil
+}
+
+// AccountResult 单个账号的签到/保活结果，供控制台按账号展示。
+type AccountResult struct {
+	UID    string
+	OK     bool
+	Detail string // 失败原因，OK 时为空
+}
+
+// CheckinAccount 对单个账号执行签到并刷新余额，供控制台"单账号签到"使用。
+// 语义与 RunCheckinNow 的单账号分支完全一致：DailyCheckin 的业务错误
+// （如"今日已签到"）不算失败，只要随后的余额查询成功即视为成功。
+func (s *Scheduler) CheckinAccount(uid string) AccountResult {
+	a := s.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		return AccountResult{UID: uid, Detail: "账号不存在"}
+	}
+	if a.Snapshot().RefreshToken == "" {
+		return AccountResult{UID: uid, Detail: "账号缺少 refresh token"}
+	}
+	if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
+		// 已签到等业务错误也继续走余额查询，仅记录日志。
+		log.Printf("checkin %s: %v", uid, err)
+	}
+	if err := s.refreshAccountCredits(uid, a); err != nil {
+		return AccountResult{UID: uid, Detail: err.Error()}
+	}
+	return AccountResult{UID: uid, OK: true}
+}
+
+// KeepaliveAccount 对单个账号刷新 token，供控制台"单账号保活"使用。
+// 与 RunKeepaliveNow 的单账号分支一致：session 死亡时自动禁用该账号。
+func (s *Scheduler) KeepaliveAccount(uid string) AccountResult {
+	a := s.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		return AccountResult{UID: uid, Detail: "账号不存在"}
+	}
+	if a.Snapshot().RefreshToken == "" {
+		return AccountResult{UID: uid, Detail: "账号缺少 refresh token"}
+	}
+	if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+		log.Printf("keepalive %s: %v", uid, err)
+		var ue *upstream.Error
+		if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+			s.cfg.Pool.Disable(uid, "12153 session dead")
+		}
+		return AccountResult{UID: uid, Detail: err.Error()}
+	}
+	if err := a.SaveAtomic(); err != nil {
+		log.Printf("keepalive %s save: %v", uid, err)
+		return AccountResult{UID: uid, Detail: "凭证保存失败: " + err.Error()}
+	}
+	return AccountResult{UID: uid, OK: true}
 }
 
 // RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。

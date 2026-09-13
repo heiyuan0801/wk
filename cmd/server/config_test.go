@@ -158,6 +158,9 @@ func TestNewPoolConfigDefaults(t *testing.T) {
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		t.Errorf("upstash default should be empty: %+v", c.Upstash)
 	}
+	if c.SMSProxyCooldownDur.Minutes() != 30 {
+		t.Errorf("sms.proxy.cooldown=%v want 30m", c.SMSProxyCooldownDur)
+	}
 }
 
 func TestPoolConfigParsedFromFile(t *testing.T) {

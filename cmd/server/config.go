@@ -60,6 +60,53 @@ type Config struct {
 		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
 	} `json:"upstash"`
 
+	SMS struct {
+		// TwoCaptchaKey 是 2captcha 的 clientKey。仅在中国区短信直登遇到
+		// need_captcha 时使用；留空则该场景提示改用浏览器授权，不影响其他流程。
+		TwoCaptchaKey string `json:"two_captcha_key"`
+		// Proxy 把整条短信登录链路放到住宅代理后面：同一 IP 半小时内只能注册
+		// 一个号，多次注册会被上游风控。每次登录换一个随机粘性会话（sid），
+		// 天然拿到不同出口 IP；号池的日常 API 调用不走这个代理。
+		Proxy struct {
+			// URL 形如 http://用户名:密码@网关:端口。与 file 二选一；file 优先。
+			URL string `json:"url"`
+			// File 代理名单路径（每行 host:port:user:pass 或完整 URL）。
+			// 每次登录换一条，用过的条目进入 cooldown。
+			File string `json:"file"`
+			// Cooldown 同一条代理再次用于注册的最短间隔，默认 "30m"。
+			Cooldown string `json:"cooldown"`
+			// Region 可选 ISO 3166-1 两位码（如 HK）。仅在 inject_sid 时拼进用户名。
+			Region string `json:"region"`
+			// InjectSID 为 true 时按 1024proxy 约定改写用户名（每次登录换 sticky IP）。
+			// 普通静态代理必须为 false，否则账密会被改坏。
+			InjectSID bool `json:"inject_sid"`
+			// StickyMinutes 粘性时长 1-120，默认 30。一次登录十几个请求必须
+			// 落在同一个 IP 上，时长要盖过登录全程。
+			StickyMinutes int `json:"sticky_minutes"`
+		} `json:"proxy"`
+		// Haozhuma 豪猪接码平台（haozhuma.com），用于自动加号：取号 →
+		// 走本服务的短信直登链 → 收码 → 落盘账号。
+		Haozhuma struct {
+			// User / Pass 豪猪 API 账号密码（login 换 token 用）。
+			User string `json:"user"`
+			Pass string `json:"pass"`
+			// Token 已有 token 时直接用，跳过 login。
+			Token string `json:"token"`
+			// Sid 项目 ID。52283 = 腾讯科技[限对接]。
+			Sid string `json:"sid"`
+			// Author 「[限对接]」项目的对接方标识。留空则不下发。
+			// 注意：实测 52283 项目带 author=adminzfz 反而取不到号，默认留空。
+			Author string `json:"author"`
+			// UID 指定对接码（豪猪后台的"对接码 UID"）。一个 sid 下可能挂了
+			// 多个对接商，质量不一：不指定时平台随机分配，可能撞上没号的那个。
+			// 实测指定有号的对接码成功率 6/6，随机只有 3/6。
+			UID string `json:"uid"`
+			// ISP 取号运营商优先级：1=移动 2=联通 3=电信，逗号分隔依次降级，
+			// 最后自动退回"不限"。留空表示直接不限。
+			ISP string `json:"isp"`
+		} `json:"haozhuma"`
+	} `json:"sms"`
+
 	Postgres struct {
 		DSN              string `json:"dsn"`
 		MaxOpenConns     int    `json:"max_open_conns"`
@@ -90,6 +137,7 @@ type Config struct {
 	BreakerCooldownMaxD time.Duration `json:"-"`
 	SessionTTL          time.Duration `json:"-"`
 	SessionGCInterval   time.Duration `json:"-"`
+	SMSProxyCooldownDur time.Duration `json:"-"`
 	PostgresMaxLifetime time.Duration `json:"-"`
 	PostgresMaxIdleTime time.Duration `json:"-"`
 }
@@ -244,6 +292,12 @@ func (c *Config) normalize() error {
 	}
 	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
 		return fmt.Errorf("session_sticky.gc_interval: %w", err)
+	}
+	if strings.TrimSpace(c.SMS.Proxy.Cooldown) == "" {
+		c.SMS.Proxy.Cooldown = "30m"
+	}
+	if c.SMSProxyCooldownDur, err = time.ParseDuration(c.SMS.Proxy.Cooldown); err != nil {
+		return fmt.Errorf("sms.proxy.cooldown: %w", err)
 	}
 	if c.Postgres.ConnMaxLifetime == "" {
 		c.Postgres.ConnMaxLifetime = "30m"

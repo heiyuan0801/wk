@@ -59,28 +59,31 @@ type ModelCooldownStatus struct {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID                 string                         `json:"uid"`
-	Nickname            string                         `json:"nickname,omitempty"`
-	Region              string                         `json:"region"`
-	Credits             int64                          `json:"credits"`
-	CapacitySize        int64                          `json:"capacity_size,omitempty"`
-	CapacityRemain      int64                          `json:"capacity_remain,omitempty"`
-	CapacityUsed        int64                          `json:"capacity_used,omitempty"`
-	CycleCapacitySize   int64                          `json:"cycle_capacity_size,omitempty"`
-	CycleCapacityRemain int64                          `json:"cycle_capacity_remain,omitempty"`
-	CycleCapacityUsed   int64                          `json:"cycle_capacity_used,omitempty"`
-	CreditUpdatedAt     int64                          `json:"credit_updated_at,omitempty"`
-	Cooling             bool                           `json:"cooling"`
-	CoolKind            string                         `json:"cool_kind,omitempty"`
-	CoolRemaining       int64                          `json:"cool_remaining_sec,omitempty"`
-	Until               time.Time                      `json:"until,omitempty"`
-	Reason              string                         `json:"reason,omitempty"`
-	Disabled            bool                           `json:"disabled"`
-	ModelCooldowns      map[string]ModelCooldownStatus `json:"model_cooldowns,omitempty"`
-	SuccessCount        int64                          `json:"success_count,omitempty"`
-	ErrTotal            int64                          `json:"err_total,omitempty"`
-	LastSuccessTime     time.Time                      `json:"last_success,omitempty"`
-	LastErrTime         time.Time                      `json:"last_err,omitempty"`
+	UID                 string `json:"uid"`
+	Nickname            string `json:"nickname,omitempty"`
+	Region              string `json:"region"`
+	Credits             int64  `json:"credits"`
+	CapacitySize        int64  `json:"capacity_size,omitempty"`
+	CapacityRemain      int64  `json:"capacity_remain,omitempty"`
+	CapacityUsed        int64  `json:"capacity_used,omitempty"`
+	CycleCapacitySize   int64  `json:"cycle_capacity_size,omitempty"`
+	CycleCapacityRemain int64  `json:"cycle_capacity_remain,omitempty"`
+	CycleCapacityUsed   int64  `json:"cycle_capacity_used,omitempty"`
+	CreditUpdatedAt     int64  `json:"credit_updated_at,omitempty"`
+	// TokenExpiresAt 是 access token 到期时间（Unix 秒，0 = 未知）。只读观测字段，
+	// 供控制台提示凭证即将失效；不参与选号。
+	TokenExpiresAt  int64                          `json:"token_expires_at,omitempty"`
+	Cooling         bool                           `json:"cooling"`
+	CoolKind        string                         `json:"cool_kind,omitempty"`
+	CoolRemaining   int64                          `json:"cool_remaining_sec,omitempty"`
+	Until           time.Time                      `json:"until,omitempty"`
+	Reason          string                         `json:"reason,omitempty"`
+	Disabled        bool                           `json:"disabled"`
+	ModelCooldowns  map[string]ModelCooldownStatus `json:"model_cooldowns,omitempty"`
+	SuccessCount    int64                          `json:"success_count,omitempty"`
+	ErrTotal        int64                          `json:"err_total,omitempty"`
+	LastSuccessTime time.Time                      `json:"last_success,omitempty"`
+	LastErrTime     time.Time                      `json:"last_err,omitempty"`
 
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
@@ -618,11 +621,8 @@ func (p *Pool) pickForModelLocked(model string, tried map[string]bool) *auth.Aut
 		}
 	}
 	// 权重只算一次：顶 5 截断要排序，若在 sort 比较器里现算 weightOf 会翻成 O(n log n) 次
-	// 冗余浮点计算（46 账号约 500 次）。先做 O(n) 预计算，再按 (权重, uid) 排序。
-	type weighted struct {
-		e *entry
-		w float64
-	}
+	// 冗余浮点计算（46 账号约 500 次）。先做 O(n) 预计算，再按 (权重, uid) 排序；
+	// 后面的加权抽签复用这份权重，不再按候选子集重算。
 	ws := make([]weighted, len(cands))
 	for i, e := range cands {
 		ws[i] = weighted{e: e, w: p.weightOf(e, maxCredits, now)}
@@ -643,24 +643,24 @@ func (p *Pool) pickForModelLocked(model string, tried map[string]bool) *auth.Aut
 		cands = cands[:5]
 	}
 
-	eligible := make([]*entry, 0, len(cands))
-	for _, e := range cands {
-		if now.Sub(e.lastUsed) >= minPickGap {
-			eligible = append(eligible, e)
+	eligible := make([]weighted, 0, len(cands))
+	for _, c := range ws[:len(cands)] {
+		if now.Sub(c.e.lastUsed) >= minPickGap {
+			eligible = append(eligible, c)
 		}
 	}
 	var e *entry
 	if len(eligible) == 0 {
 		// Top5 全部刚被用过时，先从完整健康候选集扩散，避免在高并发
 		// 下反复命中 Top5 中同一个 LRU 账号。
-		expanded := make([]*entry, 0, len(allCands))
-		for _, c := range allCands {
-			if now.Sub(c.lastUsed) >= minPickGap {
+		expanded := make([]weighted, 0, len(ws))
+		for _, c := range ws {
+			if now.Sub(c.e.lastUsed) >= minPickGap {
 				expanded = append(expanded, c)
 			}
 		}
 		if len(expanded) > 0 {
-			e = p.pickWeighted(expanded)
+			e = p.pickWeightedPrepared(expanded)
 		} else {
 			// 所有健康账号都在窗口内：从完整候选集选择全局 LRU。
 			e = allCands[0]
@@ -671,7 +671,7 @@ func (p *Pool) pickForModelLocked(model string, tried map[string]bool) *auth.Aut
 			}
 		}
 	} else {
-		e = p.pickWeighted(eligible) // eligible 保序 = top5 降序子集
+		e = p.pickWeightedPrepared(eligible)
 	}
 	p.markUsedLocked(e)
 	return e.a
@@ -745,6 +745,14 @@ func (p *Pool) inFlightFull(e *entry) bool {
 // 生产默认 100ms；纯加权分布测试可临时置 0 关闭防撞号。
 var minPickGap = 100 * time.Millisecond
 
+// weighted 是选号路径上的「账号 + 已算好的三因子权重」。
+// 权重必须按「当前健康候选集的 maxCredits」算一次后带着走：抽签若按短名单
+// 重新归一化，低积分号进 Top5 后会被抬成 1.0，和排序口径不一致。
+type weighted struct {
+	e *entry
+	w float64
+}
+
 // pickWeighted 三因子加权随机（claude-api selectWeightedRandom 参考口径）：
 //
 //		weight = credits 比例 × 10 + idleWeight + successRate × 3
@@ -764,13 +772,20 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 			maxCredits = e.credits
 		}
 	}
+	prepared := make([]weighted, len(cands))
+	for i, e := range cands {
+		prepared[i] = weighted{e: e, w: p.weightOf(e, maxCredits, now)}
+	}
+	return p.pickWeightedPrepared(prepared)
+}
 
+// pickWeightedPrepared 用已经算好的权重做定点抽签，避免 Top5 截断后再扫一遍候选集。
+func (p *Pool) pickWeightedPrepared(cands []weighted) *entry {
 	const scale = 1_000_000 // 定点放大：int64 累加权重大整数抽签
 	weights := make([]int64, len(cands))
 	var total int64
-	for i, e := range cands {
-		w := p.weightOf(e, maxCredits, now)
-		weights[i] = int64(w * scale)
+	for i, c := range cands {
+		weights[i] = int64(c.w * scale)
 		total += weights[i]
 	}
 
@@ -779,17 +794,17 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 		rnd = p.randInt64N
 	}
 	if total <= 0 {
-		return cands[int(rnd(int64(len(cands))))]
+		return cands[int(rnd(int64(len(cands))))].e
 	}
 	r := rnd(total)
 	var acc int64
-	for i, e := range cands {
+	for i, c := range cands {
 		acc += weights[i]
 		if r < acc {
-			return e
+			return c.e
 		}
 	}
-	return cands[len(cands)-1]
+	return cands[len(cands)-1].e
 }
 
 // weightOf 计算单个账号的三因子权重。
@@ -1010,6 +1025,34 @@ func (p *Pool) Remove(uid string) (removed, busy bool) {
 	return true, false
 }
 
+// ClearCooldown 手动清除账号级/模型级冷却与熔断，并把连续失败计数归零。
+//
+// 与 reviveCoolingLocked（签到自动解冻）的关键差异：签到只清冷却、**有意不动熔断**
+// （签到仅证明 billing 通道健康，不证明 chat 通道健康）；而本方法是运维人工干预，
+// 语义是"我确认这个账号现在没问题"，因此冷却、熔断、退避计数一并复位。
+// 不动 disabled —— 那是 Enable 的职责。
+// 返回 false 表示 uid 不在池中（调用方可据此回 404）。
+func (p *Pool) ClearCooldown(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.until = time.Time{}
+	e.coolKind = 0
+	e.modelCooldowns = nil
+	e.breakerUntil = time.Time{}
+	e.fails = 0
+	e.retryCount = 0
+	// 未禁用时 reason 就是冷却文案；已禁用时 reason 是禁用原因，不能清。
+	if !e.disabled {
+		e.reason = ""
+	}
+	p.dirty.Store(true)
+	return true
+}
+
 // reviveCoolingLocked 只清冷却（until/coolKind/reason）并更新 credits，不动熔断器
 // （fails/retryCount/breakerUntil）。签到解冻走这里：签到成功只证明余额恢复与
 // billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx 信号）不应被签到覆盖。
@@ -1226,6 +1269,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		CycleCapacitySize:   e.cycleCapacitySize,
 		CycleCapacityRemain: e.cycleCapacityRemain,
 		CycleCapacityUsed:   e.cycleCapacityUsed,
+		TokenExpiresAt:      e.a.Snapshot().ExpiresAt,
 		Cooling:             now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:              e.reason,
 		Disabled:            e.disabled,

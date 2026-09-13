@@ -16,7 +16,9 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
+	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/session"
+	"workbuddy2api/internal/smslogin"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -55,6 +57,56 @@ func TestReadRequestBodyDetectsLimit(t *testing.T) {
 	got, tooLarge, err := readRequestBody(req)
 	if err != nil || !tooLarge || got != nil {
 		t.Fatalf("readRequestBody = (%d bytes, tooLarge=%v, err=%v)", len(got), tooLarge, err)
+	}
+}
+
+// TestProxyStatusEndpoint 代理池页依赖这个端点：未配置时要明确报"直连"，
+// 而不是返回空对象让前端猜；配置后要给出池内容量与冷却明细，且不带密码。
+func TestProxyStatusEndpoint(t *testing.T) {
+	// 未配置 SMSLogin：明确说未启用。
+	h := NewHandler(Config{})
+	rec := httptest.NewRecorder()
+	h.proxyStatus(rec, httptest.NewRequest(http.MethodGet, "/admin/proxy/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d", rec.Code)
+	}
+	var disabled map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &disabled); err != nil {
+		t.Fatal(err)
+	}
+	if disabled["enabled"] != false {
+		t.Fatalf("enabled=%v want false", disabled["enabled"])
+	}
+	if disabled["reason"] == nil || disabled["reason"] == "" {
+		t.Fatal("disabled response must explain why")
+	}
+
+	// 配了代理池：给出明细。
+	pool, err := smslogin.NewPoolDialer([]string{"1.1.1.1:1:alice:SECRETPW"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := smslogin.NewManager(smslogin.Endpoints{}, time.Minute)
+	m.SetProxyDialer(pool)
+	h2 := NewHandler(Config{SMSLogin: m})
+	rec2 := httptest.NewRecorder()
+	h2.proxyStatus(rec2, httptest.NewRequest(http.MethodGet, "/admin/proxy/status", nil))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec2.Code, rec2.Body.String())
+	}
+	body := rec2.Body.String()
+	if strings.Contains(body, "SECRETPW") {
+		t.Fatalf("proxy status leaked the password: %s", body)
+	}
+	var enabled map[string]any
+	if err := json.Unmarshal([]byte(body), &enabled); err != nil {
+		t.Fatal(err)
+	}
+	if enabled["enabled"] != true || enabled["mode"] != "pool" {
+		t.Fatalf("enabled=%v mode=%v", enabled["enabled"], enabled["mode"])
+	}
+	if enabled["endpoints"] != float64(1) {
+		t.Fatalf("endpoints=%v want 1", enabled["endpoints"])
 	}
 }
 
@@ -964,6 +1016,87 @@ func TestAdminAccountActions(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/account/u1/enable", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("missing enable code=%d body=%s", rec.Code, rec.Body)
+	}
+}
+
+func TestAdminClearCooldownAction(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at"})
+	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足")
+	h := NewHandler(Config{Pool: p})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/account/u1/clear-cooldown", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear-cooldown code=%d body=%s", rec.Code, rec.Body)
+	}
+	st, _ := p.Status("u1")
+	if st.Cooling {
+		t.Fatalf("cooling should be cleared: %+v", st)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/account/missing/clear-cooldown", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing clear-cooldown code=%d body=%s", rec.Code, rec.Body)
+	}
+}
+
+func TestAdminCheckinAndKeepaliveAccount(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at"})
+	var checked, kept string
+	h := NewHandler(Config{
+		Pool: p,
+		CheckinAccount: func(uid string) scheduler.AccountResult {
+			checked = uid
+			return scheduler.AccountResult{UID: uid, OK: true}
+		},
+		KeepaliveAccount: func(uid string) scheduler.AccountResult {
+			kept = uid
+			return scheduler.AccountResult{UID: uid, Detail: "upstream 401"}
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/account/u1/checkin", nil))
+	if rec.Code != http.StatusOK || checked != "u1" {
+		t.Fatalf("checkin code=%d checked=%q body=%s", rec.Code, checked, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"ok":true`) {
+		t.Fatalf("checkin body should report ok=true: %s", rec.Body)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/account/u1/keepalive", nil))
+	if rec.Code != http.StatusOK || kept != "u1" {
+		t.Fatalf("keepalive code=%d kept=%q body=%s", rec.Code, kept, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"ok":false`) {
+		t.Fatalf("keepalive body should report ok=false: %s", rec.Body)
+	}
+}
+
+func TestAdminCheckinUnavailableWithNilCallback(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at"})
+	h := NewHandler(Config{Pool: p})
+	for _, path := range []string{"/admin/account/u1/checkin", "/admin/account/u1/keepalive"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", path, nil))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s code=%d body=%s", path, rec.Code, rec.Body)
+		}
+	}
+}
+
+func TestStatusTokenExpiresAtExposed(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 1893456000})
+	h := NewHandler(Config{Pool: p})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	if rec.Code != 200 {
+		t.Fatalf("status code=%d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"token_expires_at":1893456000`) {
+		t.Fatalf("status should expose token_expires_at: %s", rec.Body)
 	}
 }
 

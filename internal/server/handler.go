@@ -24,8 +24,11 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/session"
+	"workbuddy2api/internal/smslogin"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -41,9 +44,21 @@ type Config struct {
 	LoginBin           string // OAuth 登录辅助程序路径
 	CheckinNow         func()
 	CreditRefreshNow   func()
-	UpdateSchedule     func(checkinHours, keepaliveHours []int)
 	UpdateLogRetention func(days int)
-	MaxRotate          int // 单请求最多换号次数，默认 3
+	// CheckinAccount / KeepaliveAccount 按单账号执行签到/保活，供控制台手动触发。
+	CheckinAccount   func(uid string) scheduler.AccountResult
+	KeepaliveAccount func(uid string) scheduler.AccountResult
+	// SMSLogin 短信直登（中国区）。nil = 关闭该入口，控制台回退到 OAuth 链接。
+	SMSLogin *smslogin.Manager
+	// HaozhumaClient 豪猪接码客户端（可选）。配置了 sms.haozhuma 时由 main
+	// 注入；NewHandler 内部用它组装 AutoEnroll（persist/find 回调指向 handler）。
+	HaozhumaClient *haozhuma.Client
+	// HaozhumaSid 豪猪项目 ID（如 52283 腾讯科技[限对接]）。
+	HaozhumaSid string
+	// AutoEnroll 豪猪自动加号（NewHandler 内部组装）。nil = 未启用该端点。
+	AutoEnroll     *AutoEnroller
+	UpdateSchedule func(checkinHours, keepaliveHours []int)
+	MaxRotate      int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -148,9 +163,37 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/credits/refresh", h.withFrontend(h.refreshCredits))
 	h.mux.HandleFunc("POST /admin/account/url", h.withFrontend(h.accountURL))
 	h.mux.HandleFunc("POST /admin/account/poll", h.withFrontend(h.accountPoll))
+	// 短信直登：发码 + 验码落盘，省掉浏览器授权。
+	h.mux.HandleFunc("POST /admin/account/sms/send", h.withFrontend(h.accountSMSSend))
+	h.mux.HandleFunc("POST /admin/account/sms/verify", h.withFrontend(h.accountSMSVerify))
+	h.mux.HandleFunc("POST /admin/account/sms/captcha", h.withFrontend(h.accountSMSSubmitCaptcha))
+	h.mux.HandleFunc("POST /admin/account/sms/auto-enroll", h.withFrontend(h.accountSMSAutoEnroll))
+	h.mux.HandleFunc("GET /admin/account/sms/auto-enroll", h.withFrontend(h.accountSMSAutoEnrollStatus))
+	h.mux.HandleFunc("POST /admin/account/sms/auto-enroll/stop", h.withFrontend(h.accountSMSAutoEnrollStop))
+	h.mux.HandleFunc("GET /admin/proxy/status", h.withFrontend(h.proxyStatus))
 	h.mux.HandleFunc("POST /admin/account/{uid}/enable", h.withFrontend(h.enableAccount))
 	h.mux.HandleFunc("POST /admin/account/{uid}/disable", h.withFrontend(h.disableAccount))
+	h.mux.HandleFunc("POST /admin/account/{uid}/clear-cooldown", h.withFrontend(h.clearCooldownAccount))
+	h.mux.HandleFunc("POST /admin/account/{uid}/checkin", h.withFrontend(h.checkinAccount))
+	h.mux.HandleFunc("POST /admin/account/{uid}/keepalive", h.withFrontend(h.keepaliveAccount))
 	h.mux.HandleFunc("DELETE /admin/account/{uid}", h.withFrontend(h.deleteAccount))
+	// 自动加号：豪猪取号→短信直登→落盘。persist/find 回调指向本 handler，
+	// 必须在 NewHandler 里组装（main 那边拿不到方法值）。
+	if cfg.HaozhumaClient != nil && cfg.SMSLogin != nil && cfg.HaozhumaSid != "" {
+		h.cfg.AutoEnroll = NewAutoEnroller(
+			cfg.SMSLogin, cfg.HaozhumaClient, cfg.HaozhumaSid,
+			func(cred accountCredential, region string) (map[string]any, int, error) {
+				return h.persistAccount(cred, region)
+			},
+			func(mobile string) (string, bool) {
+				st, ok := h.findAccountByMobile(mobile)
+				if !ok {
+					return "", false
+				}
+				return st.Nickname, true
+			},
+		)
+	}
 	// Static console assets are served from the image's frontend directory.
 	h.mux.Handle("/", http.FileServer(http.Dir("frontend")))
 	return h
@@ -378,7 +421,7 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		retentionDays = *req.RequestLogs.RetentionDays
 	}
 	if retentionDays < 0 || retentionDays > 3650 {
-		writeJSON(w, 400, map[string]string{"error": "request_logs.retention_days must be between 0 and 3650"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request_logs.retention_days must be between 0 and 3650"})
 		return
 	}
 	schedule := map[string]any{"checkin_hours": checkinHours, "keepalive_hours": keepaliveHours}
@@ -540,14 +583,13 @@ func (h *Handler) loginRegion(r *http.Request) (string, error) {
 }
 
 func (h *Handler) loginPortal(r *http.Request, region string) (string, error) {
-	portal := "codebuddy"
 	if region == "global" {
 		return "global", nil
 	}
 	if raw := strings.TrimSpace(r.URL.Query().Get("portal")); raw != "" {
 		return normalizeLoginPortal(raw)
 	}
-	return portal, nil
+	return "codebuddy", nil
 }
 
 func (h *Handler) loginCommand(ctx context.Context, arg, region, portal string) ([]byte, error) {
@@ -643,27 +685,77 @@ func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
 		// host is necessary because account.Region() drives every later request.
 		result.Domain = "www.workbuddy.ai"
 	}
-	if filepath.Base(result.UID) != result.UID || strings.ContainsAny(result.UID, `/\`) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "授权返回的 UID 无效"})
+	response, status, err := h.persistAccount(accountCredential{
+		UID:          result.UID,
+		Nickname:     result.Nickname,
+		EnterpriseID: result.EnterpriseID,
+		Domain:       result.Domain,
+		AccessToken:  result.AccessToken,
+		RefreshToken: result.RefreshToken,
+		ExpiresIn:    result.ExpiresIn,
+	}, region)
+	if err != nil {
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
+	}
+	writeJSON(w, status, response)
+}
+
+// accountCredential 是新增账号的落盘输入，OAuth 与短信直登共用。
+type accountCredential struct {
+	UID          string
+	Nickname     string
+	EnterpriseID string
+	Domain       string
+	AccessToken  string
+	RefreshToken string
+	ExpiresIn    int64
+}
+
+// persistAccount 把一份新凭证写入 auths/、热加载进账号池，并按需把配置提升为
+// 混合区域。返回控制台响应体与 HTTP 状态码；err 非 nil 时 status 为其对应码。
+//
+// region 是本次登录所属区域，仅用于决定是否要把 config.region 提升为 all。
+func (h *Handler) persistAccount(cred accountCredential, region string) (map[string]any, int, error) {
+	if filepath.Base(cred.UID) != cred.UID || strings.ContainsAny(cred.UID, `/\`) {
+		return nil, http.StatusBadRequest, errors.New("授权返回的 UID 无效")
 	}
 	if err := os.MkdirAll(h.cfg.AuthDir, 0700); err != nil {
-		writeJSON(w, 500, map[string]string{"error": err.Error()})
-		return
+		return nil, 500, err
 	}
 	expiresAt := int64(0)
-	if result.ExpiresIn > 0 {
-		expiresAt = time.Now().Unix() + result.ExpiresIn
+	if cred.ExpiresIn > 0 {
+		expiresAt = time.Now().Unix() + cred.ExpiresIn
 	}
-	doc := map[string]any{"auth": map[string]any{"accessToken": result.AccessToken, "refreshToken": result.RefreshToken, "expiresAt": expiresAt, "domain": result.Domain}, "account": map[string]any{"uid": result.UID, "enterpriseId": result.EnterpriseID, "nickname": result.Nickname}}
+	doc := map[string]any{
+		"auth": map[string]any{
+			"accessToken": cred.AccessToken, "refreshToken": cred.RefreshToken,
+			"expiresAt": expiresAt, "domain": cred.Domain,
+		},
+		"account": map[string]any{
+			"uid": cred.UID, "enterpriseId": cred.EnterpriseID, "nickname": cred.Nickname,
+		},
+	}
 	raw, _ := json.MarshalIndent(doc, "", "  ")
-	path := filepath.Join(h.cfg.AuthDir, "workbuddy-"+result.UID+".json")
+	path := filepath.Join(h.cfg.AuthDir, "workbuddy-"+cred.UID+".json")
 	if err := writeFileAtomic(path, append(raw, '\n'), 0600); err != nil {
-		writeJSON(w, 500, map[string]string{"error": err.Error()})
-		return
+		return nil, 500, err
 	}
+
 	loadedMixed := false
+	responseExisted := false
+	existedDisabled := false
 	if h.cfg.Pool != nil {
+		// 重新登录已有账号时 upsert 只换凭证、保留 disabled/cooling 状态。
+		// 若该账号此前被禁用，重登后依然不接流量，必须明确告知，否则用户
+		// 以为登录成功却始终用不上。
+		existed := h.cfg.Pool.AuthByUID(cred.UID) != nil
+		if existed {
+			responseExisted = true
+			if st, ok := h.cfg.Pool.Status(cred.UID); ok && st.Disabled {
+				existedDisabled = true
+			}
+		}
 		if loaded, loadErr := auth.LoadDir(h.cfg.AuthDir, auth.RegionAll); loadErr == nil {
 			regions := make(map[string]struct{}, 2)
 			for _, loadedAuth := range loaded {
@@ -672,19 +764,31 @@ func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
 			loadedMixed = len(regions) > 1
 			h.cfg.Pool.SyncToDir(loaded)
 		} else {
-			log.Printf("account poll: reload auths failed: %v", loadErr)
+			log.Printf("account add: reload auths failed: %v", loadErr)
 		}
 		h.cfg.Pool.Add(&auth.Auth{
-			AccessToken: result.AccessToken, RefreshToken: result.RefreshToken, ExpiresAt: expiresAt,
-			Domain: result.Domain, UID: result.UID, EnterpriseID: result.EnterpriseID,
-			Nickname: result.Nickname, FilePath: path,
+			AccessToken: cred.AccessToken, RefreshToken: cred.RefreshToken, ExpiresAt: expiresAt,
+			Domain: cred.Domain, UID: cred.UID, EnterpriseID: cred.EnterpriseID,
+			Nickname: cred.Nickname, FilePath: path,
 		})
 	}
 	// A newly added account may expose a different regional model catalogue.
 	// Force the next /models request to fetch with the expanded pool.
 	invalidateDynamicModelsCache()
 
-	response := map[string]any{"ok": true, "uid": result.UID, "nickname": result.Nickname, "region": region}
+	response := map[string]any{"ok": true, "uid": cred.UID, "nickname": cred.Nickname, "region": region}
+	if responseExisted {
+		// 让控制台区分"新增账号"与"刷新已有账号凭证"。
+		response["existed"] = true
+		if existedDisabled {
+			// upsert 有意保留 disabled，重登不会自动启用；必须提示，
+			// 否则用户会以为登录成功却始终用不上这个账号。
+			response["disabled"] = true
+			response["notice"] = "该账号已在号池中，凭证已更新；但它当前处于禁用状态，需要在账号列表中手动启用后才会接流量。"
+		} else {
+			response["notice"] = "该账号已在号池中，凭证已更新（积分与冷却状态保持不变）。"
+		}
+	}
 	var configErr error
 	if loadedMixed {
 		configErr = h.promoteMixedRegion()
@@ -696,7 +800,307 @@ func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
 		// so an unwritable config mount does not hide the restart persistence fix.
 		response["warning"] = "账号已添加，但混合区域配置未能保存：" + configErr.Error()
 	}
-	writeJSON(w, http.StatusOK, response)
+	return response, http.StatusOK, nil
+}
+
+// findAccountByMobile 在账号池里按手机号找已存在的中国区账号。
+// 中国区账号的 nickname 就是运营商号码本身（无区号），所以两边都取国内号码再比。
+// 找到时返回账号状态与 true；池为空或未匹配返回零值与 false。
+func (h *Handler) findAccountByMobile(mobile string) (pool.Status, bool) {
+	if h.cfg.Pool == nil {
+		return pool.Status{}, false
+	}
+	want := smslogin.NationalNumber(mobile)
+	if want == "" {
+		return pool.Status{}, false
+	}
+	for _, st := range h.cfg.Pool.List() {
+		if st.Region != "" && st.Region != "cn" {
+			continue
+		}
+		if smslogin.NationalNumber(st.Nickname) == want {
+			return st, true
+		}
+	}
+	return pool.Status{}, false
+}
+
+// accountSMSSend 短信直登第一步：向指定手机号下发 OneID 短信验证码。
+// 返回 session_id，验码时凭它取回本次登录的中间状态。
+func (h *Handler) accountSMSSend(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.SMSLogin == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "短信登录未启用"})
+		return
+	}
+	var req struct {
+		Mobile string `json:"mobile"`
+		Region string `json:"region"`
+		// Force 表示用户已确认"该号码已在号池中，仍要重新登录"。
+		Force bool `json:"force"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
+		return
+	}
+	region, err := normalizeLoginRegion(req.Region)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	// 手机号已在号池中时先提示、不发短信：发一条短信是有成本的，而"已经有这个
+	// 账号"通常意味着用户没必要重登。确认后带 force 再来，才真正走发码。
+	// 注意必须在 Send 之前判断——发完码再提示等于白白消耗一条短信。
+	if !req.Force {
+		if st, ok := h.findAccountByMobile(req.Mobile); ok {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":    "该手机号已在号池中",
+				"existing": true,
+				"uid":      st.UID,
+				"nickname": st.Nickname,
+				"region":   st.Region,
+				"disabled": st.Disabled,
+			})
+			return
+		}
+	}
+	// 手机号与验证码属于敏感输入，失败原因要回给用户，但绝不写进日志。
+	res, err := h.cfg.SMSLogin.Send(r.Context(), req.Mobile, region)
+	if err != nil {
+		writeJSON(w, smsLoginStatus(err), smsLoginErrorBody(err))
+		return
+	}
+	writeJSON(w, http.StatusOK, smsSendBody(res))
+}
+
+// smsSendBody 统一发码回执。被要求人机校验时也要回 200：会话已经建立、
+// 用户只需要接着在界面上过码，这不是错误。
+func smsSendBody(res smslogin.SendResult) map[string]any {
+	body := map[string]any{
+		"ok": true, "session_id": res.SessionID, "mobile": res.Mobile,
+		"status": res.Status, "expires_in": res.ExpiresIn, "region": res.Region,
+	}
+	if res.Captcha != nil {
+		body["captcha"] = res.Captcha
+	}
+	return body
+}
+
+// accountSMSSubmitCaptcha 接收用户在界面上完成的人机校验结果，继续发码。
+//
+// 上游只认 captchaVerification 这个对象，不区分票据来自打码平台还是真人操作，
+// 所以这里与自动过码共用同一条回灌路径。
+func (h *Handler) accountSMSSubmitCaptcha(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.SMSLogin == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "短信登录未启用"})
+		return
+	}
+	var req struct {
+		SessionID string `json:"session_id"`
+		Ticket    string `json:"ticket"`
+		RandStr   string `json:"rand_str"`
+		CloudType string `json:"cloud_type"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
+		return
+	}
+	res, err := h.cfg.SMSLogin.SubmitCaptcha(r.Context(), req.SessionID, req.Ticket, req.RandStr, req.CloudType)
+	if err != nil {
+		writeJSON(w, smsLoginStatus(err), smsLoginErrorBody(err))
+		return
+	}
+	writeJSON(w, http.StatusOK, smsSendBody(res))
+}
+
+// accountSMSVerify 短信直登第二步：校验验证码，走完全部上游步骤并把账号落盘。
+func (h *Handler) accountSMSVerify(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.SMSLogin == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "短信登录未启用"})
+		return
+	}
+	var req struct {
+		SessionID string `json:"session_id"`
+		Code      string `json:"code"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
+		return
+	}
+	creds, err := h.cfg.SMSLogin.Verify(r.Context(), req.SessionID, req.Code)
+	if err != nil {
+		writeJSON(w, smsLoginStatus(err), smsLoginErrorBody(err))
+		return
+	}
+	response, status, err := h.persistAccount(accountCredential{
+		UID:          creds.UID,
+		Nickname:     creds.Nickname,
+		EnterpriseID: creds.EnterpriseID,
+		Domain:       creds.Domain,
+		AccessToken:  creds.AccessToken,
+		RefreshToken: creds.RefreshToken,
+		ExpiresIn:    creds.ExpiresIn,
+	}, creds.Region)
+	if err != nil {
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, status, response)
+}
+
+// accountSMSAutoEnroll 豪猪自动加号：后台循环"取号→发码→收码→验码落盘"。
+// POST {"count": N, "workers": M} 启动；同一时刻只允许一个任务在跑。
+// workers 并发数 1-8，默认 3（每个号一个独立代理出口，共享同一个号池）。
+// accountSMSAutoEnrollStop 停止正在跑的自动加号任务。
+//
+// 没有这个端点时只能重启容器才能停下一个跑偏的任务（例如对接商全是空号，
+// 循环一直在取号失败）。已在途的号会由各自的超时收尾，不会落半截账号。
+func (h *Handler) accountSMSAutoEnrollStop(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.AutoEnroll == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "自动加号未启用"})
+		return
+	}
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	// body 可选：没有 body 也能停。
+	_ = json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&req)
+
+	if !h.cfg.AutoEnroll.Stop(req.Reason) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "note": "当前没有正在运行的任务"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "note": "已请求停止，正在收尾"})
+}
+
+// proxyStatus 导出登录代理池状态，供「代理池」页展示。
+//
+// 只报告配置与冷却情况，**绝不返回代理密码**：这些凭据对控制台没有
+// 使用价值，但会留在浏览器历史/日志里。
+func (h *Handler) proxyStatus(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.SMSLogin == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "reason": "短信直登未启用"})
+		return
+	}
+	st := h.cfg.SMSLogin.ProxyStatus()
+	if st == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled": false,
+			"reason":  "未配置登录代理（直连模式）",
+		})
+		return
+	}
+	st["enabled"] = true
+	writeJSON(w, http.StatusOK, st)
+}
+
+// accountSMSAutoEnroll 启动自动加号任务。
+func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.SMSLogin == nil || h.cfg.AutoEnroll == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "自动加号未启用（缺少豪猪配置）"})
+		return
+	}
+	var req struct {
+		Count   int `json:"count"`
+		Workers int `json:"workers"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
+		return
+	}
+	if req.Count < 1 || req.Count > 50 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "count 需在 1-50 之间"})
+		return
+	}
+	if req.Workers < 0 || req.Workers > 8 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "workers 需在 1-8 之间（不填默认 3）"})
+		return
+	}
+	if err := h.cfg.AutoEnroll.AutoRun(req.Count, req.Workers); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"ok":      true,
+		"count":   req.Count,
+		"workers": req.Workers,
+		"note":    "任务已在后台运行，用 GET /admin/account/sms/auto-enroll 查看进度",
+	})
+}
+
+// accountSMSAutoEnrollStatus 查询自动加号进度。
+func (h *Handler) accountSMSAutoEnrollStatus(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.AutoEnroll == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "自动加号未启用"})
+		return
+	}
+	st := h.cfg.AutoEnroll.Status()
+	body := map[string]any{
+		"running": st.Running, "attempts": st.Attempts,
+		"ok": st.OK, "fail": st.Fail, "logs": st.Logs,
+		"consumed": st.Consumed,
+	}
+	if st.Workers > 0 {
+		body["workers"] = st.Workers
+	}
+	// 终止原因（余额不足/熔断/无号可取）：控制台据此提示用户，别只显示 0 成功。
+	if st.StopReason != "" {
+		body["stop_reason"] = st.StopReason
+	}
+	// 余额：任务开始前能看出钱还够不够，失败也不用翻后台。
+	if bal, err := h.cfg.AutoEnroll.Balance(r.Context()); err == nil && bal >= 0 {
+		body["balance"] = bal
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// smsLoginStatus 把登录失败映射到 HTTP 状态码：会话失效用 410，其余上游/参数
+// 问题用 502 或 400，便于控制台区分"重发验证码"与"直接报错"。
+func smsLoginStatus(err error) int {
+	switch {
+	case errors.Is(err, smslogin.ErrSessionNotFound):
+		return http.StatusGone
+	case errors.Is(err, smslogin.ErrSessionBusy):
+		return http.StatusConflict
+	case errors.Is(err, smslogin.ErrGlobalUnsupported):
+		return http.StatusBadRequest
+	}
+	var ue *smslogin.Error
+	if errors.As(err, &ue) {
+		switch ue.Step {
+		case "发送验证码", "校验验证码", "读取账号", "人机校验":
+			return http.StatusBadRequest
+		}
+		return http.StatusBadGateway
+	}
+	return http.StatusBadRequest
+}
+
+// smsLoginErrorBody 组装错误响应，并带上 retryable 让前端决定是保留当前会话
+// （验证码填错，直接重填即可）还是清空状态要求重新发码。
+func smsLoginErrorBody(err error) map[string]any {
+	body := map[string]any{"error": err.Error(), "retryable": false}
+	var ue *smslogin.Error
+	if errors.As(err, &ue) && ue.Retryable {
+		body["retryable"] = true
+	}
+	switch {
+	case errors.Is(err, smslogin.ErrCodeWrong):
+		body["reason"] = "code_wrong"
+	case errors.Is(err, smslogin.ErrTooFrequent):
+		body["reason"] = "too_frequent"
+	case errors.Is(err, smslogin.ErrSessionNotFound):
+		body["reason"] = "session_expired"
+	case errors.Is(err, smslogin.ErrSessionBusy):
+		body["reason"] = "busy"
+	case errors.Is(err, smslogin.ErrCaptchaPending):
+		body["reason"] = "captcha_pending"
+	case errors.Is(err, smslogin.ErrCaptchaIncomplete):
+		body["reason"] = "captcha_incomplete"
+	}
+	if ue != nil && ue.Step == "取回凭证" && ue.Retryable {
+		body["reason"] = "ticket_pending"
+	}
+	return body
 }
 
 // promoteMixedRegionIfNeeded keeps both CN and global credentials available
@@ -802,6 +1206,48 @@ func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	h.cfg.Pool.Flush()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "message": "账号已删除"})
+}
+
+func (h *Handler) clearCooldownAccount(w http.ResponseWriter, r *http.Request) {
+	uid := strings.TrimSpace(r.PathValue("uid"))
+	if uid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "账号 UID 不能为空"})
+		return
+	}
+	if h.cfg.Pool == nil || !h.cfg.Pool.ClearCooldown(uid) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "账号不存在"})
+		return
+	}
+	h.cfg.Pool.Flush()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "message": "冷却与熔断已清除"})
+}
+
+func (h *Handler) checkinAccount(w http.ResponseWriter, r *http.Request) {
+	uid := strings.TrimSpace(r.PathValue("uid"))
+	if uid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "账号 UID 不能为空"})
+		return
+	}
+	if h.cfg.CheckinAccount == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "签到服务不可用"})
+		return
+	}
+	res := h.cfg.CheckinAccount(uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": res.OK, "uid": res.UID, "detail": res.Detail})
+}
+
+func (h *Handler) keepaliveAccount(w http.ResponseWriter, r *http.Request) {
+	uid := strings.TrimSpace(r.PathValue("uid"))
+	if uid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "账号 UID 不能为空"})
+		return
+	}
+	if h.cfg.KeepaliveAccount == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "保活服务不可用"})
+		return
+	}
+	res := h.cfg.KeepaliveAccount(uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": res.OK, "uid": res.UID, "detail": res.Detail})
 }
 
 func (h *Handler) removeAccountFile(uid string, account *auth.Auth) error {
@@ -942,12 +1388,7 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, metrics)
 		return
 	}
-	durations := map[string]time.Duration{
-		"24h": 24 * time.Hour,
-		"7d":  7 * 24 * time.Hour,
-		"30d": 30 * 24 * time.Hour,
-		"90d": 90 * 24 * time.Hour,
-	}
+	durations := map[string]time.Duration{"24h": 24 * time.Hour, "7d": 7 * 24 * time.Hour, "30d": 30 * 24 * time.Hour, "90d": 90 * 24 * time.Hour}
 	duration, ok := durations[rangeName]
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"code": "invalid_stats_range", "message": "range must be one of 24h, 7d, 30d, 90d, all"}})
@@ -2248,7 +2689,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.creditsConsumed = credits
 				st.creditSource = "upstream"
 			}
-			if responseID := stats.ResponseID(); responseID != "" && upstreamHeaderID == "" {
+			if responseID := stats.ResponseID(); responseID != "" {
 				st.id = responseID
 			}
 			rc.Close()
@@ -2277,7 +2718,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		usageStats(resp, st)
-		if responseID := upstream.ResponseID(resp); responseID != "" && upstreamHeaderID == "" {
+		if responseID := upstream.ResponseID(resp); responseID != "" {
 			st.id = responseID
 			if w.Header().Get("X-Request-Id") == "" {
 				w.Header().Set("X-Request-Id", responseID)

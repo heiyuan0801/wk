@@ -51,5 +51,22 @@
     "enabled": true,
     "ttl": "30m",
     "gc_interval": "5m"
+  },
+  "sms": {
+    "two_captcha_key": "",
+    "proxy": {
+      "url": "",
+      "file": "",
+      "cooldown": "30m",
+      "region": "",
+      "inject_sid": false,
+      "sticky_minutes": 30
+    },
+    "haozhuma": {
+      "user": "",
+      "pass": "",
+      "token": "",
+      "sid": ""
+    }
   }
 }

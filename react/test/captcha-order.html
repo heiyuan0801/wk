@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8" /><title>order probe</title></head>
+<body>
+<div id="out">running…</div>
+<script type="module">
+import { orderCaptchaOptions } from '/assets/captcha-probe.js';
+const out = [];
+// 上游实测顺序：teg 在前。必须把 tencent 提前。
+const live = [
+  { appId: '2053989439', cloudType: 'teg' },
+  { appId: '197561220', cloudType: 'tencent' },
+];
+out.push({ case: 'live order', result: orderCaptchaOptions(live).map(o => o.cloudType) });
+out.push({ case: 'input not mutated', result: live.map(o => o.cloudType) });
+out.push({ case: 'tencent first already', result: orderCaptchaOptions([...live].reverse()).map(o => o.cloudType) });
+out.push({ case: 'teg only', result: orderCaptchaOptions([{ appId: '1', cloudType: 'teg' }]).map(o => o.cloudType) });
+out.push({ case: 'unknown type kept', result: orderCaptchaOptions([{ appId: '1', cloudType: 'x' }, { appId: '2', cloudType: 'tencent' }]).map(o => o.cloudType) });
+out.push({ case: 'empty', result: orderCaptchaOptions([]).length });
+out.push({ case: 'null-safe', result: orderCaptchaOptions(null).length });
+out.push({ case: 'undefined entries', result: orderCaptchaOptions([null, { appId: '2', cloudType: 'tencent' }]).map(o => o?.cloudType ?? 'null') });
+window.__results = out;
+document.getElementById('out').textContent = JSON.stringify(out);
+</script>
+</body>
+</html>

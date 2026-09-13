@@ -109,6 +109,104 @@ func TestRemoveRejectsInFlightAndRemovesIdleAccount(t *testing.T) {
 	}
 }
 
+// TestClearCooldownResetsCoolingAndBreaker 人工清冷却必须同时复位熔断与退避计数，
+// 但**不能**改变 disabled —— 那是 Enable 的职责（两者正交）。
+func TestClearCooldownResetsCoolingAndBreaker(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetBreaker(1, time.Hour, 6*time.Hour)
+	p.Cooldown("u1", CoolSoft, time.Hour, "429")
+	p.NoteError("u1") // 触发熔断
+	p.CooldownModel("u1", "gpt-4", time.Hour, "model rate limited")
+
+	st, _ := p.Status("u1")
+	if !st.Cooling || st.BreakerUntil.IsZero() {
+		t.Fatalf("precondition: expected cooling+breaker, got %+v", st)
+	}
+
+	if !p.ClearCooldown("u1") {
+		t.Fatal("clearCooldown should find account")
+	}
+	st, _ = p.Status("u1")
+	if st.Cooling {
+		t.Fatalf("cooling should be cleared: %+v", st)
+	}
+	if !st.BreakerUntil.IsZero() {
+		t.Fatalf("breakerUntil should be reset: %+v", st)
+	}
+	if st.BreakerFails != 0 {
+		t.Fatalf("breaker fails should be reset: %+v", st)
+	}
+	if len(st.ModelCooldowns) != 0 {
+		t.Fatalf("model cooldowns should be cleared: %+v", st.ModelCooldowns)
+	}
+	if st.Disabled {
+		t.Fatalf("clearCooldown must not change disabled: %+v", st)
+	}
+	if st.Reason != "" {
+		t.Fatalf("cooling reason should be cleared for enabled accounts: %+v", st)
+	}
+	if p.ClearCooldown("missing") {
+		t.Fatal("clearCooldown should report missing account")
+	}
+}
+
+// TestClearCooldownResetsBreakerBackoff 熔断退避指数（retryCount）也要归零：
+// 否则人工清冷却后，下一次熔断仍按已放大的退避时长惩罚，与"我确认账号没问题"的
+// 运维语义不符。
+func TestClearCooldownResetsBreakerBackoff(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetBreaker(1, time.Minute, time.Hour)
+	p.NoteError("u1")
+	p.ClearCooldown("u1")
+	p.NoteError("u1")
+	p.ClearCooldown("u1")
+	before := time.Now()
+	p.NoteError("u1")
+	st, _ := p.Status("u1")
+	backoff := st.BreakerUntil.Sub(before)
+	if backoff > 90*time.Second {
+		t.Fatalf("backoff=%v should be base cooldown, retryCount not reset", backoff)
+	}
+}
+
+// TestClearCooldownKeepsDisabledState 锁定与 Enable 的正交性：处于禁用态的账号
+// 清冷却后仍应保持禁用，否则"清冷却"会变成绕过人工禁用的后门。
+func TestClearCooldownKeepsDisabledState(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "manual disabled")
+	p.Cooldown("u1", CoolSoft, time.Hour, "429")
+
+	if !p.ClearCooldown("u1") {
+		t.Fatal("clearCooldown should find account")
+	}
+	st, _ := p.Status("u1")
+	if !st.Disabled {
+		t.Fatalf("disabled must be preserved: %+v", st)
+	}
+	if st.Cooling {
+		t.Fatalf("cooling should be cleared: %+v", st)
+	}
+	if st.Reason != "429" {
+		t.Fatalf("disabled account reason must be kept: %+v", st)
+	}
+}
+
+// TestStatusTokenExpiresAt /status 需要透出 access token 到期时间供控制台提示。
+func TestStatusTokenExpiresAt(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1", ExpiresAt: 1893456000})
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("account missing")
+	}
+	if st.TokenExpiresAt != 1893456000 {
+		t.Fatalf("token_expires_at=%d want 1893456000", st.TokenExpiresAt)
+	}
+}
+
 func TestPickExpiredCooldownReturnsToHealthy(t *testing.T) {
 	p := New("")
 	a1 := &auth.Auth{UID: "u1"}
@@ -1230,6 +1328,31 @@ func TestWeightTopFiveSelectionChanges(t *testing.T) {
 	p.mu.Unlock()
 	if wA, wB := p.entryWeight("a"), p.entryWeight("b"); wA <= wB {
 		t.Errorf("idle a should outweigh busy higher-credit b: a=%v b=%v", wA, wB)
+	}
+}
+
+// TestPickWeightedPreparedKeepsFullPoolScale 抽签必须沿用全量候选集算好的权重：
+// 若按短名单重新归一化 maxCredits，低积分号会被抬成 1.0，和 Top5 排序口径不一致。
+func TestPickWeightedPreparedKeepsFullPoolScale(t *testing.T) {
+	p := New("")
+	lo := &entry{a: &auth.Auth{UID: "lo"}, credits: 10}
+	hi := &entry{a: &auth.Auth{UID: "hi"}, credits: 100}
+	now := time.Now()
+	cands := []weighted{
+		{e: lo, w: p.weightOf(lo, 100, now)},
+		{e: hi, w: p.weightOf(hi, 100, now)},
+	}
+	var picks int
+	p.randInt64N = func(n int64) int64 {
+		picks++
+		return 0
+	}
+	got := p.pickWeightedPrepared(cands)
+	if got != lo {
+		t.Fatalf("first bucket should remain lo under full-pool scale, got %s", got.a.UID)
+	}
+	if picks != 1 {
+		t.Fatalf("prepared draw should not recompute weights, draws=%d", picks)
 	}
 }
 
