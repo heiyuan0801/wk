@@ -33,7 +33,7 @@ const COOL_KIND_LABEL = {
 
 // 页面标识。用 hash 路由（#/auto-enroll）而不是给每页单独打包：
 // 刷新能停在原页、地址可收藏转发，且不引入 react-router 依赖。
-const SECTIONS = ['dashboard', 'models', 'playground', 'requests', 'auto-enroll', 'proxy', 'settings'];
+const SECTIONS = ['dashboard', 'accounts', 'checkin', 'models', 'playground', 'requests', 'auto-enroll', 'proxy', 'settings'];
 
 // sectionFromHash 读取地址栏里的页面标识；非法/缺失时回落到仪表盘。
 function sectionFromHash() {
