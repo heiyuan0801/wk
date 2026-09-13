@@ -240,7 +240,7 @@ function Console() {
       const currentConfig = await api('/admin/config', { signal: controller.signal });
       if (serial !== refreshSerial.current) return;
       if (currentConfig.schedule || currentConfig.region || currentConfig.request_logs || currentConfig.sms || currentConfig.update) {
-        setConfig(current => ({ ...current, ...(currentConfig.schedule || {}), request_logs: currentConfig.request_logs || current.request_logs || { retention_days: 30 }, update: currentConfig.update || current.update, region: currentConfig.region || current.region || 'cn' }));
+        setConfig(current => ({ ...current, ...(currentConfig.schedule || {}), request_logs: currentConfig.request_logs || current.request_logs || { retention_days: 30 }, update: (currentConfig.update && (currentConfig.update.repository || currentConfig.update.branch)) ? currentConfig.update : current.update, region: currentConfig.region || current.region || 'cn' }));
       }
       if (currentConfig.sms) {
         setSmsSettings(current => ({

@@ -444,6 +444,12 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": "invalid config"})
 		return
 	}
+	if strings.TrimSpace(c.Update.Repository) == "" {
+		c.Update.Repository = h.cfg.UpdateRepository
+	}
+	if strings.TrimSpace(c.Update.Branch) == "" {
+		c.Update.Branch = h.cfg.UpdateBranch
+	}
 	writeJSON(w, 200, map[string]any{
 		"schedule":     c.Schedule,
 		"region":       c.Region,
